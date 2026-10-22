@@ -17,6 +17,8 @@ typedef uint16_t char16;
 #define EFI_ERROR_BIT        0x8000000000000000ULL
 #define EFI_ERROR(s)         (((s) & EFI_ERROR_BIT) != 0)
 #define EFI_BUFFER_TOO_SMALL (EFI_ERROR_BIT | 5)
+#define EFI_NOT_FOUND        (EFI_ERROR_BIT | 14)
+#define EFI_UNSUPPORTED      (EFI_ERROR_BIT | 3)
 
 typedef struct {
 	uint32_t a; uint16_t b; uint16_t c; uint8_t d[8];
@@ -99,6 +101,33 @@ typedef struct {
 	uint64_t nr_tables;                     /* the configuration tables: ACPI, a device tree, ... */
 	struct { efi_guid guid; void *table; } *tables;
 } efi_system_table;
+
+/* LoadedImage and SimpleFileSystem: load XNUP from the same ESP as the EFI app. */
+typedef struct {
+	uint32_t revision;
+	efi_handle parent;
+	efi_system_table *system_table;
+	efi_handle device;
+} efi_loaded_image;
+
+typedef struct efi_file {
+	uint64_t revision;
+	efi_status (EFIAPI *open)(struct efi_file *self, struct efi_file **file, const char16 *name,
+	    uint64_t mode, uint64_t attributes);
+	efi_status (EFIAPI *close)(struct efi_file *self);
+	efi_status (EFIAPI *delete_file)(struct efi_file *self);
+	efi_status (EFIAPI *read)(struct efi_file *self, uint64_t *size, void *buffer);
+	efi_status (EFIAPI *write)(struct efi_file *self, uint64_t *size, const void *buffer);
+	void *get_position;
+	efi_status (EFIAPI *set_position)(struct efi_file *self, uint64_t position);
+	void *get_info, *set_info;
+	efi_status (EFIAPI *flush)(struct efi_file *self);
+} efi_file;
+
+typedef struct efi_simple_fs {
+	uint64_t revision;
+	efi_status (EFIAPI *open_volume)(struct efi_simple_fs *self, efi_file **root);
+} efi_simple_fs;
 
 /* a device path is a list of these, each followed by its data, ending with type 0x7f subtype 0xff */
 typedef struct {
@@ -252,6 +281,8 @@ typedef struct {
 #define QCOM_USB_DEVICE_GUID    { 0xd9d9ce48, 0x44b8, 0x4f49, { 0x8e, 0x3e, 0x2a, 0x3b, 0x92, 0x7d, 0xc6, 0xc1 } }
 #define QCOM_USB_INIT_EVENT_GUID { 0x1c0cffce, 0xfc8d, 0x4e44, { 0x8c, 0x78, 0x9c, 0x9e, 0x5b, 0x53, 0x0d, 0x36 } }
 #define EFI_GOP_GUID            { 0x9042a9de, 0x23dc, 0x4a38, { 0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a } }
+#define EFI_LOADED_IMAGE_GUID   { 0x5b1b31a1, 0x9562, 0x11d2, { 0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
+#define EFI_SIMPLE_FS_GUID      { 0x964e5b22, 0x6459, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
 #define EFI_BLOCK_IO_GUID       { 0x964e5b21, 0x6459, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
 #define EFI_BLOCK_IO2_GUID      { 0xa77b2472, 0xe282, 0x4e9f, { 0xa2, 0x45, 0xc2, 0xc0, 0xe2, 0x7b, 0xbc, 0xc1 } }
 #define EFI_DEVICE_PATH_GUID    { 0x09576e91, 0x6d3f, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }

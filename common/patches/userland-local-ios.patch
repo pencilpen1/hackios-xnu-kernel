@@ -1,0 +1,8 @@
+diff --git a/userland/build.sh b/userland/build.sh
+--- a/userland/build.sh
++++ b/userland/build.sh
+@@ -84,2 +84,2 @@
+-IOS=../ios165
+-CACHE=$IOS/20F66__iPhone10,3_6
++IOS=${IOS_SOURCE:-../ios165}
++CACHE=${IOS_CACHE:-$IOS/20F66__iPhone10,3_6}

@@ -46,6 +46,7 @@ __pycache__/
 !/xnuloader/loader.c
 !/xnuloader/mkidentity.py
 !/xnuloader/mkpayload.py
+!/xnuloader/lancelot.h
 
 /qemu/*
 !/qemu/*.sh

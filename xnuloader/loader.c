@@ -15,7 +15,8 @@
 /* ------------------------------------------------------------------------ */
 /* Fixed conventions shared with the boot shim, the packer and the kernel   */
 
-#define PAYLOAD_BASE        0xF0000000ULL
+static uint64_t payload_base = 0xF0000000ULL;
+#define PAYLOAD_BASE        payload_base
 #define PAYLOAD_MAGIC       0x50554E58u /* "XNUP" */
 
 struct payload_header { uint32_t magic; uint32_t size; };
@@ -84,6 +85,8 @@ struct segment_command_64 {
 static efi_system_table *ST;
 static efi_boot_services *BS;
 static efi_handle IMAGE;
+static efi_file *esp_root;
+static void save_esp_log(const char *data, uint64_t size);
 
 static char log_buf[32768];
 static uint32_t log_len;
@@ -330,9 +333,14 @@ static void hc_take_back(const char *when);
 static void
 write_logs(const char *klog, uint64_t klog_len)
 {
-	efi_block_io *bio = find_log_partition();
+	efi_block_io *bio;
 
 	compose_logs(klog, klog_len);
+	if (esp_root != NULL) {
+		save_esp_log(staged_data, staged_len);
+		return;
+	}
+	bio = find_log_partition();
 	if (bio == NULL) {
 		/* No log partition (QEMU): echo the returned kernel log on the console instead. */
 		if (klog != NULL) {
@@ -553,14 +561,26 @@ static const struct platform platform_redwood = {
 	.fb_base = 0xE1000000,
 };
 
+static const struct platform platform_lancelot = {
+	/* Android FDT: reg, not cpu@ unit names, gives MPIDR 0x000..0x700. */
+	.name = "lancelot", .io_base = 0x0C000000, .io_size = 0x14000000,
+	.gic_dist = 0x0C000000, .gic_redist = 0x0C040000,
+	.cores = 8, .core_shift = 8, .small_cores = 0x3f,
+	.fb_base = 0x7CDB0000,
+	/* MTK's UART is not PL011; Qualcomm watchdog/USB/UFS are not present. */
+};
+
 /*
  * The devices the loader knows, told apart by the framebuffer base their UEFI reports. A port to another
  * device adds its description here (common/new-device.sh writes a starting point, docs/PORTING.md says
  * where each value comes from); a display that matches none is QEMU's ramfb.
  */
+#ifndef XNULOADER_LANCELOT
 static const struct platform *const platforms[] = {
 	&platform_redwood,
+	&platform_lancelot,
 };
+#endif
 
 /* ------------------------------------------------------------------------ */
 
@@ -2530,12 +2550,29 @@ parse_payload(struct payload_info *pi, int verbose)
 		print("no payload at %x (magic %x)\n", PAYLOAD_BASE, (uint64_t)ph->magic);
 		return 0;
 	}
+	if (ph->size > PAYLOAD_MAX_SIZE - 0x100000 - sizeof(*ph)) {
+		print("payload exceeds reserved memory\n");
+		return 0;
+	}
 	const uint8_t *p = (const uint8_t *)(ph + 1), *pend = p + ph->size;
 	while (p + sizeof(struct payload_entry) <= pend) {
 		const struct payload_entry *e = (const struct payload_entry *)p;
 		const char *text = (const char *)(p + sizeof(*e));
 		if (e->name[0] == 0) {
-			break;
+			return 1;
+		}
+		uint64_t padded = ((uint64_t)e->size + 15) & ~15ULL;
+		int terminated = 0;
+		for (unsigned i = 0; i < sizeof(e->name); i++) terminated |= e->name[i] == 0;
+		if (!terminated || padded > (uint64_t)(pend - p) - sizeof(*e)) {
+			print("invalid payload entry\n");
+			return 0;
+		}
+		if ((str_eq(e->name, "cmdline") || str_eq(e->name, "physbase") ||
+		    str_eq(e->name, "rdres") || str_eq(e->name, "checkpoint")) &&
+		    (e->size == 0 || text[e->size - 1] != 0)) {
+			print("unterminated payload text\n");
+			return 0;
 		}
 		if (verbose) {
 			print("payload entry '%s' size %x\n", e->name, (uint64_t)e->size);
@@ -2556,9 +2593,10 @@ parse_payload(struct payload_info *pi, int verbose)
 		} else if (str_eq(e->name, "usb")) {
 			pi->usb_mode = 1;                         /* stay in the loader and take commands over USB */
 		}
-		p += sizeof(*e) + ((e->size + 15) & ~15u);
+		p += sizeof(*e) + padded;
 	}
-	return 1;
+	print("payload has no end entry\n");
+	return 0;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -2882,10 +2920,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	if (battery_requested) {
 		charger_start();
 	}
-	if (ufs_requested >= 2) {
+	if (ufs_requested >= 2 && PLAT == &platform_redwood) {
 		hc_init();              /* (ufs_native=: UEFI's transfer list kept, before anything reads) */
 	}
-	if (ufs_requested >= 1) {
+	if (ufs_requested >= 1 && PLAT == &platform_redwood) {
 		ufs_survey();
 	}
 	if (ufs_requested >= 2) {
@@ -3917,6 +3955,8 @@ ramfb_phone_screen(void)
 	SCREEN.stride = PHONE_WIDTH * 4;
 }
 
+#include "lancelot.h"
+
 efi_status EFIAPI
 efi_main(efi_handle image, efi_system_table *st)
 {
@@ -3932,7 +3972,11 @@ efi_main(efi_handle image, efi_system_table *st)
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
 
+#ifdef XNULOADER_LANCELOT
+	PLAT = &platform_lancelot;
+#else
 	PLAT = &platform_qemu_virt;
+#endif
 	if (EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&GOP)) || GOP->mode == NULL ||
 	    GOP->mode->info == NULL || GOP->mode->fb_base == 0) {
 		GOP = NULL;                     /* no display (QEMU without -device ramfb) */
@@ -3941,14 +3985,19 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.width = GOP->mode->info->width;
 		SCREEN.height = GOP->mode->info->height;
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
+#ifndef XNULOADER_LANCELOT
 		for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++)
 			if (platforms[i]->fb_base == SCREEN.base)
 				PLAT = platforms[i];
+#endif
 		if (PLAT == &platform_qemu_virt)
 			ramfb_phone_screen();
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
 	print("platform %s\n", PLAT->name);
+	if (PLAT == &platform_lancelot) {
+		return lancelot_boot();
+	}
 
 	install_exception_hook();
 	wdt_arm();

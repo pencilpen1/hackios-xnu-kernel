@@ -19,34 +19,11 @@ sed -e "s/^NAME=.*/NAME=\"TODO vendor model ($CODE)\"/" -e "s/^UEFI_TARGET=.*/UE
 	common/devices/_template.conf > "$CONF"
 [ -n "$DTB" ] && sed -i "s|^DTB=.*|DTB=$(readlink -f "$DTB")|" "$CONF"
 
-GIC_DIST=TODO GIC_REDIST=TODO CORES=8 SHIFT=8 SMALL=0x0
+GIC_DIST=TODO GIC_REDIST=TODO CORES=8 SHIFT=8 SMALL=0x0 HVC=0
 if [ -n "$DTB" ]; then
-	command -v dtc >/dev/null || die "dtc is needed to read $DTB (package dtc)"
-	# GIC (compatible "arm,gic-v3": reg = <dist size redist size>, one or two cells each), the cores
-	# (cpu@N), how MPIDR numbers them (Qualcomm: reg 0x100, 0x200... -- the second affinity field) and
-	# which are small (the cluster with the lowest capacity-dmips-mhz)
-	read -r GIC_DIST GIC_REDIST CORES SHIFT SMALL < <(python3 - "$DTB" <<'PY'
-import re, subprocess, sys
-dts = subprocess.run(['dtc', '-I', 'dtb', '-O', 'dts', sys.argv[1]], capture_output=True, text=True).stdout
-gic = ['TODO', 'TODO']
-m = re.search(r'compatible = "arm,gic-v3";(.*?)\};', dts, re.S)
-if m:
-    cells = [int(x, 16) for x in re.search(r'reg = <([^>]*)>', m.group(1)).group(1).split()]
-    if len(cells) == 4: gic = [hex(cells[0]), hex(cells[2])]
-    elif len(cells) >= 8: gic = [hex((cells[0] << 32) | cells[1]), hex((cells[4] << 32) | cells[5])]
-cpus = []
-for m in re.finditer(r'\n\t*cpu@([0-9a-f]+) \{(.*?)\n\t*\};', dts, re.S):
-    cap = re.search(r'capacity-dmips-mhz = <(0x[0-9a-f]+)>', m.group(2))
-    cpus.append((int(m.group(1), 16), int(cap.group(1), 16) if cap else 0))
-shift = 8 if any(r >= 0x100 for r, _ in cpus) else 0
-caps = [c for _, c in cpus if c]
-small = 0
-for r, c in cpus:
-    # the little cluster: the lowest capacity, when the cores are not all alike
-    if caps and c == min(caps) and min(caps) < max(caps): small |= 1 << (r >> shift)
-print(gic[0], gic[1], len(cpus) or 8, shift, hex(small))
-PY
-)
+	command -v fdtget >/dev/null || die "fdtget is needed to read $DTB (package device-tree-compiler)"
+	FIELDS=$(python3 common/dtb-platform.py "$DTB") || die "cannot extract platform from $DTB"
+	read -r GIC_DIST GIC_REDIST CORES SHIFT SMALL HVC <<< "$FIELDS"
 	echo "new-device: from $DTB: GIC $GIC_DIST / $GIC_REDIST, $CORES cores, MPIDR shift $SHIFT, small cores $SMALL"
 fi
 
@@ -62,6 +39,7 @@ static const struct platform platform_$CODE = {
 	.uart = 0,                                      /* phones: no PL011 */
 	.log_other_cpu = 1,
 	.cores = $CORES, .core_shift = $SHIFT,
+	.psci_hvc = $HVC,
 	.small_cores = $SMALL,                          /* TODO: a bit per "small" core (capacity-dmips-mhz in the DT) */
 	.fb_base = 0x0,                                 /* TODO: the framebuffer base the UEFI prints ("display ... at") */
 };

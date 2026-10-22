@@ -15,6 +15,9 @@
 #   SKIP="kernel loader images boot"   leave steps out
 . "$(dirname "$(readlink -f "$0")")/lib.sh"
 load_device "$1"; shift
+if [ "${BOOT_METHOD:-}" = efi-file ]; then
+	exec bash common/build-lancelot.sh "$@"
+fi
 skip() { [[ " $SKIP " == *" $1 "* ]]; }
 mkdir -p out
 
