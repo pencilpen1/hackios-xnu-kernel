@@ -39,7 +39,10 @@ redwood boot shim, hard-coded payload reservation, Qualcomm USB protocol or UFS 
 The generic `common/build.sh lancelot` entry delegates to this path.
 
 `checkpoint` stops at XNU assembly checkpoint 1 (before page tables); `sweep` advances
-through 1, 2, 3, 4, 5 and 10. XNU runs on A75 MPIDR `0x600`, leaving firmware on core 0.
+through 1, 2, 3, 4, 5 and 10. **Current strategy: the firmware's boot CPU only**,
+with no `bootcpu=6`, PSCI preflight or secondary-core start. `cpus=1` does not cause
+PSCI affinity queries for other cores. The loader refuses secondary CPU and firmware
+storage mailbox requests on lancelot rather than silently taking the withdrawn path.
 `selftest` exercises the same-core context round trip and is not yet validated on MTK.
 These tests are not complete iOS boots.
 The shipped XNU is the repository's unmodified prebuilt `xnu-8796.121.2`.
@@ -113,9 +116,14 @@ This image has **not been written to Ubuntu yet**; hardware boot/ABI compatibili
 If 16.7 userspace is incompatible, the user authorizes the upstream `ios165/fetch.sh`
 download of matching 16.5. Keep the two versions in separate source directories.
 
-`common/build-lancelot.sh ios` packages small md0/md1 images. It uses the existing read-only
-loader Block I/O mailbox (`ufs_*` names are legacy, also usable with eMMC) with firmware
-servicing requests on core 0 and XNU on core 6. Native Qualcomm UFS is not enabled.
+The experimental A75 strategy halted after `lancelot: starting secondary MPIDR 600`.
+The user reports the earlier same-core path reached further. A75 boot and its dependent
+firmware eMMC mailbox strategy have therefore been withdrawn; `common/build-lancelot.sh ios`
+now refuses that unsafe/incomplete recipe before replacing output files. The prepared iOS
+images are retained. Continue the known single-core path, then implement validated RAM/native
+eMMC loading. The same-core build provides a 30-second USB capture window before handoff,
+and prints the physical entry, boot-args and return-stub addresses before the actual branch.
+No further UEFI source change is involved.
 
 Full iOS boot also needs a low-memory storage strategy (the system image exceeds the usable
 contiguous RAM), MTK input and watchdog integration, and verification of 16.7 userspace with

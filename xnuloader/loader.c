@@ -2942,6 +2942,14 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		hc_requested |= starts_with(c, "ufs_native=") && (c == pi.cmdline || c[-1] == ' ') && c[11] >= '1' &&
 		    c[11] <= '9';
 	}
+	if (PLAT == &platform_lancelot) {
+		if (kernel_mpidr != this_mpidr || ufs_requested || hc_requested || block_write_requested) {
+			print("lancelot: same-core mode refuses secondary CPU and firmware-storage mailbox arguments\n");
+			return 0;
+		}
+		/* cpus=1 is not a request to query/start every core. Keep the known boot CPU. */
+		more_cores = 0;
+	}
 	if (battery_requested) {
 		charger_start();
 	}
@@ -3397,6 +3405,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 				return 1;
 			}
 		} else {
+			if (PLAT == &platform_lancelot) {
+				print("lancelot: same-core branch entry=%x args=%x stub=%x\n", entry_va + slide, ba_pa,
+				    (uint64_t)(uintptr_t)&loader_return_stub);
+				BS->stall(5000000);
+			}
 			jump_to_kernel(entry_va + slide, ba_pa);
 		}
 	}

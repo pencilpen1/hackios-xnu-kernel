@@ -136,10 +136,11 @@ lancelot_boot(void)
 	print_memory_map();
 	flush_log();
 	install_exception_hook();
+	print("lancelot: same-core bring-up, no PSCI CPU_ON; USB capture window 30 s\n");
+	BS->stall(30000000);
 	struct payload_info pi;
 	if (parse_payload(&pi, 0) && pi.checkpoint == 998) {
 		/* A sequence ends at the first failed return, never masks a failed step. */
-		/* Avoid the same-core context selftest: keep USB alive on firmware core. */
 		static const uint64_t checkpoints[] = { 1, 2, 3, 4, 5, 10 };
 		for (unsigned i = 0; i < sizeof(checkpoints) / sizeof(checkpoints[0]); i++) {
 			uint64_t n = checkpoints[i];
