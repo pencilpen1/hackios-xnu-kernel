@@ -625,6 +625,8 @@ enum {
 	CTX_ICC_PMR, CTX_ICC_IGRPEN1, CTX_ICC_BPR1, CTX_COUNT
 };
 uint64_t loader_ctx[CTX_COUNT];
+/* Diagnostic copy of the kernel's MMU state before firmware registers are restored. */
+volatile uint64_t loader_mmu_state[6];
 int loader_save_ctx(void) __attribute__((returns_twice));
 void loader_return_stub(void);
 
@@ -683,6 +685,7 @@ __asm__ (
         "  .inst 0xd500409f\n"          /* msr PAN, #0 */
         "  .inst 0xd500407f\n"          /* msr UAO, #0 */
         "  mrs x9, sctlr_el1\n"
+        "  mov x11, x9\n"
         "  bic x9, x9, #0x1\n"
         "  bic x9, x9, #0x4\n"
         "  bic x9, x9, #0x1000\n"
@@ -690,6 +693,14 @@ __asm__ (
         "  isb\n"
         "  adrp x10, loader_ctx\n"
         "  add  x10, x10, :lo12:loader_ctx\n"
+        "  adrp x9, loader_mmu_state\n"
+        "  add x9, x9, :lo12:loader_mmu_state\n"
+        "  str x11, [x9, #0]\n"
+        "  mrs x11, tcr_el1\n       str x11, [x9, #8]\n"
+        "  mrs x11, ttbr0_el1\n     str x11, [x9, #16]\n"
+        "  mrs x11, ttbr1_el1\n     str x11, [x9, #24]\n"
+        "  mrs x11, vbar_el1\n      str x11, [x9, #32]\n"
+        "  mrs x11, mair_el1\n      str x11, [x9, #40]\n"
         "  ldr x9, [x10, #0]\n   msr ttbr0_el1, x9\n"
         "  ldr x9, [x10, #8]\n   msr tcr_el1, x9\n"
         "  ldr x9, [x10, #16]\n  msr mair_el1, x9\n"
@@ -2781,6 +2792,7 @@ choose_window(const struct payload_info *pi)
  * written to the log partition. Returns 0 if the kernel could not be started.
  */
 static int starts_with(const char *s, const char *prefix);
+static void lancelot_mmu_report(uint64_t entry_pa, uint64_t entry_va);
 
 static int
 run_kernel(int have_checkpoint, uint64_t checkpoint)
@@ -3349,6 +3361,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 
 	/* --- hand off (UEFI is left resident, see loader_save_ctx) ------------ */
 	if (PLAT == &platform_lancelot) print("lancelot: saving firmware context before handoff\n");
+	for (unsigned i = 0; i < 6; i++) loader_mmu_state[i] = 0;
 	if (loader_save_ctx() == 0) {
 		if (PLAT == &platform_lancelot) print("lancelot: firmware context saved, cleaning kernel memory\n");
 		/*
@@ -3460,6 +3473,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		}
 	}
 	const char *klog = (const char *)loader_ctx[CTX_LOG_PA];
+	if (PLAT == &platform_lancelot) {
+		/* The return stub recorded these with caches off, so discard old UEFI lines. */
+		flush_dcache((uint64_t)(uintptr_t)loader_mmu_state,
+		    (uint64_t)(uintptr_t)loader_mmu_state + sizeof(loader_mmu_state));
+		lancelot_mmu_report(entry_va + slide, entry_va);
+	}
 	uint64_t klog_len = loader_ctx[CTX_LOG_LEN];
 	uint64_t reason = loader_ctx[CTX_REASON];
 	if (checkpoint == CHECKPOINT_SELFTEST) {

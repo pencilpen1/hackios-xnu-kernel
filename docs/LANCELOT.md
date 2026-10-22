@@ -125,6 +125,26 @@ eMMC loading. The same-core build provides a 30-second USB capture window before
 and prints the physical entry, boot-args and return-stub addresses before the actual branch.
 No further UEFI source change is involved.
 
+### Single-core hardware result
+
+The single-core test on the authorized UEFI image returned successfully from checkpoints
+**1, 2, 3 and 4**. Actual firmware: EL1, Cortex-A55 MIDR `0x411fd050`, timer 13 MHz,
+GOP 1080x2340 at `0x7cdb0000`. XNU's claimed contiguous window is
+`0xc0000000..0x13c000000` (1984 MiB), payload at `0x13c000000`.
+Checkpoint 5 has not returned; USB callbacks cease after the kernel takes the boot CPU.
+This narrows investigation to enabling the kernel MMU or its post-MMU return path, not
+an iOS 16.7 ABI issue. The original branch to `0xc345e4a8` now works.
+
+The pinned prebuilt actually uses **4 KiB kernel pages**, not 16 KiB: disassembly has
+2 MiB L2 blocks, 4 KiB table spacing and `_sysreg_restore` TCR `0x22a51a251a`
+(TG0=0/TG1=2, T0SZ=T1SZ=26, IPS=40-bit). The loader checks TGran4 accordingly.
+The next checkpoint-4 diagnostic records SCTLR/TCR/TTBR0/TTBR1/VBAR before restoring
+firmware state and walks the kernel's tables read-only, with bounded physical addresses.
+Hardware checkpoint-4 readback confirms correct translations for the physical entry,
+kernel virtual entry and exception vectors. The standalone loader MMU probe also completed
+`stage=3` with zero ESR/ELR/FAR using those exact tables and the prebuilt's SCTLR.
+This proves a minimal MMU round trip, not yet XNU checkpoint 5 or iOS boot.
+
 Full iOS boot also needs a low-memory storage strategy (the system image exceeds the usable
 contiguous RAM), MTK input and watchdog integration, and verification of 16.7 userspace with
 the 16.5 kernel. Mali GPU, MediaTek Wi-Fi/audio and native eMMC support are not provided by

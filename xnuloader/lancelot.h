@@ -13,6 +13,136 @@ struct mtk_boot_log {
 _Static_assert(sizeof(struct mtk_boot_log) == MTK_LOG_SIZE, "MTK boot log ABI");
 static volatile struct mtk_boot_log *mtk_log;
 
+/* Bounded, read-only walk of this kernel's 4 KiB bootstrap tables at checkpoint 4. */
+static void
+lancelot_walk_4k(uint64_t va, int upper)
+{
+	uint64_t tcr = loader_mmu_state[1];
+	unsigned tsz = (unsigned)(tcr >> (upper ? 16 : 0)) & 63;
+	unsigned bits = 64 - tsz;
+	uint64_t table = loader_mmu_state[upper ? 3 : 2] & 0x0000fffffffff000ULL;
+	if (bits < 31 || bits > 39) {
+		print("mmu: unsupported bootstrap VA width %d\n", (uint64_t)bits);
+		return;
+	}
+	for (unsigned level = 1; level <= 3; level++) {
+		unsigned shift = 12 + 9 * (3 - level);
+		uint64_t index = (va >> shift) & 511;
+		if (level == 1) index &= (1ULL << (bits - 30)) - 1;
+		uint64_t at = table + index * 8;
+		if (at < win_base || at > win_base + win_size - 8) {
+			print("mmu: table outside kernel window at %x\n", at);
+			return;
+		}
+		/* Bootstrap wrote tables with caches disabled; discard the firmware view. */
+		flush_dcache(at, at + 8);
+		uint64_t desc = *(const uint64_t *)(uintptr_t)at;
+		print("mmu: TTBR%d L%d [%x]=%x\n", (uint64_t)upper, (uint64_t)level, at, desc);
+		if (!(desc & 1)) {
+			print("mmu: translation INVALID for %x\n", va);
+			return;
+		}
+		if (level == 3 || !(desc & 2)) {
+			uint64_t mask = (1ULL << shift) - 1;
+			uint64_t pa = (desc & 0x0000fffffffff000ULL & ~mask) | (va & mask);
+			print("mmu: %x -> %x\n", va, pa);
+			return;
+		}
+		table = desc & 0x0000fffffffff000ULL;
+	}
+}
+
+static void
+lancelot_mmu_report(uint64_t entry_pa, uint64_t entry_va)
+{
+	print("mmu: SCTLR=%x TCR=%x TTBR0=%x TTBR1=%x VBAR=%x MAIR=%x\n", loader_mmu_state[0],
+	    loader_mmu_state[1], loader_mmu_state[2], loader_mmu_state[3], loader_mmu_state[4], loader_mmu_state[5]);
+	if (((loader_mmu_state[1] >> 14) & 3) != 0 || ((loader_mmu_state[1] >> 30) & 3) != 2) return;
+	lancelot_walk_4k(entry_pa, 0);
+	lancelot_walk_4k(entry_va, 1);
+	lancelot_walk_4k(loader_mmu_state[4], 1);
+}
+
+/* Position-independent test copied into XNU's mapped, owned window.
+ * It enables the checkpoint-4 tables with XNU's SCTLR, then returns through
+ * the existing loader stub. Its own vectors record faults without kernel C.
+ * This isolates the MMU transition from XNU's checkpoint/exception code. */
+extern char lancelot_probe_begin[], lancelot_probe_entry[], lancelot_probe_data[], lancelot_probe_end[];
+__asm__(
+    ".text\n.balign 2048\n.globl lancelot_probe_begin\nlancelot_probe_begin:\n"
+    "  b lancelot_probe_fault\n.balign 128\n  b lancelot_probe_fault\n.balign 128\n"
+    "  b lancelot_probe_fault\n.balign 128\n  b lancelot_probe_fault\n.balign 128\n"
+    "  b lancelot_probe_fault\n.balign 128\n  b lancelot_probe_fault\n.balign 128\n"
+    "  b lancelot_probe_fault\n.balign 128\n  b lancelot_probe_fault\n.balign 128\n"
+    "  b lancelot_probe_fault\n.balign 128\n  b lancelot_probe_fault\n.balign 128\n"
+    "  b lancelot_probe_fault\n.balign 128\n  b lancelot_probe_fault\n.balign 128\n"
+    "  b lancelot_probe_fault\n.balign 128\n  b lancelot_probe_fault\n.balign 128\n"
+    "  b lancelot_probe_fault\n.balign 128\n  b lancelot_probe_fault\n.balign 128\n"
+    ".globl lancelot_probe_entry\nlancelot_probe_entry:\n"
+    "  msr daifset, #0xf\n"
+    "  adr x12, lancelot_probe_data\n"
+    "  ldr x9, [x12, #0]\n   msr tcr_el1, x9\n"
+    "  ldr x9, [x12, #8]\n   msr ttbr0_el1, x9\n"
+    "  ldr x9, [x12, #16]\n  msr ttbr1_el1, x9\n"
+    "  ldr x9, [x12, #24]\n  msr mair_el1, x9\n"
+    "  adr x9, lancelot_probe_begin\n  msr vbar_el1, x9\n"
+    "  isb\n  tlbi vmalle1\n  dsb sy\n  isb\n"
+    "  mov x9, #1\n  str x9, [x12, #40]\n  dsb sy\n"
+    "  ldr x9, [x12, #32]\n  msr sctlr_el1, x9\n  isb\n"
+    "  mov x9, #2\n  str x9, [x12, #40]\n"
+    "  dc cvac, x12\n  dsb sy\n"
+    "  mrs x9, sctlr_el1\n  ldr x10, [x12, #56]\n  bic x9, x9, x10\n"
+    "  msr sctlr_el1, x9\n  isb\n"
+    "  adr x12, lancelot_probe_data\n  mov x9, #3\n  str x9, [x12, #40]\n"
+    "  ldr x9, [x12, #48]\n  mov x0, #0\n  mov x1, #0\n  mov x2, #2\n  mov x3, #997\n  br x9\n"
+    "lancelot_probe_fault:\n"
+    "  adr x12, lancelot_probe_data\n"
+    "  mrs x3, esr_el1\n  mrs x4, elr_el1\n  mrs x5, far_el1\n"
+    "  stp x3, x4, [x12, #64]\n  str x5, [x12, #80]\n"
+    "  dc cvac, x12\n  add x9, x12, #64\n  dc cvac, x9\n  dsb sy\n"
+    "  mrs x9, sctlr_el1\n  bic x9, x9, #1\n  bic x9, x9, #4\n  bic x9, x9, #0x1000\n"
+    "  msr sctlr_el1, x9\n  isb\n"
+    "  adr x12, lancelot_probe_data\n  ldr x9, [x12, #48]\n"
+    "  mov x0, #0\n  mov x1, #0\n  mov x2, #1\n  mov x6, x30\n  mov x7, sp\n  br x9\n"
+    ".balign 64\n.globl lancelot_probe_data\nlancelot_probe_data:\n.space 128\n"
+    ".globl lancelot_probe_end\nlancelot_probe_end:\n"
+);
+
+static void
+lancelot_mmu_probe(uint64_t disable_mask)
+{
+	const uint64_t address = win_base + 0x08000000;
+	const uint64_t bytes = (uint64_t)(lancelot_probe_end - lancelot_probe_begin);
+	const uint64_t data_offset = (uint64_t)(lancelot_probe_data - lancelot_probe_begin);
+	const uint64_t entry = address + (uint64_t)(lancelot_probe_entry - lancelot_probe_begin);
+	if (!win_size || win_size < 0x08001000 || bytes > 4096 ||
+	    ((loader_mmu_state[1] >> 14) & 3) != 0 || ((loader_mmu_state[1] >> 30) & 3) != 2) {
+		print("mmu-probe: unsupported window/tables\n");
+		return;
+	}
+	memcpy((void *)(uintptr_t)address, lancelot_probe_begin, (size_t)bytes);
+	volatile uint64_t *data = (volatile uint64_t *)(uintptr_t)(address + data_offset);
+	data[0] = loader_mmu_state[1];
+	data[1] = loader_mmu_state[2];
+	data[2] = loader_mmu_state[3];
+	data[3] = loader_mmu_state[5];
+	data[4] = 0x3454593d; /* SCTLR_EL1_DEFAULT in the pinned prebuilt */
+	data[5] = 0;
+	data[6] = (uint64_t)(uintptr_t)&loader_return_stub;
+	data[7] = disable_mask;
+	print("mmu-probe: entry=%x data=%x SCTLR=%x disable=%x\n", entry, address + data_offset, data[4], disable_mask);
+	lancelot_walk_4k(entry, 0);
+	if (loader_save_ctx() == 0) {
+		clean_dcache((uint64_t)(uintptr_t)loader_ctx, (uint64_t)(uintptr_t)loader_ctx + sizeof(loader_ctx));
+		clean_dcache((uint64_t)(uintptr_t)loader_mmu_state,
+		    (uint64_t)(uintptr_t)loader_mmu_state + sizeof(loader_mmu_state));
+		flush_dcache(address, address + bytes);
+		jump_to_kernel(entry, 0);
+	}
+	flush_dcache(address + data_offset, address + bytes);
+	print("mmu-probe: stage=%d (3=roundtrip) ESR=%x ELR=%x FAR=%x\n", data[5], data[8], data[9], data[10]);
+}
+
 static void
 lancelot_log_char(char c)
 {
@@ -121,10 +251,11 @@ lancelot_boot(void)
 		print("lancelot: loader needs EL1; refusing an unsafe EL2 handoff\n");
 		return EFI_UNSUPPORTED;
 	}
-	print("MPIDR=%x TGran16=%x\n", READ_SYSREG(MPIDR_EL1), (READ_SYSREG(ID_AA64MMFR0_EL1) >> 20) & 15);
-	/* TGran16=0 means unsupported. XNU here uses 16 KiB stage-1 pages. */
-	if (((READ_SYSREG(ID_AA64MMFR0_EL1) >> 20) & 15) == 0) {
-		print("lancelot: this CPU cannot run the 16 KiB kernel\n");
+	print("MPIDR=%x TGran4=%x TGran16=%x\n", READ_SYSREG(MPIDR_EL1),
+	    (READ_SYSREG(ID_AA64MMFR0_EL1) >> 28) & 15, (READ_SYSREG(ID_AA64MMFR0_EL1) >> 20) & 15);
+	/* The pinned BCM2837 prebuilt uses TG0=4 KiB, TG1=4 KiB (confirmed in TCR). */
+	if (((READ_SYSREG(ID_AA64MMFR0_EL1) >> 28) & 15) == 15) {
+		print("lancelot: this CPU cannot run the 4 KiB kernel\n");
 		return EFI_UNSUPPORTED;
 	}
 	if (!lancelot_load_payload()) {
@@ -152,6 +283,10 @@ lancelot_boot(void)
 		}
 	} else {
 		run_kernel(0, 0);
+	}
+	if (pi.checkpoint == 4 && loader_ctx[CTX_REASON] == 2 && loader_ctx[CTX_ESR] == 4) {
+		lancelot_mmu_probe(0x1005); /* MMU and both caches off */
+		lancelot_mmu_probe(1);      /* checkpoint macro: MMU off, caches still on */
 	}
 	print("lancelot: run finished; result=%s\n", last_result);
 	/* Preserve the composed kernel log: flush_log() would replace it with loader text. */
