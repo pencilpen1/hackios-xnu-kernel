@@ -86,7 +86,7 @@ static efi_system_table *ST;
 static efi_boot_services *BS;
 static efi_handle IMAGE;
 static efi_file *esp_root;
-static void save_esp_log(const char *data, uint64_t size);
+static void (*platform_log_char)(char);
 
 static char log_buf[32768];
 static uint32_t log_len;
@@ -180,6 +180,7 @@ put_char(char c)
 	if (log_len < sizeof(log_buf) - 1) {
 		log_buf[log_len++] = c;
 	}
+	if (platform_log_char) platform_log_char(c);
 	if (ST->con_out != NULL && !screen_quiet) {
 		if (c == '\n') {
 			w[0] = '\r', w[1] = '\n';
@@ -337,7 +338,13 @@ write_logs(const char *klog, uint64_t klog_len)
 
 	compose_logs(klog, klog_len);
 	if (esp_root != NULL) {
-		save_esp_log(staged_data, staged_len);
+		/* MTK's current firmware can block on FAT writes. The existing MUSB
+		 * transport drains its reserved RAM log while boot services run. */
+		if (platform_log_char && klog) {
+			const char *sep = "\n== KERNEL LOG ==\n";
+			while (*sep) platform_log_char(*sep++);
+			for (uint64_t i = 0; i < klog_len; i++) platform_log_char(klog[i]);
+		}
 		return;
 	}
 	bio = find_log_partition();
@@ -566,6 +573,7 @@ static const struct platform platform_lancelot = {
 	.name = "lancelot", .io_base = 0x0C000000, .io_size = 0x14000000,
 	.gic_dist = 0x0C000000, .gic_redist = 0x0C040000,
 	.cores = 8, .core_shift = 8, .small_cores = 0x3f,
+	.log_other_cpu = 1,
 	.fb_base = 0x7CDB0000,
 	/* MTK's UART is not PL011; Qualcomm watchdog/USB/UFS are not present. */
 };
@@ -617,7 +625,7 @@ enum {
 	CTX_ICC_PMR, CTX_ICC_IGRPEN1, CTX_ICC_BPR1, CTX_COUNT
 };
 uint64_t loader_ctx[CTX_COUNT];
-int loader_save_ctx(void);
+int loader_save_ctx(void) __attribute__((returns_twice));
 void loader_return_stub(void);
 
 __asm__ (
@@ -2518,6 +2526,8 @@ struct payload_info {
 	const uint8_t *kernel;
 	const uint8_t *ramdisk;
 	uint32_t ramdisk_size;
+	const uint8_t *bootdisk;        /* optional small md0; ramdisk then becomes md1 */
+	uint32_t bootdisk_size;
 	const char *cmdline;
 	uint64_t checkpoint;
 	uint64_t forced_base;
@@ -2580,6 +2590,9 @@ parse_payload(struct payload_info *pi, int verbose)
 		if (str_eq(e->name, "ramdisk")) {
 			pi->ramdisk = p + sizeof(*e);             /* becomes /dev/md0, the root device */
 			pi->ramdisk_size = e->size;
+		} else if (str_eq(e->name, "bootdisk")) {
+			pi->bootdisk = p + sizeof(*e);
+			pi->bootdisk_size = e->size;
 		} else if (str_eq(e->name, "kernel")) {
 			pi->kernel = p + sizeof(*e);
 		} else if (str_eq(e->name, "cmdline")) {
@@ -2833,6 +2846,14 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	if (pi.resident_rd != 0) {
 		resident_rd_size = pi.resident_rd;
 	}
+	if (pi.bootdisk_size && (resident_rd_size || !rd_size)) {
+		print("bootdisk needs ramdisk and cannot accompany a resident image\n");
+		return 0;
+	}
+	if (pi.bootdisk_size) {
+		rd1_pa = rd_pa + rd_size;
+		rd1_size = ((uint64_t)pi.bootdisk_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
+	}
 	if (resident_rd_size != 0) {
 		uint64_t res_pa = phys_base + RESIDENT_RD_OFFSET;
 		uint64_t res_size = (resident_rd_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
@@ -2880,7 +2901,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		print("ramdisk at pa %x size %x\n", rd_pa, rd_size);
 	}
 	if (rd1_size != 0) {
-		print("resident image at pa %x size %x: it is the root (md0), the payload ramdisk is md1\n", rd1_pa, rd1_size);
+		if (pi.bootdisk_size) {
+			memset((void *)rd1_pa, 0, rd1_size);
+			memcpy((void *)rd1_pa, pi.bootdisk, pi.bootdisk_size);
+		}
+		print("root image at pa %x size %x: it is md0, the payload ramdisk is md1\n", rd1_pa, rd1_size);
 	}
 
 	/* "bootcpu=N" among the kernel's arguments: run it on core N (see run_on_other_cpu) */
@@ -3315,7 +3340,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	wdt_set_ms(60000);
 
 	/* --- hand off (UEFI is left resident, see loader_save_ctx) ------------ */
+	if (PLAT == &platform_lancelot) print("lancelot: saving firmware context before handoff\n");
 	if (loader_save_ctx() == 0) {
+		if (PLAT == &platform_lancelot) print("lancelot: firmware context saved, cleaning kernel memory\n");
 		/*
 		 * On real hardware (under the Qualcomm hypervisor) dirty data-cache
 		 * lines do not survive the MMU-off round trip. UEFI stays resident,
@@ -3343,6 +3370,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			jump_to_kernel((uint64_t)(uintptr_t)&loader_return_stub, 0);
 		}
 		if (kernel_mpidr != this_mpidr) {
+			if (PLAT == &platform_lancelot) print("lancelot: starting secondary MPIDR %x\n", kernel_mpidr);
 			int64_t status = run_on_other_cpu(kernel_mpidr, entry_va + slide, ba_pa, kernel_live, slide, kernel_budget);
 
 			wdt_set_ms(WDT_BITE_MS);

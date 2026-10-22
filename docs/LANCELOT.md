@@ -14,7 +14,15 @@
 - Existing UEFI: [pencilpen1/Mu-Silicium](https://github.com/pencilpen1/Mu-Silicium),
   baseline `293c87e0`, lancelot USB dual v0.3. It has successfully booted Linux on this device.
 
-Raw Android evidence and partition backups belong in the ignored `local/` directory.
+Raw Android evidence belongs in the ignored `local/` directory. Verified partition backups
+are in `D:\AI_rom\ubuntuforlava\work\hackios-backup-20261022`:
+
+- `android-boot.img`: 64 MiB; matches `E:\shuaji\Lancelot\boot.img`.
+- `esp-before.img`: 1 GiB; SHA-256 `6f1e5c78166360f661c113d638c90e000e114c61ffe3f56b2ecf06c691713510`.
+- `Ubuntu-before-ios.img.gz`: the entire 33,285,963,776-byte partition, compressed to
+  2,559,218,342 bytes. Decompressed/source SHA-256:
+  `5c5327b280c1197065f2a82489a1959405e6782dfc0f5cc8661b96872a6ac031`.
+  Gzip integrity, byte count and before/after source hashes all verified.
 Use `tools/collect-android-port.py --adb PATH --serial SERIAL --out NEW_DIRECTORY` to repeat collection.
 
 ## EFI/XNU boot
@@ -24,13 +32,16 @@ bash common/build-lancelot.sh checkpoint
 ```
 
 Produces `out/lancelot/EFI/HackiOS/loader.efi` and `boot.xnup`. The EFI app loads the XNUP
-from its own ESP, allocates its memory through UEFI, and writes `EFI/HackiOS/last.log`.
+from its own ESP and allocates its memory through UEFI. **No UEFI filesystem writes**:
+logs go to the existing MUSB LLOG1 RAM ring, not FAT metadata or raw log partitions.
 The lancelot build explicitly selects MTK even if GOP's buffer moves. It does not use the
 redwood boot shim, hard-coded payload reservation, Qualcomm USB protocol or UFS registers.
 The generic `common/build.sh lancelot` entry delegates to this path.
 
-`checkpoint` currently stops at XNU assembly checkpoint 1 (before page tables), and `selftest`
-exercises just the loader's context round trip. Neither is a complete iOS boot.
+`checkpoint` stops at XNU assembly checkpoint 1 (before page tables); `sweep` advances
+through 1, 2, 3, 4, 5 and 10. XNU runs on A75 MPIDR `0x600`, leaving firmware on core 0.
+`selftest` exercises the same-core context round trip and is not yet validated on MTK.
+These tests are not complete iOS boots.
 The shipped XNU is the repository's unmodified prebuilt `xnu-8796.121.2`.
 Build success is not hardware validation: advance through checkpoints 1–5, 10+, then
 root mount and userland after examining the real device log.
@@ -61,9 +72,50 @@ images are local artifacts, not Git content.
 The existing UEFI exposes diagnostic fastboot `18d1:d00d`, serial `lancelot-uefi`,
 interface 0, OUT `0x01`, IN `0x81`. Its `oem log <16-hex-digit-cursor>` returns LLOG1/LLOGD
 records from a RAM ring at `0x512c0000`. It is not a CDC ACM COM port, and is not the
-loader's Qualcomm USB API. ESP logs provide the initial kernel evidence while USB transport
-integration is developed. UEFI USB remains a boot-services facility; running XNU on the same
+loader's Qualcomm USB API. Loader logs are appended to this ring for USB retrieval.
+UEFI USB remains a boot-services facility; running XNU on the same
 core suspends its callbacks until the kernel returns.
+
+Capture with Windows platform-tools or Linux fastboot:
+
+```sh
+python tools/read-lancelot-log.py --fastboot /path/to/fastboot --out logs/lancelot.log
+```
+
+The reader validates the advertised byte ranges and hex framing before advancing a cursor.
+Host tests reject truncation, extra data and a bare OKAY with no firmware log.
+
+### UEFI write defect and scope
+
+First hardware test loaded the payload and printed the memory map, then blocked while
+writing `last.log`. Android reported corrupt FSINFO/FAT; the complete original ESP was
+restored and its hash verified. Root cause in Mu-Silicium's `MsdcFifoWrite`: the 32-bit
+FIFO write read `*ByteBuffer` (one byte), advancing by four, producing byte/zero corruption.
+`uefi/mt6768-msdc-fifo.patch` repairs the actual word load. `tools/test-msdc-fifo.py`
+compiled the real function: old source fails at length 4, fixed source preserves alignments
+0..7 and lengths 0..4096 under ASan/UBSan.
+
+The user authorized this existing fix and its use; it is committed and pushed as
+Mu-Silicium `251bd657`. The resulting image SHA-256 is
+`a23bdf6ddf8bcde9275b57240ba87abe60373651f2e3a5fd254ed2e4c6074f7c`.
+**Ask the user before any further UEFI source modifications.** Loader/XNU work continues
+without more UEFI changes. The source tree's older unrelated local edits were not committed.
+
+### iOS image status
+
+16.7.16 `root.apfs` and `system.apfs` built successfully. apfsck reports both clean;
+the kernel APFS reader checked 77 and 62,393 entries against their source trees respectively.
+A 4 MiB `flashboot.apfs` (stage0 + mount points) also passed readback checks.
+`tools/prepare-lancelot-flash.py` converted the original local DMGs to consecutive APFS
+containers: root 5,635,047,424 bytes, OS cryptex 2,743,074,816 bytes, App 10,485,760 bytes.
+Output SHA-256: `0c5685be9960495afccbdd7f0fd257b35620931f7b456ae793c2a55c7241b51a`.
+This image has **not been written to Ubuntu yet**; hardware boot/ABI compatibility is unverified.
+If 16.7 userspace is incompatible, the user authorizes the upstream `ios165/fetch.sh`
+download of matching 16.5. Keep the two versions in separate source directories.
+
+`common/build-lancelot.sh ios` packages small md0/md1 images. It uses the existing read-only
+loader Block I/O mailbox (`ufs_*` names are legacy, also usable with eMMC) with firmware
+servicing requests on core 0 and XNU on core 6. Native Qualcomm UFS is not enabled.
 
 Full iOS boot also needs a low-memory storage strategy (the system image exceeds the usable
 contiguous RAM), MTK input and watchdog integration, and verification of 16.7 userspace with

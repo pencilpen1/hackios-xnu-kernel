@@ -1,0 +1,8 @@
+diff --git a/Silicon/MediaTek/MediaTekPkg/Drivers/MsdcDxe/MsdcDxe.c b/Silicon/MediaTek/MediaTekPkg/Drivers/MsdcDxe/MsdcDxe.c
+--- a/Silicon/MediaTek/MediaTekPkg/Drivers/MsdcDxe/MsdcDxe.c
++++ b/Silicon/MediaTek/MediaTekPkg/Drivers/MsdcDxe/MsdcDxe.c
+@@ -482,3 +482,3 @@ MsdcFifoWrite (
+-    MmioWrite32 (Private->MsdcMmioReg + MSDC_TXDATA, *ByteBuffer);
++    MmioWrite32 (Private->MsdcMmioReg + MSDC_TXDATA, *(UINT32 *)ByteBuffer);
+     ByteBuffer += 4;
+     RemainSize -= 4;
