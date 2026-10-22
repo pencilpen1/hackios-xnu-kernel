@@ -2544,6 +2544,7 @@ struct payload_info {
 	uint64_t forced_base;
 	uint64_t resident_rd;           /* size of a root image the host put at the resident address */
 	int usb_mode;
+	int mmu_test;                  /* explicit diagnostic round trip, never normal boot */
 };
 
 static uint64_t
@@ -2616,6 +2617,8 @@ parse_payload(struct payload_info *pi, int verbose)
 			pi->checkpoint = parse_number(text, 10);  /* where the kernel should stop and come back */
 		} else if (str_eq(e->name, "usb")) {
 			pi->usb_mode = 1;                         /* stay in the loader and take commands over USB */
+		} else if (str_eq(e->name, "mmu-test")) {
+			pi->mmu_test = 1;
 		}
 		p += sizeof(*e) + padded;
 	}

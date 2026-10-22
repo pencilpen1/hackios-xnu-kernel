@@ -28,4 +28,5 @@ assert "cpus=1" in cmdline.split()
 for word in cmdline.split():
     assert not word.startswith(("bootcpu=", "cpumask=", "ufs=", "ufs_native=", "ufs_write=")), word
 assert entries["checkpoint"] in (b"1\0", b"2\0", b"3\0", b"4\0", b"5\0", b"10\0", b"998\0")
+assert "mmu-test" not in entries, "normal checkpoint payload must not auto-run the MMU teardown probe"
 print("XNUP validated: Mach-O kernel, bounded entries, boot-CPU-only arguments, checkpoint", entries["checkpoint"].rstrip(b"\0").decode())

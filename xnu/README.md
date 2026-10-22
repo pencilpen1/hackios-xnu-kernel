@@ -4,6 +4,7 @@ Our changes to XNU `xnu-8796.121.2` (the iOS 16.5 kernel, Darwin 22.5.0):
 
 - `redwood.patch` -- changes to Apple's files;
 - `files/` -- new files, at their paths in the XNU tree;
+- `lancelot.patch` -- additional checkpoint/exception teardown fix, applied after `redwood.patch`;
 - `apply.sh` -- takes Apple's sources and applies all of this; `export.sh` -- the reverse.
 
 It builds on Linux with stock clang, without macOS or Xcode.
@@ -54,6 +55,12 @@ Things to know:
 Changes are made directly in `xnu-src/xnu-8796.121.2` (an ordinary git tree of Apple's, on branch `redwood`).
 Before committing to this repository run `xnu/export.sh` (it regenerates the patch and `files/`); to update
 the ready-made kernel in `prebuilt/`, `tools/update-prebuilt.sh`.
+
+The MTK checkpoint fix is currently a separate overlay, `lancelot.patch`. Do not run
+`export.sh` on a tree with that overlay applied: it would also include the fix in
+`redwood.patch`, making a subsequent `apply.sh` apply it twice. Keep overlay changes
+in their own patch until deliberately merging it into the base patch. The checked-in
+prebuilt predates this overlay; rebuild the kernel before claiming the fix was tested.
 
 **Two traps, each of which cost a build.**
 

@@ -26,5 +26,6 @@ git checkout -q -b redwood "$TAG"
 [ "$(git rev-parse HEAD)" = "$BASE" ] || { echo "apply.sh: $TAG is $(git rev-parse HEAD), expected $BASE" >&2; false; }
 echo 'BUILD/' >> .git/info/exclude
 git apply --whitespace=nowarn "$HERE/redwood.patch"
+[ ! -s "$HERE/lancelot.patch" ] || git apply --whitespace=nowarn "$HERE/lancelot.patch"
 cp -a "$HERE/files/." .
 echo "apply.sh: $DIR: $TAG + $(grep -c '^diff --git' "$HERE/redwood.patch") changed and $(find "$HERE/files" -type f | wc -l) new files"

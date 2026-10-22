@@ -1,0 +1,42 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -324,12 +324,16 @@ Lloader_early_exception:
+ 	dsb		sy
+ 	mov		x2, #1
+-	mrs		x9, SCTLR_EL1
+-	bic		x9, x9, #1
+-	msr		SCTLR_EL1, x9
+-	isb
+ 	adr		x9, Lloader_stub_slot
+ 	ldr		x9, [x9, #8]
+ 	cbz		x9, .
++	// Resolve the physical target before changing address/cache interpretation.
++	mrs		x10, SCTLR_EL1
++	bic		x10, x10, #1
++	bic		x10, x10, #4
++	bic		x10, x10, #0x1000
++	dsb		sy
++	msr		SCTLR_EL1, x10
++	isb
+ 	br		x9
+ 	.align	3
+ 	.globl EXT(loader_stub_slot)
+@@ -627,11 +631,16 @@ Lloader_stub_slot:
+ 	mov		x1, #0
+ 	mov		x2, #2
+ 	mov		x3, #$0
++	// Only the requested checkpoint tears down MMU/caches to return to UEFI.
++	// The normal boot path branches around this entire sequence, leaving MMU on.
++	ldr		x9, [x9, #8]
+ 	mrs		x11, SCTLR_EL1
+ 	bic		x11, x11, #1
++	bic		x11, x11, #4
++	bic		x11, x11, #0x1000
++	dsb		sy
+ 	msr		SCTLR_EL1, x11
+ 	isb
+-	ldr		x9, [x9, #8]
+ 	br		x9
+ 1:
+ .endmacro

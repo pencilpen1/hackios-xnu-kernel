@@ -91,7 +91,7 @@ __asm__(
     "  ldr x9, [x12, #32]\n  msr sctlr_el1, x9\n  isb\n"
     "  mov x9, #2\n  str x9, [x12, #40]\n"
     "  dc cvac, x12\n  dsb sy\n"
-    "  mrs x9, sctlr_el1\n  ldr x10, [x12, #56]\n  bic x9, x9, x10\n"
+    "  mrs x9, sctlr_el1\n  bic x9, x9, #1\n  bic x9, x9, #4\n  bic x9, x9, #0x1000\n"
     "  msr sctlr_el1, x9\n  isb\n"
     "  adr x12, lancelot_probe_data\n  mov x9, #3\n  str x9, [x12, #40]\n"
     "  ldr x9, [x12, #48]\n  mov x0, #0\n  mov x1, #0\n  mov x2, #2\n  mov x3, #997\n  br x9\n"
@@ -109,7 +109,7 @@ __asm__(
 );
 
 static void
-lancelot_mmu_probe(uint64_t disable_mask)
+lancelot_mmu_probe(void)
 {
 	const uint64_t address = win_base + 0x08000000;
 	const uint64_t bytes = (uint64_t)(lancelot_probe_end - lancelot_probe_begin);
@@ -129,8 +129,7 @@ lancelot_mmu_probe(uint64_t disable_mask)
 	data[4] = 0x3454593d; /* SCTLR_EL1_DEFAULT in the pinned prebuilt */
 	data[5] = 0;
 	data[6] = (uint64_t)(uintptr_t)&loader_return_stub;
-	data[7] = disable_mask;
-	print("mmu-probe: entry=%x data=%x SCTLR=%x disable=%x\n", entry, address + data_offset, data[4], disable_mask);
+	print("mmu-probe: DIAGNOSTIC ONLY entry=%x data=%x SCTLR=%x\n", entry, address + data_offset, data[4]);
 	lancelot_walk_4k(entry, 0);
 	if (loader_save_ctx() == 0) {
 		clean_dcache((uint64_t)(uintptr_t)loader_ctx, (uint64_t)(uintptr_t)loader_ctx + sizeof(loader_ctx));
@@ -141,6 +140,7 @@ lancelot_mmu_probe(uint64_t disable_mask)
 	}
 	flush_dcache(address + data_offset, address + bytes);
 	print("mmu-probe: stage=%d (3=roundtrip) ESR=%x ELR=%x FAR=%x\n", data[5], data[8], data[9], data[10]);
+	print("mmu-probe: restored firmware SCTLR=%x MMU=%d\n", READ_SYSREG(SCTLR_EL1), READ_SYSREG(SCTLR_EL1) & 1);
 }
 
 static void
@@ -270,7 +270,8 @@ lancelot_boot(void)
 	print("lancelot: same-core bring-up, no PSCI CPU_ON; USB capture window 30 s\n");
 	BS->stall(30000000);
 	struct payload_info pi;
-	if (parse_payload(&pi, 0) && pi.checkpoint == 998) {
+	int valid = parse_payload(&pi, 0);
+	if (valid && pi.checkpoint == 998) {
 		/* A sequence ends at the first failed return, never masks a failed step. */
 		static const uint64_t checkpoints[] = { 1, 2, 3, 4, 5, 10 };
 		for (unsigned i = 0; i < sizeof(checkpoints) / sizeof(checkpoints[0]); i++) {
@@ -284,9 +285,9 @@ lancelot_boot(void)
 	} else {
 		run_kernel(0, 0);
 	}
-	if (pi.checkpoint == 4 && loader_ctx[CTX_REASON] == 2 && loader_ctx[CTX_ESR] == 4) {
-		lancelot_mmu_probe(0x1005); /* MMU and both caches off */
-		lancelot_mmu_probe(1);      /* checkpoint macro: MMU off, caches still on */
+	if (valid && pi.mmu_test && pi.checkpoint == 4 && !pi.ramdisk_size && !pi.bootdisk_size &&
+	    !pi.resident_rd && loader_ctx[CTX_REASON] == 2 && loader_ctx[CTX_ESR] == 4) {
+		lancelot_mmu_probe(); /* Explicit diagnostic teardown, never executes iOS. */
 	}
 	print("lancelot: run finished; result=%s\n", last_result);
 	/* Preserve the composed kernel log: flush_log() would replace it with loader text. */

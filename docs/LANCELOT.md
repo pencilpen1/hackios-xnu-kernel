@@ -145,6 +145,18 @@ kernel virtual entry and exception vectors. The standalone loader MMU probe also
 `stage=3` with zero ESR/ELR/FAR using those exact tables and the prebuilt's SCTLR.
 This proves a minimal MMU round trip, not yet XNU checkpoint 5 or iOS boot.
 
+**MMU policy:** normal XNU/iOS execution must retain the MMU and caches. Disabling them
+is only a diagnostic teardown/handoff, followed by restoring the firmware's MMU; it is
+not a boot workaround. The standalone probe is now opt-in (`mkpayload.py --mmu-test`),
+allowed only after checkpoint 4 without RAM disks. Normal checkpoint/sweep payloads do
+not run it. The planned MMU-only-disable comparison was cancelled before device deployment.
+The next work is a fix to the checkpoint's teardown code and normal post-MMU execution.
+`xnu/lancelot.patch` now loads the return target before teardown and synchronizes
+MMU/cache state on the taken checkpoint/exception path. The actual checkpoint macro
+compiles, and a disassembly test confirms the ordinary boot branch bypasses the complete
+teardown sequence. This is a source-level repair candidate: the installed prebuilt does
+not contain it yet, and checkpoint 5 remains unverified until rebuilding and retesting.
+
 Full iOS boot also needs a low-memory storage strategy (the system image exceeds the usable
 contiguous RAM), MTK input and watchdog integration, and verification of 16.7 userspace with
 the 16.5 kernel. Mali GPU, MediaTek Wi-Fi/audio and native eMMC support are not provided by
