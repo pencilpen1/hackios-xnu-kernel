@@ -157,6 +157,32 @@ compiles, and a disassembly test confirms the ordinary boot branch bypasses the 
 teardown sequence. This is a source-level repair candidate: the installed prebuilt does
 not contain it yet, and checkpoint 5 remains unverified until rebuilding and retesting.
 
+### Rebuild and deploy the repair
+
+The build uses WSL's Linux filesystem and four jobs initially; the machine had about
+8.8 GiB free WSL RAM when preparation started. Keep the phone in Android while preparing.
+These commands do not flash anything:
+
+```sh
+# Can run with Windows Python when WSL's GitHub downloads are slow:
+python tools/fetch-xnu-toolchain.py --out local/build-deps-NEW
+# In the WSL workspace (adjust archive path to the Windows checkout):
+python3 tools/prepare-xnu-sources.py "$PWD"
+bash tools/setup-xnu-offline.sh /mnt/d/AI_rom/iOSforLava/hackios-xnu-kernel/local/build-deps-NEW
+JOBS=4 CHECKPOINT=5 bash common/build-lancelot-kernel.sh
+```
+
+Archives are pinned to the upstream Theos toolchain/16.5 SDK and macOS 13.3 SDK for
+pre-generated DriverKit headers. Ranges, archive integrity and hashes are checked; only
+macOS SDK has a published hash. No Apple IPSW or phone firmware is downloaded by this step.
+
+`build-lancelot-kernel.sh` refuses an absent/stale kernel and verifies checkpoints 1–5
+in the actual machine code before packaging. Upstream's post-link export errors are
+not treated as success unless a fresh verified kernel exists. `mach.lancelot` is a local
+artifact; the old prebuilt stays untouched. Deployment then uses
+`tools/deploy-lancelot.py --adb PATH --serial SERIAL --files DIRECTORY` with readback hashes,
+and the already-authorized UEFI image only. No Ubuntu partition write is needed for this test.
+
 Full iOS boot also needs a low-memory storage strategy (the system image exceeds the usable
 contiguous RAM), MTK input and watchdog integration, and verification of 16.7 userspace with
 the 16.5 kernel. Mali GPU, MediaTek Wi-Fi/audio and native eMMC support are not provided by
