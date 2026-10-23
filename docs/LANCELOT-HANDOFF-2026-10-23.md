@@ -18,6 +18,10 @@
 - The user now permits removal of old Ubuntu OS files. They have not been deleted: deployment
   is already complete and about 15.8 GiB remains free. Never delete `/hackios/20H392`, the
   verified host backup, userdata, ESP, or GPT as part of any later Ubuntu-only cleanup.
+- The user now explicitly requires **persistent read/write support on hardware** after the
+  read path is validated. The current candidate is still read-only. Next storage phase should
+  use a dedicated preallocated data image on Ubuntu with bounded writes/flush/readback;
+  do not turn raw Ubuntu/ext4 metadata, GPT or the system-container device into a write target.
 
 ## Device and recovery
 
@@ -346,6 +350,15 @@ python tools/deploy-ubuntu-files.py `
   XNUP `97c7fe2d49baccfe49d80546b6f1b77a3d18cb4a4b5b35ccd0d7c213a4c4859b`.
   Native eMMC reads/root switch remain pending hardware verification. The builder checks
   relevant native driver/header/call-site sources against the tracked files before compiling.
+- That candidate was deployed with matching ESP readback hashes and the same fixed UEFI.
+  `local/lancelot-native-emmc-20261023/xnu-native-emmc.log` completed a 240-second **host-only**
+  capture: boot ID `0000000003b94a3c`, 3,438 firmware bytes. The loader verified both bootstrap
+  images and supplied Ubuntu offset `0x6cbd00000`, superblock digest and
+  `root_apfs=lancelot_ios`; it entered the kernel with checkpoint 0. USB went quiet while
+  XNU owned the CPU, so this capture does not establish native I/O or root-switch success.
+  The user selected "new launchd output" but has not provided the actual new lines/photo yet.
+  Obtain those before diagnosing the next issue or claiming full iOS launchd startup.
+  Native writes are still unimplemented; the user's requested persistent read/write phase is next.
 
 ## Next AI: required sequence
 
