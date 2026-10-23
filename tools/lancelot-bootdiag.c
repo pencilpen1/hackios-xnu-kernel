@@ -10,7 +10,7 @@ struct proc_bsdinfo {
 	uint64_t start_sec, start_usec;
 };
 _Static_assert(sizeof(struct proc_bsdinfo) == 136, "PROC_PIDTBSDINFO ABI");
-static const char *wanted[] = {"launchd", "SpringBoard", "backboardd", "runningboardd", "PosterBoard", "wifid", "mobileactivationd"};
+static const char *wanted[] = {"launchd", "SpringBoard", "backboardd", "runningboardd", "PosterBoard", "mediaserverd", "lsd", "wifid", "mobileactivationd"};
 static uint64_t metric(const char *name)
 {
 	char path[128];
@@ -88,12 +88,31 @@ static void tail(const char *path, off_t *cursor)
 	if (st.st_size > 4 * 1024 * 1024) { (void)ftruncate(fd, 0); *cursor = 0; }
 	close(fd);
 }
+
+/* Incremental, unfiltered file forwarding into the USB log ring, not the
+ * framebuffer. Offsets and loss notices make truncation/backlog explicit. */
+static void forward(const char *path, off_t *cursor)
+{
+	static char data[16384];
+	struct stat st;
+	int fd = open(path, O_RDONLY, 0);
+	if (fd < 0) return;
+	if (fstat(fd, &st) || st.st_size < 0) { close(fd); return; }
+	if (*cursor > st.st_size) { printf("bootdiag: file truncated %s old_offset=%lld\n", path, *cursor); *cursor = 0; }
+	ssize_t n = pread(fd, data, sizeof(data), *cursor);
+	if (n > 0 && (size_t)n <= sizeof(data)) {
+		/* This marker also identifies chunks that end halfway through a line. */
+		printf("bootdiag: file-chunk %s offset=%lld bytes=%lld\n", path, *cursor, (long long)n);
+		if (!sysctlbyname("kern.redwood.usb_log", NULL, NULL, data, (size_t)n)) *cursor += n;
+	}
+	close(fd);
+}
 int main(int argc, char **argv, char **envp)
 {
 	(void)argc; (void)argv; (void)envp;
 	int fd = open("/dev/console", O_WRONLY, 0);
 	if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); if (fd > 2) close(fd); }
-	off_t sb = 0, bb = 0;
+	off_t sb = 0, bb = 0, sb_raw = 0, bb_raw = 0;
 	for (unsigned sample = 0;; sample++) {
 		printf("bootdiag: sample=%u mmc width=%llu hz=%llu batch=%llu errors=%llu\n", sample,
 		    (unsigned long long)metric("lancelot_mmc_bus_width"), (unsigned long long)metric("lancelot_mmc_clock_hz"),
@@ -101,9 +120,16 @@ int main(int argc, char **argv, char **envp)
 		printf("bootdiag: sectors=%llu commands=%llu pio_us=%llu fallback=%llu\n",
 		    (unsigned long long)metric("lancelot_mmc_sectors"), (unsigned long long)metric("lancelot_mmc_commands"),
 		    (unsigned long long)metric("lancelot_mmc_pio_us"), (unsigned long long)metric("lancelot_mmc_mode_fallbacks"));
+		printf("bootdiag: usb polls=%llu resets=%llu commands=%llu sent=%llu\n",
+		    (unsigned long long)metric("usb_log_polls"), (unsigned long long)metric("usb_log_resets"),
+		    (unsigned long long)metric("usb_log_commands"), (unsigned long long)metric("usb_log_sent"));
 		processes();
 		tail("/private/var/log/hackios/SpringBoard.log", &sb);
 		tail("/private/var/log/hackios/backboardd.log", &bb);
-		usleep(30000000);
+		for (unsigned tick = 0; tick < 300; tick++) {
+			forward("/private/var/log/hackios/SpringBoard.log", &sb_raw);
+			forward("/private/var/log/hackios/backboardd.log", &bb_raw);
+			usleep(100000);
+		}
 	}
 }

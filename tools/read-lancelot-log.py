@@ -9,7 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import subprocess
+import struct
 import time
+import tempfile
+import zlib
 
 
 @dataclass
@@ -41,6 +44,18 @@ def parse(data):
     return Batch(*header, bytes(payload))
 
 
+def parse_klog(data):
+    if len(data) < 40:
+        raise ValueError("truncated KLOG2 header")
+    magic, boot, start, end, checksum, size = struct.unpack_from("<8sQQQII", data)
+    payload = data[40:]
+    if magic != b"KLOG2\0\0\0" or not 0 <= end - start <= 16384 or size != end - start or len(payload) != size:
+        raise ValueError("invalid KLOG2 range/length")
+    if zlib.crc32(payload) != checksum:
+        raise ValueError("KLOG2 checksum mismatch")
+    return Batch(boot, start, end, payload)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--fastboot", default="fastboot")
@@ -48,29 +63,41 @@ def main():
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--duration", type=float, default=120)
     ap.add_argument("--once", action="store_true")
+    ap.add_argument("--runtime", action="store_true", help="capture XNU KLOG2 via fastboot upload; keep retrying through handoff")
+    ap.add_argument("--quiet", action="store_true", help="save all bytes without echoing the phone's log to the terminal")
     args = ap.parse_args()
     if not 0 < args.duration < float("inf"):
         ap.error("duration must be finite and positive")
     args.out.parent.mkdir(parents=True, exist_ok=True)
     cursor, boot, total = 0, None, 0
     deadline = time.monotonic() + args.duration
-    with args.out.open("ab") as output, args.out.with_suffix(args.out.suffix + ".fastboot").open("ab") as raw:
+    with tempfile.TemporaryDirectory(prefix="klog-", dir=args.out.parent) as staging, \
+            args.out.open("ab") as output, args.out.with_suffix(args.out.suffix + ".fastboot").open("ab") as raw:
         def note(text):
             line = f"\n[capture] {text}\n"
             print(line.strip(), flush=True)
             output.write(line.encode())
             output.flush()
-        note("starting LLOG1 capture")
+        note("starting " + ("XNU KLOG2" if args.runtime else "LLOG1") + " capture")
         while time.monotonic() < deadline:
             try:
-                result = subprocess.run([args.fastboot, "-s", args.serial, "oem", "log", f"{cursor:016x}"],
-                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                        timeout=min(10, max(0.1, deadline - time.monotonic())))
-                raw.write(result.stdout)
-                raw.flush()
-                if result.returncode:
-                    raise ValueError("fastboot command failed")
-                batch = parse(result.stdout)
+                def command(*parts):
+                    result = subprocess.run([args.fastboot, "-s", args.serial, *parts],
+                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                            timeout=min(10, max(0.1, deadline - time.monotonic())))
+                    raw.write(result.stdout)
+                    raw.flush()
+                    if result.returncode:
+                        raise ValueError("fastboot command failed: " + result.stdout.decode(errors="replace").strip())
+                    return result.stdout
+                if args.runtime:
+                    snapshot = Path(staging) / "snapshot.bin"
+                    snapshot.unlink(missing_ok=True)
+                    command("oem", "klog", f"{cursor:016x}")
+                    command("get_staged", str(snapshot))
+                    batch = parse_klog(snapshot.read_bytes())
+                else:
+                    batch = parse(command("oem", "log", f"{cursor:016x}"))
                 if boot != batch.boot:
                     old = boot
                     boot, cursor = batch.boot, 0
@@ -82,11 +109,11 @@ def main():
                 chunk = batch.data[max(0, cursor - batch.start):]
                 output.write(chunk)
                 output.flush()
-                if chunk:
+                if chunk and not args.quiet:
                     print(chunk.decode("utf-8", errors="replace"), end="", flush=True)
                 total += len(chunk)
                 cursor = max(cursor, batch.end)
-                if len(batch.data) < 4096:
+                if len(batch.data) < (16384 if args.runtime else 4096):
                     if args.once:
                         return 0
                     time.sleep(0.2)
@@ -95,7 +122,7 @@ def main():
                 if args.once:
                     return 1
                 time.sleep(0.5)
-        note(f"saved {total} firmware bytes")
+        note(f"saved {total} {'kernel/userland' if args.runtime else 'firmware'} bytes")
     return 0 if total else 1
 
 

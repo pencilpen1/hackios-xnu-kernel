@@ -87,6 +87,8 @@ static efi_boot_services *BS;
 static efi_handle IMAGE;
 #include "../xnu/files/bsd/dev/lancelot_storage.h"
 static struct lancelot_storage mtk_storage_info;
+static uint64_t mtk_usb_offer[3]; /* magic, initialized MAC, firmware boot id */
+static void lancelot_usb_resume(void);
 static efi_file *esp_root;
 static void (*platform_log_char)(char);
 
@@ -3148,6 +3150,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_prop_u32(&w, "#size-cells", 2);
 
 	dt_begin(&w, "chosen");
+	if (PLAT == &platform_lancelot && mtk_usb_offer[0] && kernel_mpidr == this_mpidr)
+		dt_prop(&w, "lancelot-usb-log", mtk_usb_offer, sizeof(mtk_usb_offer));
 	if (PLAT == &platform_lancelot && mtk_storage_info.magic == LANCELOT_STORAGE_MAGIC)
 		dt_prop(&w, "lancelot-emmc", &mtk_storage_info, sizeof(mtk_storage_info));
 	dt_prop(&w, "random-seed", seed, sizeof(seed));
@@ -3442,6 +3446,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 
 	/* --- the kernel came back ------------------------------------------- */
+	if (PLAT == &platform_lancelot) lancelot_usb_resume();
 	wdt_set_ms(WDT_BITE_MS);
 	hc_take_back("the kernel came back");   /* before anything here touches the storage */
 	if (hc_known) {

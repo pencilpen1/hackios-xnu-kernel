@@ -81,6 +81,7 @@ static char     loader_log_scratch[LOADER_LOG_RING];
  * inside this very function) goes ahead without it.
  */
 static uint32_t loader_log_lock;
+static uint64_t loader_log_written;
 
 static void loader_log_put_locked(char c);
 
@@ -136,6 +137,7 @@ loader_log_line(const char *line)
 static void
 loader_log_put_locked(char c)
 {
+	if (loader_log_written != UINT64_MAX) loader_log_written++;
 	if (loader_log_linear || loader_log_len < LOADER_LOG_HEAD) {
 		if (loader_log_len < LOADER_LOG_SIZE) {
 			loader_log[loader_log_len++] = c;
@@ -150,6 +152,46 @@ loader_log_put_locked(char c)
 			loader_log_len = LOADER_LOG_HEAD + loader_log_ring_at;
 		}
 	}
+}
+
+/* A read cursor addresses the retained head followed by the rolling tail.
+ * A skipped middle is returned as a forward cursor gap, never silent loss.
+ * USB holds an immutable copy; writers never wait for a host transfer. */
+size_t loader_log_snapshot(uint64_t cursor, uint64_t *start, uint8_t *out, size_t capacity);
+size_t
+loader_log_snapshot(uint64_t cursor, uint64_t *start, uint8_t *out, size_t capacity)
+{
+	uint64_t daif = __builtin_arm_rsr64("DAIF");
+	__builtin_arm_wsr("DAIFSet", DAIFSC_IRQF | DAIFSC_FIQF);
+	*start = cursor;
+	if (!os_atomic_cmpxchg(&loader_log_lock, 0, 1, acquire)) {
+		__builtin_arm_wsr64("DAIF", daif);
+		return 0;
+	}
+	uint64_t total = loader_log_written, oldest = total > LOADER_LOG_HEAD + LOADER_LOG_RING ? total - LOADER_LOG_RING : LOADER_LOG_HEAD;
+	if (cursor > total) cursor = 0;
+	if (cursor >= LOADER_LOG_HEAD && cursor < oldest) cursor = oldest;
+	uint64_t end = cursor < LOADER_LOG_HEAD && total > LOADER_LOG_HEAD ? LOADER_LOG_HEAD : total;
+	size_t count = end - cursor < capacity ? (size_t)(end - cursor) : capacity;
+	*start = cursor;
+	if (cursor < LOADER_LOG_HEAD) __builtin_memcpy(out, loader_log + cursor, count);
+	else {
+		size_t at = (size_t)((cursor - LOADER_LOG_HEAD) % LOADER_LOG_RING);
+		size_t first = count < LOADER_LOG_RING - at ? count : LOADER_LOG_RING - at;
+		__builtin_memcpy(out, loader_log + LOADER_LOG_HEAD + at, first);
+		__builtin_memcpy(out + first, loader_log + LOADER_LOG_HEAD, count - first);
+	}
+	os_atomic_store(&loader_log_lock, 0, release);
+	__builtin_arm_wsr64("DAIF", daif);
+	return count;
+}
+
+/* File log forwarding bypasses framebuffer rendering but uses the same lock. */
+void loader_log_write(const char *data, size_t length);
+void
+loader_log_write(const char *data, size_t length)
+{
+	for (size_t i = 0; i < length; i++) loader_log_putc(data[i]);
 }
 
 /* Oldest first: the head, a note about what was dropped, then the ring from its oldest character. */
@@ -245,6 +287,8 @@ loader_jump(uint64_t reason, uint64_t code)
 		return;
 	}
 	loader_return_entered = true;
+	extern void lancelot_usb_stop(void);
+	lancelot_usb_stop();
 #if defined(GENERIC_GIC_V3_IRQ)
 	gic_v3_irq_quiesce();
 	/*

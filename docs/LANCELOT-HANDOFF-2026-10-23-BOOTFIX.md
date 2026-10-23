@@ -77,7 +77,16 @@ Windows artifact directory:
 
 ## Hardware validation and next work
 
-Combined EFI/kernel deployment and hardware observation are pending. Require actual evidence
+The bootfix combination was deployed and booted (firmware boot ID `00000000045630c4`).
+Its UEFI capture has 3514 bytes and confirms the root hash, checkpoint 0 and a 384 MHz
+MSDC source clock. The user reported continued user-space scrolling, lsd CPU-monitor
+messages and unsupported RedwoodAudio properties; a stable desktop is not confirmed.
+The lsd executable lacks `com.apple.private.kernel.override-cpumon`; the warning restores
+default limits, rather than killing the process. Audio property messages alone do not
+prove an audio-server restart. Firmware log timeouts after CPU handoff do not prove a hang.
+
+The next candidate adds XNU runtime USB logging; see `LANCELOT-RUNTIME-LOG.md`.
+Require actual evidence
 of negotiated transfer settings, zero sustained I/O errors, expected core processes and
 progress beyond the former Apple-logo stall before calling the combined fix passed/pushing.
 Host compilation alone is not that result.

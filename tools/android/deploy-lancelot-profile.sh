@@ -18,7 +18,7 @@ cleanup() {
 trap cleanup EXIT
 mount -t ext4 -o rw /dev/block/by-name/Ubuntu "$mountpoint"
 mounted=1
-dest=$mountpoint/hackios/20H392/bootfix-20261023
+dest=$mountpoint/hackios/20H392/runtime-log-20261023
 [ ! -L "$mountpoint/hackios" ] && [ ! -L "$mountpoint/hackios/20H392" ]
 [ -d "$mountpoint/hackios/20H392" ] && [ ! -e "$dest" ]
 mkdir "$dest"

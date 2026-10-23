@@ -178,10 +178,31 @@ lancelot_attach_log(void)
 			return;
 		}
 		platform_log_char = lancelot_log_char;
+		if (mtk_log->usb_active) {
+			mtk_usb_offer[0] = 0x31474f4c4253554cULL;
+			mtk_usb_offer[1] = 0x11200000;
+			mtk_usb_offer[2] = mtk_log->boot_id;
+		}
 		for (uint32_t i = 0; i < log_len; i++) platform_log_char(log_buf[i]);
 		print("lancelot: attached UEFI MUSB LLOG1 ring, USB active=%d\n", (uint64_t)mtk_log->usb_active);
 		return;
 	}
+}
+
+/* XNU leaves USB detached on return. Firmware regains its own state machine
+ * on the next host bus reset. This is an EFI application change only. */
+static void
+lancelot_usb_resume(void)
+{
+	if (!mtk_usb_offer[0]) return;
+	volatile uint8_t *mac = (volatile uint8_t *)(uintptr_t)mtk_usb_offer[1];
+	mac[1] = 0;
+	BS->stall(30000);
+	*(volatile uint16_t *)(mac + 6) = 3;
+	*(volatile uint16_t *)(mac + 8) = 2;
+	mac[11] = 4;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	mac[1] = 0x40;
 }
 
 static int
