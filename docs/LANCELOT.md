@@ -115,7 +115,7 @@ Output SHA-256: `0c5685be9960495afccbdd7f0fd257b35620931f7b456ae793c2a55c7241b51
 This image and the three prepared APFS files were deployed to the existing Ubuntu ext4
 directory `/hackios/20H392` on 2026-10-23. All four SHA-256 checks passed after transfer and
 after a read-only remount, then Ubuntu was unmounted; Android remains running. See
-`docs/LANCELOT-HANDOFF-2026-10-23.md` for logs, hashes and the no-reboot constraint.
+`docs/LANCELOT-HANDOFF-2026-10-23.md` for logs, hashes and the latest reboot authorization.
 These are files inside ext4, not a raw APFS partition; hardware boot/ABI compatibility is unverified.
 If 16.7 userspace is incompatible, the user authorizes the upstream `ios165/fetch.sh`
 download of matching 16.5. Keep the two versions in separate source directories.
@@ -135,9 +135,11 @@ The single-core test on the authorized UEFI image returned successfully from che
 **1, 2, 3 and 4**. Actual firmware: EL1, Cortex-A55 MIDR `0x411fd050`, timer 13 MHz,
 GOP 1080x2340 at `0x7cdb0000`. XNU's claimed contiguous window is
 `0xc0000000..0x13c000000` (1984 MiB), payload at `0x13c000000`.
-Checkpoint 5 has not returned; USB callbacks cease after the kernel takes the boot CPU.
-This narrows investigation to enabling the kernel MMU or its post-MMU return path, not
-an iOS 16.7 ABI issue. The original branch to `0xc345e4a8` now works.
+The original prebuilt stalled at checkpoint 5. On 2026-10-23, the rebuilt kernel with
+`xnu/lancelot.patch` **returned successfully from checkpoint 5 on hardware**, after enabling
+MMU. Log: `local/lancelot-cp5-hardware-20261023/xnu-cp5.log`, boot ID `0000000003c7f618`,
+`STOPPED AT CHECKPOINT 5`, `result=checkpoint 5 0`. Its entry PA is `0xc34464a8`.
+Next is checkpoint 10/C initialization; iOS userspace has not run.
 
 The pinned prebuilt actually uses **4 KiB kernel pages**, not 16 KiB: disassembly has
 2 MiB L2 blocks, 4 KiB table spacing and `_sysreg_restore` TCR `0x22a51a251a`
@@ -147,7 +149,8 @@ firmware state and walks the kernel's tables read-only, with bounded physical ad
 Hardware checkpoint-4 readback confirms correct translations for the physical entry,
 kernel virtual entry and exception vectors. The standalone loader MMU probe also completed
 `stage=3` with zero ESR/ELR/FAR using those exact tables and the prebuilt's SCTLR.
-This proves a minimal MMU round trip, not yet XNU checkpoint 5 or iOS boot.
+That probe proved a minimal MMU round trip; the later repaired XNU checkpoint-5 test passed
+separately. Neither is an iOS boot.
 
 **MMU policy:** normal XNU/iOS execution must retain the MMU and caches. Disabling them
 is only a diagnostic teardown/handoff, followed by restoring the firmware's MMU; it is
@@ -158,8 +161,9 @@ The next work is a fix to the checkpoint's teardown code and normal post-MMU exe
 `xnu/lancelot.patch` now loads the return target before teardown and synchronizes
 MMU/cache state on the taken checkpoint/exception path. The actual checkpoint macro
 compiles, and a disassembly test confirms the ordinary boot branch bypasses the complete
-teardown sequence. This is a source-level repair candidate: the installed prebuilt does
-not contain it yet, and checkpoint 5 remains unverified until rebuilding and retesting.
+teardown sequence. The rebuilt kernel SHA-256
+`17557e43eb9a4604149ba85ec2508bfcfd9964c9b1f1a39462f846ab1d9f30b1` contains this repair and
+passed checkpoint 5 on device; the checked-in prebuilt remains the older kernel.
 
 ### Rebuild and deploy the repair
 

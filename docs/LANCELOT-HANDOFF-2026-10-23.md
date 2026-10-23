@@ -2,9 +2,10 @@
 
 ## Latest user constraints
 
-- Keep Android running: **no reboot or boot test in the current session**. Continue the
-  host-side toolchain/kernel repair; checkpoint 5 hardware validation remains for a later
-  explicitly authorized test.
+- The user subsequently **authorized reboots and flashing the UEFI/test images**. The earlier
+  no-reboot restriction is superseded for phone bring-up. Host Windows reboot is unnecessary.
+  Checkpoint 5 has now passed on hardware. New EFI/XNUP is on ESP and the previously authorized
+  MSDC-fixed UEFI is on boot; the phone is resident in UEFI for log retrieval. See below.
 - ESP corruption is resolved by the existing UEFI MSDC patch, as confirmed by the user.
   Every future authorized UEFI source change must receive its own Git commit; ask before
   making new UEFI changes. No additional UEFI source changes were made for this deployment.
@@ -17,7 +18,7 @@
 ## Device and recovery
 
 - Xiaomi Redmi 9 `lancelot`, MT6768/MT6769T, 6x Cortex-A55 + 2x Cortex-A75, 4 GiB RAM.
-- Final confirmed operating state: Android (`sys.boot_completed=1`), USB debugging authorized.
+- Pre-test Android snapshot: Android (`sys.boot_completed=1`), USB debugging authorized.
   Final check is saved in kernel checkout `local/device-final-20261023.txt` (Ubuntu unmounted,
   mountpoint absent, Android boot SHA-256 unchanged, battery 100%, no deployment TCP forward).
   Fastboot boot tests can
@@ -91,14 +92,15 @@ python tools/deploy-ubuntu-files.py `
   `tools/read-lancelot-log.py` with Windows or native Linux fastboot.
 - On device, the loader loaded XNUP and XNU returned correctly from checkpoints 1–4.
   Minimal MMU enable/disable/firmware-return probe also passed with ESR/ELR/FAR zero.
-  Normal XNU checkpoint 5 (enabling MMU and continuing execution) remains unresolved.
+  On 2026-10-23 the rebuilt kernel also passed checkpoint 5 on hardware after enabling MMU;
+  it returned through the diagnostic teardown to UEFI. Checkpoint 10/C initialization is next.
 - The pinned kernel is XNU `xnu-8796.121.2`, configured for 4 KiB granules. Actual TCR from the
   prebuilt is `0x22a51a251a`; do not infer 16 KiB merely from CPU support.
 - `xnu/lancelot.patch` fixes checkpoint-only and early-exception return ordering; ordinary XNU
   boot bypasses that teardown. Source/application and linked-machine-code verifiers exist.
   The old prebuilt does **not** contain this fix. The new host-built `mach.lancelot` passed
   `tools/verify-xnu-checkpoint.py`; its checkpoint-5 payload passed validation. These are
-  static checks, not an on-device checkpoint-5 pass.
+  static checks; the subsequent hardware pass is separately recorded below.
 - Local host RAM is ample (~8.9 GiB available in WSL). A complete earlier download exists in
   `local/build-deps-20261022` in the Windows kernel checkout: all three archives matched their
   manifest SHA-256/length and passed XZ decompression integrity checks on 2026-10-23.
@@ -130,8 +132,9 @@ python tools/deploy-ubuntu-files.py `
   | `EFI/HackiOS/loader.efi` | 68,096 | `1bebd8de8835682b3460ed6b0d4482dab65f3359eac3924e214d46340b9f4bd3` |
   | `EFI/HackiOS/boot.xnup` | 15,144,664 | `61c3c2bfc4ca0e5219fc53c06cae6fd144347f7d2ad60e7c88599d0532318d36` |
 
-- These checkpoint artifacts are **host-only, not deployed to ESP or boot**. No reboot was
-  performed. The earlier four iOS/APFS payloads are already deployed on Ubuntu.
+- At completion of the host rebuild these checkpoint artifacts were host-only. After the
+  later reboot/flash authorization they were deployed and tested as recorded below.
+  The earlier four iOS/APFS payloads are already deployed on Ubuntu.
 - Mirror-first dependency fetching now supports repeatable `--mirror HTTPS_PREFIX` and
   `HACKIOS_GITHUB_MIRROR`, defaulting to `https://ghfast.top`, then direct GitHub. All three
   archive hashes are pinned to published/original-download values. Offline tests verify
@@ -148,6 +151,39 @@ python tools/deploy-ubuntu-files.py `
 - Kernel repository commits pushed to `pencilpen1/hackios-xnu-kernel`: `0bf2983`, `cae871b`,
   `9ec84c0`, `0221bd8`, `057c0d5`, `013652b`, `23dde59` (check Git for the latest HEAD).
 
+## Authorized checkpoint-5 hardware test — 2026-10-23
+
+- Test directory: kernel checkout `local/lancelot-cp5-hardware-20261023/`.
+- The exact fixed UEFI is WSL
+  `/home/pencilqwq/Mu-Silicium/Mu-Silicium/Mu-lancelot.img`, copied to
+  `Mu-lancelot-msdc-fixed.img` in that test directory; SHA-256
+  `a23bdf6ddf8bcde9275b57240ba87abe60373651f2e3a5fd254ed2e4c6074f7c`, 608,256 bytes.
+  `E:\shuaji\Lancelot\MuUEFI-lancelot.img` is the older baseline (`b50c3e6c...`), not this fix.
+  Existing unrelated/local UEFI source edits were left untouched; no UEFI rebuild was done.
+- Preflight confirmed Android running, boot `/dev/block/mmcblk0p33` (64 MiB), ESP
+  `/dev/block/mmcblk0p48` (1 GiB), ESP/Ubuntu unmounted and battery 100%.
+- Prior EFI/HackiOS and fallback loader were saved in `esp-files-before-cp5.tar`, SHA-256
+  `62a3c339d3e11ad2b409a0a874f556557ae1cd208289214167e6bce7ff8caa18`.
+  `esp-deployment.log` records the new payload and both loader copies matching the host hashes.
+- Native fastboot confirmed `product: lancelot` and boot size `4000000`; flashing the fixed
+  UEFI returned OKAY. `boot-flash.log` records the commands/results. Phone reboot was issued;
+  `xnu-cp5.log` and `.fastboot` contain the completed LLOG1 capture (3,367 firmware bytes).
+  No Ubuntu rewrite was performed.
+- **Hardware checkpoint 5 PASSED:** log boot ID `0000000003c7f618`, payload size 15,144,664,
+  entry PA `0xc34464a8`, return slot `0xc3447800`; it reports `STOPPED AT CHECKPOINT 5` and
+  `result=checkpoint 5 0`. Kernel TCR `0x22a51a251a`, TTBR0 `0xc319e000`, TTBR1 `0xc319f000`.
+  The reported SCTLR `0x34544938` is sampled after checkpoint teardown, not normal runtime.
+  This validates the repaired MMU-enable/checkpoint-return sequence, not C/iOS startup.
+- The earlier Android final-state and host-only artifact statements describe the pre-test
+  snapshot; boot now contains the fixed UEFI and ESP contains the repaired checkpoint-5 package.
+- Current firmware USB interface (`lancelot-uefi`) supports only `getvar` and `oem log`, not
+  reboot/download/flash. The loader deliberately stays resident after the successful test.
+  To change the ESP files, enter **native FASTBOOT with Power + Volume Down**, restore Android
+  boot temporarily, boot Android, deploy the next package, then flash the same fixed UEFI.
+- Checkpoint-10 package prepared and validated (not deployed yet):
+  `local/lancelot-cp10-hardware-20261023/EFI/HackiOS/`. Loader hash is unchanged; XNUP SHA-256
+  `af3ad9b110964634ef8ee77d1a0fb1c6e94979fcd3373719222978a3542602ce`, 15,144,664 bytes.
+
 ## Next AI: required sequence
 
 1. Read this file and `docs/LANCELOT.md`. Deployment is done; evidence and four payload hashes
@@ -155,9 +191,9 @@ python tools/deploy-ubuntu-files.py `
    action, then confirm `/dev/block/mmcblk0p49` is unmounted. Do not rerun the host deployment
    command. Expected files are under the **Ubuntu filesystem directory** `/hackios/20H392`;
    `/data/local/tmp/hackios-ubuntu` is only a temporary mountpoint and should not exist.
-2. Do not flash or alter UEFI. No more UEFI source edits without asking the user first.
-   The user authorized the already-pushed MSDC patch only. The boot partition must remain
-   `E:\shuaji\Lancelot\boot.img` unless the user approves another test.
+2. Reboot/flash tests are now authorized using the known fixed UEFI image. No more UEFI
+   source edits without asking the user first, and every authorized UEFI change needs a Git
+   commit. Restore `E:\shuaji\Lancelot\boot.img` when returning to Android.
 3. The XNU toolchain is installed and the build passed. If setup needs reconstruction, use
    the already-verified archives in Windows `local/build-deps-20261022` and install into
    WSL `/home/pencilqwq/hackios-lancelot/local-toolchain/theos` with
@@ -165,12 +201,12 @@ python tools/deploy-ubuntu-files.py `
    The pinned source repositories are already present and must not be discarded. The failed
    20261023 `.partial` files are not usable archives. If a fresh download is actually needed,
    prefer a mirror and verify against the recorded hashes before extraction.
-4. The repaired kernel and checkpoint-5 payload are ready at the paths/hashes above. To
+4. Checkpoint 5 passed; the next prepared test is checkpoint 10 at the path/hash above. To
    rebuild after source changes use `JOBS=4 CHECKPOINT=5 bash common/build-lancelot-kernel.sh`;
    require make build exit 0 and the linked verifier. Do not package/flash the old `prebuilt/`
    as if it contained `xnu/lancelot.patch`. Keep the phone running Android during the build.
-   Only with later boot-test authorization, retest checkpoint 5 on the known single CPU and
-   keep normal runtime MMU enabled. The opt-in MMU probe is teardown-only, never an OS boot.
+   Boot tests are now authorized; advance on the known single CPU and keep normal runtime MMU
+   enabled. The opt-in MMU probe is teardown-only, never an OS boot.
 5. Implement a real read-only MT6768 MSDC/eMMC kernel driver or a validated same-core data
    loading method. The UEFI EFI app can read its ESP payload, but XNU stops the same-core
    UEFI services; the withdrawn A75/PSCI firmware-mailbox strategy is not the next test.
