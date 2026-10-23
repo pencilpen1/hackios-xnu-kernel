@@ -18,6 +18,7 @@ ap.add_argument('--usb', action='store_true', help='make the loader stay residen
 ap.add_argument('--rdres', default='', help='hex size of a root image already placed at the resident address (QEMU)')
 ap.add_argument('--checkpoint', default='', help='kernel checkpoint to stop at; 999 = loader self test')
 ap.add_argument('--mmu-test', action='store_true', help='opt-in diagnostic MMU round trip after checkpoint 4; not an OS boot')
+ap.add_argument('--ubuntu-boot', action='store_true', help='load verified 20H392 bootstrap APFS files from Ubuntu ext4 before XNU')
 ap.add_argument('items', nargs='*')
 args = ap.parse_args()
 
@@ -41,6 +42,8 @@ if args.checkpoint:
     add('checkpoint', args.checkpoint.encode() + b'\0')
 if args.mmu_test:
     add('mmu-test', b'1\0')
+if args.ubuntu_boot:
+    add('ubuntu-boot', b'20H392\0')
 body += b'\0' * 24
 open(args.output, 'wb').write(struct.pack('<II', 0x50554E58, len(body)) + body)
 print(f'{args.output}: {len(body) + 8} bytes')

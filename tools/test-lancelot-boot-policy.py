@@ -10,7 +10,7 @@ kernel = Path(sys.argv[1]).resolve()
 cmdline = "-v cpus=1 touchscreen=0 gpu=0 wifi=0 adsp=0"
 with tempfile.TemporaryDirectory() as tmp:
     for label, extra, arguments, valid in (
-        ("continuous", [], cmdline, True),
+        ("continuous", ["--ubuntu-boot"], cmdline, True),
         ("checkpoint", ["--checkpoint", "10"], cmdline, False),
         ("timer", [], cmdline + " loader_return_after=60", False),
         ("panic", [], cmdline + " return_panic=1", False),

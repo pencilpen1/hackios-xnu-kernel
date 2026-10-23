@@ -81,8 +81,9 @@ python tools/deploy-ubuntu-files.py `
 - `tools/deploy-ubuntu-files.py` has no dry-run or `--write` option: invoking it performs the
   deployment, and it refuses to overwrite the existing log or destination directory. Do not
   rerun it. `deployment-source.json` and `SHA256SUMS` are alongside the four payload files.
-- **Presence on Ubuntu is not a bootable iOS installation.** The current EFI loader reads only
-  `EFI/HackiOS/boot.xnup` from ESP; the XNU same-core eMMC read path is not implemented. The
+- **Presence on Ubuntu is not a bootable iOS installation.** The EFI loader reads
+  `EFI/HackiOS/boot.xnup` from ESP; the new bootstrap reader below also reads the two small
+  APFS files from Ubuntu before handoff. The XNU native eMMC read path is not implemented. The
   previous A75 + UEFI mailbox proposal halted and was withdrawn. Do not enable that strategy
   without fresh, explicit design and hardware validation.
 
@@ -261,6 +262,35 @@ python tools/deploy-ubuntu-files.py `
   established. Continuous boot remains the default; targeted diagnosis is now justified by
   the observed panic. Phone has not been stopped/rebooted by ending the host capture.
   Code/default-policy commit: `c8d6190`.
+
+## Root-device panic and Ubuntu bootstrap reader
+
+- The user supplied the actual panic reason: `Failed to mount root device @IOKitBSDInit.cpp:926`.
+  This is the IOFindBSDRoot failure when no matching root device exists. The continuous package
+  contained only the kernel/command line: no memory disks and no `rd=md0`; native MTK storage
+  is also absent. This is now the identified startup blocker, not an MMU/checkpoint failure.
+- The new EFI **application** implementation (`xnuloader/lancelot_ubuntu.h`, `ext4_read.h`,
+  `sha256.h`) uses the existing UEFI Block I/O protocol to read the exact `Ubuntu` GPT name
+  and 33,285,963,776-byte partition. It performs no block writes and changes no UEFI firmware
+  source. A payload marker `ubuntu-boot=20H392` opts into the reader; normal `boot` now emits it.
+- Before XNU starts, it reads `/hackios/20H392/root.apfs` and `flashboot.apfs` (4 MiB each),
+  checks their APFS signatures and the pinned deployment SHA-256s, and appends them to the
+  in-memory XNUP. The existing loader presents `flashboot` as md0 and the small init image as
+  md1, automatically adding `rd=md0`. All reads finish before firmware services are suspended.
+  The files stay on Ubuntu; there is no new APFS staging file on userdata or ESP.
+- Root mount/PID 1 is the next validation. The 8 MiB bootstrap is not the full iOS system:
+  `system.apfs`/`ios-containers.img` still need a native/file-backed runtime storage path.
+  Normal execution remains continuous; no checkpoint or scheduled return was added.
+- Host tests: real 1/2/4 KiB ext4 fixtures, both 32/64-bit descriptors, sparse/external extents,
+  partial reads, missing/symlink path rejection, corrupt extent counts/depth, dirty journal and
+  unsupported bigalloc rejection passed under ASan/UBSan. SHA-256 padding-boundary and 4 MiB
+  checks matched Python hashlib. Firmware build and continuous-payload validation passed.
+- Candidate: `local/lancelot-ubuntu-root-20261023/EFI/HackiOS/`;
+  loader 74,752 bytes, SHA-256 `9db36afd5963a3329675f0359bd6a285a516cc22e5ebbbbf4b06fb7a91df5e30`;
+  XNUP 15,144,664 bytes, SHA-256 `4fdee056679ce2130e889e71854d28a9cf4886fe57cf3b43fbe393db4ff0214c`.
+  Kernel is still `8baa2dcc...`, firmware still the authorized `a23bdf6d...` image.
+  Verify current Ubuntu superblock is clean before deployment (the older pre-iOS backup
+  superblock had a needs-recovery bit); never bypass the reader's clean-filesystem check.
 
 ## Next AI: required sequence
 

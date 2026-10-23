@@ -242,6 +242,8 @@ lancelot_load_payload(void)
 	return 1;
 }
 
+#include "lancelot_ubuntu.h"
+
 static efi_status
 lancelot_boot(void)
 {
@@ -260,6 +262,12 @@ lancelot_boot(void)
 	}
 	if (!lancelot_load_payload()) {
 		flush_log();
+		if (esp_root) esp_root->close(esp_root);
+		esp_root = NULL;
+		return EFI_NOT_FOUND;
+	}
+	if (!lancelot_ubuntu_bootstrap()) {
+		print("lancelot: Ubuntu bootstrap failed; root device not provided\n");
 		if (esp_root) esp_root->close(esp_root);
 		esp_root = NULL;
 		return EFI_NOT_FOUND;

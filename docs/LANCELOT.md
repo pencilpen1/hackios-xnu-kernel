@@ -160,7 +160,14 @@ Continuous boot was subsequently deployed with checkpoint disabled and no return
 observed during the 180-second host capture. Same-core USB silence is not a hang diagnosis.
 The user confirms an on-screen kernel panic ending in a successful stackshot (4,088 traced,
 11,504 uncompressed bytes), but the panic reason and full LR/FP backtrace are not yet provided.
-Obtain a photo of the panic header before identifying the fault. Default boot remains uninterrupted.
+The supplied panic header then identified `Failed to mount root device @IOKitBSDInit.cpp:926`:
+the kernel-only payload provided no root disk. Default boot remains uninterrupted.
+
+The Ubuntu bootstrap reader now reads the two verified 4 MiB APFS files from existing Ubuntu
+ext4 using firmware Block I/O before handing off the CPU. `flashboot.apfs` becomes md0 and
+`root.apfs` becomes md1, with `rd=md0`. Its files remain on Ubuntu. See the handoff's root-device
+section for candidate hashes and host tests; actual root/PID-1 startup still needs validation.
+This supplies only the small bootstrap, not runtime access to the full iOS containers.
 
 The pinned prebuilt actually uses **4 KiB kernel pages**, not 16 KiB: disassembly has
 2 MiB L2 blocks, 4 KiB table spacing and `_sysreg_restore` TCR `0x22a51a251a`

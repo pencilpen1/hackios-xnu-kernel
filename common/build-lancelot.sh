@@ -23,8 +23,8 @@ case "$MODE" in
   boot)
     # Continue through all checkpoints. Panic/exception return remains available.
     python3 xnuloader/mkpayload.py -o "$OUT/boot.xnup" "kernel=$KERNEL" \
-      --cmdline '-v cpus=1 touchscreen=0 gpu=0 wifi=0 adsp=0'
-    python3 tools/test-lancelot-payload.py "$OUT/boot.xnup" --expect-boot
+      --ubuntu-boot --cmdline '-v cpus=1 touchscreen=0 gpu=0 wifi=0 adsp=0'
+    python3 tools/test-lancelot-payload.py "$OUT/boot.xnup" --expect-boot --expect-ubuntu
     ;;
   checkpoint|sweep)
     # Checkpoint 1 is XNU's assembly entry, before MMU setup (C starts at 10).

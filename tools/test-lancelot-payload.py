@@ -7,6 +7,7 @@ import struct
 ap = argparse.ArgumentParser(description=__doc__)
 ap.add_argument("payload", type=Path)
 ap.add_argument("--expect-boot", action="store_true", help="require uninterrupted boot, without diagnostic stops")
+ap.add_argument("--expect-ubuntu", action="store_true", help="require the verified Ubuntu bootstrap source")
 args = ap.parse_args()
 payload = args.payload.read_bytes()
 magic, size = struct.unpack_from("<II", payload)
@@ -26,6 +27,11 @@ while offset + 24 <= len(payload):
     entries[key] = payload[offset:offset + length]
     offset += (length + 15) & ~15
 assert terminated
+if args.expect_ubuntu:
+    assert entries.get("ubuntu-boot") == b"20H392\0", "Ubuntu bootstrap source is missing"
+if "ubuntu-boot" in entries:
+    assert entries["ubuntu-boot"] == b"20H392\0", "unsupported Ubuntu bootstrap source"
+    assert not {"ramdisk", "bootdisk", "rdres"}.intersection(entries), "conflicting bootstrap disks"
 assert entries["kernel"][:4] == bytes.fromhex("cffaedfe")
 cmdline = entries["cmdline"].rstrip(b"\0").decode()
 assert "cpus=1" in cmdline.split()
