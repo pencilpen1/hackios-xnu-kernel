@@ -255,12 +255,11 @@ python tools/deploy-ubuntu-files.py `
   Timeouts alone do not prove a kernel hang, successful root mount, or iOS startup.
 - The user subsequently confirmed an on-screen **kernel panic**, with task/thread/backtrace
   details, tid 101, and `Stackshot Succeeded: Bytes Traced 4088, Uncompressed 11504`.
-  Transcription: `local/lancelot-continuous-20261023/screen-report.txt`. The actual
-  `panic(cpu ... caller ...): reason` line and complete LR/FP addresses are still missing;
-  obtain a clear photo of the panic header/backtrace before identifying the fault.
-  Stackshot success is crash-dump success, not successful boot. No panic cause has yet been
-  established. Continuous boot remains the default; targeted diagnosis is now justified by
-  the observed panic. Phone has not been stopped/rebooted by ending the host capture.
+  Transcription: `local/lancelot-continuous-20261023/screen-report.txt`. The subsequently
+  supplied panic header identifies the root-device failure documented below. Stackshot
+  success is crash-dump success, not successful boot. Continuous boot remains the default;
+  targeted diagnosis is justified by the observed panic. Ending host capture did not stop
+  or reboot the kernel.
   Code/default-policy commit: `c8d6190`.
 
 ## Root-device panic and Ubuntu bootstrap reader
@@ -278,7 +277,7 @@ python tools/deploy-ubuntu-files.py `
   in-memory XNUP. The existing loader presents `flashboot` as md0 and the small init image as
   md1, automatically adding `rd=md0`. All reads finish before firmware services are suspended.
   The files stay on Ubuntu; there is no new APFS staging file on userdata or ESP.
-- Root mount/PID 1 is the next validation. The 8 MiB bootstrap is not the full iOS system:
+- Root mount/PID 1 subsequently passed, as recorded below. The 8 MiB bootstrap is not the full iOS system:
   `system.apfs`/`ios-containers.img` still need a native/file-backed runtime storage path.
   Normal execution remains continuous; no checkpoint or scheduled return was added.
 - Host tests: real 1/2/4 KiB ext4 fixtures, both 32/64-bit descriptors, sparse/external extents,
@@ -291,6 +290,62 @@ python tools/deploy-ubuntu-files.py `
   Kernel is still `8baa2dcc...`, firmware still the authorized `a23bdf6d...` image.
   Verify current Ubuntu superblock is clean before deployment (the older pre-iOS backup
   superblock had a needs-recovery bit); never bypass the reader's clean-filesystem check.
+- Android preflight found ext4 state `0x3` (valid plus error recorded), incompat `0x42`.
+  Both the pre-iOS backup and current superblock recorded the same single historical
+  `ext4_orphan_get` error at line 1264. `e2fsck -fn` identified a deleted inode 1327357 with
+  zero dtime, and stale inode/block bitmap entries (block 5308935).
+  With Ubuntu unmounted, `e2fsck -pf` fixed it; a subsequent forced read-only check completed
+  all five passes without repairs/errors. It reclaimed one old inode and one 4 KiB block.
+  Logs: `ubuntu-e2fsck-readonly.log`, `ubuntu-e2fsck-preen.log`, `ubuntu-e2fsck-after.log` in
+  `local/lancelot-ubuntu-root-20261023/`. This was filesystem metadata repair, not formatting.
+  All four APFS images passed SHA-256 recheck via a read-only mount after repair, and Ubuntu
+  was unmounted. Superblock state is now `0x1`, incompat `0x42`; 16,588,908 KiB is free.
+  See `ubuntu-images-after-fsck.log` and `ubuntu-superblock-after.bin` in the same directory.
+- The new loader/XNUP were deployed with matching readback hashes; the unchanged fixed UEFI
+  was flashed successfully (`deployment-and-flash.log`). The first 180-second capture
+  `xnu-ubuntu-root.log` received zero bytes; the user then clarified the phone had not been
+  powered on. Do not classify that capture as a loader or root-mount failure.
+  The user has now powered it on; `xnu-ubuntu-root-powered.log` is the fresh active capture.
+
+### Root/PID-1 hardware result and next storage work
+
+- The powered capture completed: boot ID `0000000003b6ab20`, 3,333 firmware bytes. The loader
+  read both 4 MiB files directly from Ubuntu, verified their hashes, installed md0 at
+  `0xc465c000` and md1 at `0xc425c000`, and booted with `rd=md0`, checkpoint 0.
+- **Root mount and first user process succeeded**, confirmed by the user's screen output:
+  stage0 mounted `/redwood`, ran init, and init reported `22 checks, 3 failed` before reading
+  `/redwood/etc/rc`. It then failed to execute `/sbin/launchd.ios` (ENOENT), finished and halted.
+  Transcription is `local/lancelot-ubuntu-root-20261023/screen-report.txt`. The failed check
+  labels were obscured by screen damage and remain unknown. NVRAM `No_nvramcontroller` /
+  `0xe00002d9` appeared during shutdown; it is not the cause of the missing executable.
+- The missing executable is a system-volume access problem: only bootstrap images are
+  mounted. Copying a lone launchd into those images would not provide its libraries/shared
+  cache. The next implementation provides runtime reads of the existing full container file.
+- Native candidate under development: `xnu/files/bsd/dev/lancelot_emmc.c` and `lancelot_msdc.h`.
+  It inherits firmware's MSDC0/card configuration, performs bounded CMD17-only PIO reads on
+  the XNU CPU, and exposes the ext4 file `ios-containers.img` as read-only `/dev/lancelot_ios`.
+  The loader supplies partition geometry and the ext4 superblock SHA-256; native reads must
+  match that digest before any device is published. No UEFI callbacks, mailbox, secondary
+  CPU, media writes, DMA or card reconfiguration are used.
+- The existing init supports `root_apfs=lancelot_ios`: it mounts the original root container,
+  switches root, mounts OS/App cryptex containers and redirects the launchd command to Apple's
+  `/sbin/launchd`. Default boot now requests that path in the candidate. Kernel and bootstrap
+  files stay on their respective existing storage paths; APFS contents are not rewritten.
+- PIO host simulation passed under ASan/UBSan: exact bytes for unaligned buffers, stuck
+  busy/FIFO/command/data timeouts, CRC/R1 errors, short transfers/overflow, and rejection of
+  any register/data-write operation outside the read transaction. Native hardware I/O and
+  full iOS root switch are not yet validated. Shared ext4/SHA code now lives beside the kernel
+  driver, with `xnuloader/` include wrappers; filesystem fixture tests still pass.
+- Native candidate build completed (`make build` exit 0); the linked image contains
+  `lancelot_emmc_init`/the block-device strategy and passed checkpoint-machine-code checks.
+  Source list reproduces from the pinned XNU base. Initial missing `ml_io_map` declaration
+  was fixed using the same explicit declaration as adjacent BSD drivers. Candidate artifacts:
+  `local/lancelot-native-emmc-20261023/` (`build-report.json`, build log and verification):
+  kernel SHA-256 `2e0575e34e008dac99227fe49e7e66433ea6c370cc59f1d31f08d8d468c3219d`;
+  loader `8c10218a9d4bfea2b29070111fa37bba853fd54a5e63921009abf6a139b9f7a3`;
+  XNUP `97c7fe2d49baccfe49d80546b6f1b77a3d18cb4a4b5b35ccd0d7c213a4c4859b`.
+  Native eMMC reads/root switch remain pending hardware verification. The builder checks
+  relevant native driver/header/call-site sources against the tracked files before compiling.
 
 ## Next AI: required sequence
 

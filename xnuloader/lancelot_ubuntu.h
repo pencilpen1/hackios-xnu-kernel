@@ -8,6 +8,7 @@
 #undef XNULOADER_NO_LIBC
 
 #define UBUNTU_PARTITION_BYTES 33285963776ULL
+static uint64_t ubuntu_partition_offset;
 
 static efi_block_io *
 lancelot_ubuntu_partition(void)
@@ -29,8 +30,11 @@ lancelot_ubuntu_partition(void)
 		    (m->block_size & (m->block_size - 1)) || m->io_align > 8192 ||
 		    (m->io_align && (m->io_align & (m->io_align - 1))) ||
 		    m->last_block != UBUNTU_PARTITION_BYTES / m->block_size - 1) continue;
+		if (part->end_lba < part->start_lba || part->end_lba - part->start_lba != m->last_block ||
+		    part->start_lba >= ((1ULL << 41) - UBUNTU_PARTITION_BYTES) / m->block_size) continue;
 		if (found) { found = NULL; print("ubuntu: ambiguous partition handles\n"); break; }
 		found = bio;
+		ubuntu_partition_offset = part->start_lba * m->block_size;
 	}
 	BS->free_pool(handles);
 	return found;
@@ -117,6 +121,17 @@ lancelot_ubuntu_bootstrap(void)
 	}
 	memset(end, 0, sizeof(struct payload_entry));
 	header->size = (uint32_t)(end + sizeof(struct payload_entry) - (uint8_t *)(header + 1));
+	uint8_t superblock[1024];
+	if (!lancelot_ubuntu_read(bio, 1024, sizeof(superblock), superblock)) return 0;
+	memset(&mtk_storage_info, 0, sizeof(mtk_storage_info));
+	mtk_storage_info.magic = LANCELOT_STORAGE_MAGIC;
+	mtk_storage_info.version = 1;
+	mtk_storage_info.size = sizeof(mtk_storage_info);
+	mtk_storage_info.mmio = 0x11230000;
+	mtk_storage_info.partition_offset = ubuntu_partition_offset;
+	mtk_storage_info.partition_bytes = UBUNTU_PARTITION_BYTES;
+	sha256(superblock, sizeof(superblock), mtk_storage_info.superblock_sha256);
 	print("ubuntu: bootstrap ready: flashboot=md0, root=md1; firmware reads complete before XNU\n");
+	print("ubuntu: native MSDC handoff: partition byte %x, superblock digest recorded\n", ubuntu_partition_offset);
 	return 1;
 }

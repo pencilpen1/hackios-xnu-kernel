@@ -165,9 +165,16 @@ the kernel-only payload provided no root disk. Default boot remains uninterrupte
 
 The Ubuntu bootstrap reader now reads the two verified 4 MiB APFS files from existing Ubuntu
 ext4 using firmware Block I/O before handing off the CPU. `flashboot.apfs` becomes md0 and
-`root.apfs` becomes md1, with `rd=md0`. Its files remain on Ubuntu. See the handoff's root-device
-section for candidate hashes and host tests; actual root/PID-1 startup still needs validation.
-This supplies only the small bootstrap, not runtime access to the full iOS containers.
+`root.apfs` becomes md1, with `rd=md0`. Its files remain on Ubuntu. Hardware boot `0000000003b6ab20`
+read both files with correct hashes; the user's screen confirmed root mount, stage0 and init.
+Init then failed to find `/sbin/launchd.ios`: the full system was not mounted.
+
+A native read-only MSDC0 PIO candidate now provides `ios-containers.img` inside Ubuntu ext4 as
+`/dev/lancelot_ios`; the existing init's `root_apfs=lancelot_ios` path can switch to the full
+root and mount its cryptexes. The driver checks native reads against a firmware-provided
+superblock SHA-256 before publishing a device. It uses no firmware callbacks or other CPU.
+Host transport/filesystem tests and the kernel build pass; native hardware I/O and root switch
+are pending validation. See the handoff for exact candidate hashes and logs.
 
 The pinned prebuilt actually uses **4 KiB kernel pages**, not 16 KiB: disassembly has
 2 MiB L2 blocks, 4 KiB table spacing and `_sysreg_restore` TCR `0x22a51a251a`

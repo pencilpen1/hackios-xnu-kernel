@@ -85,6 +85,8 @@ struct segment_command_64 {
 static efi_system_table *ST;
 static efi_boot_services *BS;
 static efi_handle IMAGE;
+#include "../xnu/files/bsd/dev/lancelot_storage.h"
+static struct lancelot_storage mtk_storage_info;
 static efi_file *esp_root;
 static void (*platform_log_char)(char);
 
@@ -3146,6 +3148,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_prop_u32(&w, "#size-cells", 2);
 
 	dt_begin(&w, "chosen");
+	if (PLAT == &platform_lancelot && mtk_storage_info.magic == LANCELOT_STORAGE_MAGIC)
+		dt_prop(&w, "lancelot-emmc", &mtk_storage_info, sizeof(mtk_storage_info));
 	dt_prop(&w, "random-seed", seed, sizeof(seed));
 	dt_prop_u64(&w, "dram-base", phys_base);
 	dt_prop_u64(&w, "dram-size", win_size);

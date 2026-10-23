@@ -23,7 +23,7 @@ case "$MODE" in
   boot)
     # Continue through all checkpoints. Panic/exception return remains available.
     python3 xnuloader/mkpayload.py -o "$OUT/boot.xnup" "kernel=$KERNEL" \
-      --ubuntu-boot --cmdline '-v cpus=1 touchscreen=0 gpu=0 wifi=0 adsp=0'
+      --ubuntu-boot --cmdline '-v cpus=1 touchscreen=0 gpu=0 wifi=0 adsp=0 root_apfs=lancelot_ios'
     python3 tools/test-lancelot-payload.py "$OUT/boot.xnup" --expect-boot --expect-ubuntu
     ;;
   checkpoint|sweep)
