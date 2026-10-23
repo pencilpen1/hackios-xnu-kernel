@@ -1,11 +1,16 @@
 #!/bin/bash
-# Build and verify the repaired XNU before packaging a phone checkpoint test.
+# Build and verify repaired XNU; continuous boot is the default.
 # Never substitutes the old prebuilt on failure and never flashes a partition.
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
 export THEOS=${THEOS:-$PWD/local-toolchain/theos}
 JOBS=${JOBS:-4}
 export JOBS
+MODE=${1:-boot}
+case "$MODE" in
+  boot|checkpoint|sweep) ;;
+  *) echo "usage: $0 [boot|checkpoint|sweep]" >&2; exit 1 ;;
+esac
 mkdir -p out/lancelot
 if [ ! -d xnu-src/xnu-8796.121.2 ]; then
   bash xnu/apply.sh
@@ -36,6 +41,8 @@ test -s "$KERNEL"
 python3 tools/verify-xnu-checkpoint.py "$KERNEL" | tee out/lancelot/kernel-verification.txt
 cp "$KERNEL" out/lancelot/mach.lancelot
 sha256sum out/lancelot/mach.lancelot >> out/lancelot/kernel-verification.txt
-KERNEL=out/lancelot/mach.lancelot CHECKPOINT=${CHECKPOINT:-5} bash common/build-lancelot.sh checkpoint
-python3 tools/test-lancelot-payload.py out/lancelot/EFI/HackiOS/boot.xnup
-echo "Repaired kernel and checkpoint files ready (make build exit 0). No device writes performed."
+KERNEL=out/lancelot/mach.lancelot CHECKPOINT=${CHECKPOINT:-5} bash common/build-lancelot.sh "$MODE"
+if [ "$MODE" != boot ]; then
+  python3 tools/test-lancelot-payload.py out/lancelot/EFI/HackiOS/boot.xnup
+fi
+echo "Repaired kernel and $MODE files ready (make build exit 0). No device writes performed."

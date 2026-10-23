@@ -28,7 +28,7 @@ Use `tools/collect-android-port.py --adb PATH --serial SERIAL --out NEW_DIRECTOR
 ## EFI/XNU boot
 
 ```sh
-bash common/build-lancelot.sh checkpoint
+JOBS=4 bash common/build-lancelot-kernel.sh
 ```
 
 Produces `out/lancelot/EFI/HackiOS/loader.efi` and `boot.xnup`. The EFI app loads the XNUP
@@ -38,16 +38,19 @@ The lancelot build explicitly selects MTK even if GOP's buffer moves. It does no
 redwood boot shim, hard-coded payload reservation, Qualcomm USB protocol or UFS registers.
 The generic `common/build.sh lancelot` entry delegates to this path.
 
-`checkpoint` stops at XNU assembly checkpoint 1 (before page tables); `sweep` advances
-through 1, 2, 3, 4, 5 and 10. **Current strategy: the firmware's boot CPU only**,
+Default `boot` continues through XNU initialization without deliberate checkpoint/timer
+stops. Use `checkpoint` or `sweep` only to investigate an actual startup blocker or collect
+targeted logs: `checkpoint` defaults to assembly checkpoint 1 in the packing-only script;
+`sweep` advances through 1, 2, 3, 4, 5 and 10. **Current strategy: the firmware's boot CPU only**,
 with no `bootcpu=6`, PSCI preflight or secondary-core start. `cpus=1` does not cause
 PSCI affinity queries for other cores. The loader refuses secondary CPU and firmware
 storage mailbox requests on lancelot rather than silently taking the withdrawn path.
 `selftest` exercises the same-core context round trip and is not yet validated on MTK.
 These tests are not complete iOS boots.
-The shipped XNU is the repository's unmodified prebuilt `xnu-8796.121.2`.
-Build success is not hardware validation: advance through checkpoints 1–5, 10+, then
-root mount and userland after examining the real device log.
+The packer defaults to repaired `out/lancelot/mach.lancelot`, produced by the build wrapper.
+Build success is not hardware validation. Continue normal execution and inspect actual
+failures; enable diagnostic checkpoints only when needed. Root mount and userland remain
+dependent on native storage support.
 
 ## Offline iOS image preparation
 
@@ -139,13 +142,18 @@ The original prebuilt stalled at checkpoint 5. On 2026-10-23, the rebuilt kernel
 `xnu/lancelot.patch` **returned successfully from checkpoint 5 on hardware**, after enabling
 MMU. Log: `local/lancelot-cp5-hardware-20261023/xnu-cp5.log`, boot ID `0000000003c7f618`,
 `STOPPED AT CHECKPOINT 5`, `result=checkpoint 5 0`. Its entry PA is `0xc34464a8`.
-Next is checkpoint 10/C initialization; iOS userspace has not run.
+Checkpoint 10/C entry has also subsequently passed as recorded below; iOS userspace has not run.
 
 The first checkpoint-10 test did not return (`local/lancelot-cp10-hardware-20261023/`).
 Its early C return helper could parse `bootcpu` before `PE_init_platform()` initialized
 `PE_state.bootArgs`. A guarded parse and regression test now cover this case; the rebuilt
-candidate is in `local/lancelot-cp10-pefix-20261023/`. Hardware retest is pending. The build
-wrapper refuses a stale/different `loader_return.c` in an existing XNU workspace.
+candidate is in `local/lancelot-cp10-pefix-20261023/`. **Hardware retest passed** with boot ID
+`0000000003b76e9b`, `STOPPED AT CHECKPOINT 10` and `result=checkpoint 10 0`. The successful
+kernel SHA-256 is `8baa2dcc630db2a0999729fef409f19eca83e12f50d36e90fac4fb3f0004ba2f`.
+Its pre-return SCTLR `0x3454593d` confirms MMU/caches were enabled while executing C.
+Continuous execution through CPU/platform initialization is next; checkpoint 11 is available
+if a real error needs localization. The build wrapper refuses a stale/different
+`loader_return.c` in an existing XNU workspace.
 
 The pinned prebuilt actually uses **4 KiB kernel pages**, not 16 KiB: disassembly has
 2 MiB L2 blocks, 4 KiB table spacing and `_sysreg_restore` TCR `0x22a51a251a`
@@ -183,7 +191,7 @@ python tools/fetch-xnu-toolchain.py --out local/build-deps-NEW
 # In the WSL workspace (adjust archive path to the Windows checkout):
 python3 tools/prepare-xnu-sources.py "$PWD"
 bash tools/setup-xnu-offline.sh /mnt/d/AI_rom/iOSforLava/hackios-xnu-kernel/local/build-deps-NEW
-JOBS=4 CHECKPOINT=5 bash common/build-lancelot-kernel.sh
+JOBS=4 bash common/build-lancelot-kernel.sh
 ```
 
 Archives are pinned to the upstream Theos toolchain/16.5 SDK and macOS 13.3 SDK for
@@ -201,7 +209,7 @@ packaging even if an old kernel is present. Up-to-date repaired kernels can be r
 make. The full `all/config` target still reports DriverKit RPC export/symbolset failures
 from upstream's incomplete `iig` stubs (`xnu/README.md`); the checkpoint-only build does not
 claim to fix those or produce a complete DriverKit SDK. `mach.lancelot` is a local artifact.
-With later device-test authorization, deployment uses
+Device reboot/flash tests are now authorized. Deployment uses
 `tools/deploy-lancelot.py --adb PATH --serial SERIAL --files DIRECTORY` with readback hashes,
 and the already-authorized UEFI image only. No Ubuntu partition write is needed for this test.
 

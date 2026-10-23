@@ -4,8 +4,13 @@
 
 - The user subsequently **authorized reboots and flashing the UEFI/test images**. The earlier
   no-reboot restriction is superseded for phone bring-up. Host Windows reboot is unnecessary.
-  Checkpoint 5 has now passed on hardware. New EFI/XNUP is on ESP and the previously authorized
-  MSDC-fixed UEFI is on boot; the phone is resident in UEFI for log retrieval. See below.
+  Checkpoints 5 and 10 have now passed on hardware. The checkpoint-10 bootArgs-fixed XNUP is
+  on ESP and the previously authorized MSDC-fixed UEFI is on boot; the phone is resident in
+  UEFI for log retrieval. See the latest checkpoint-10 result below.
+- Latest steering: **continuous boot by default**. Do not deliberately stop at each checkpoint.
+  Only select a checkpoint for an observed startup blocker or a specific logging investigation.
+  The continuous package below is now being deployed/tested, superseding the checkpoint-10
+  resident state. There is no `loader_return_after` or other scheduled diagnostic return.
 - ESP corruption is resolved by the existing UEFI MSDC patch, as confirmed by the user.
   Every future authorized UEFI source change must receive its own Git commit; ask before
   making new UEFI changes. No additional UEFI source changes were made for this deployment.
@@ -93,7 +98,8 @@ python tools/deploy-ubuntu-files.py `
 - On device, the loader loaded XNUP and XNU returned correctly from checkpoints 1–4.
   Minimal MMU enable/disable/firmware-return probe also passed with ESR/ELR/FAR zero.
   On 2026-10-23 the rebuilt kernel also passed checkpoint 5 on hardware after enabling MMU;
-  it returned through the diagnostic teardown to UEFI. Checkpoint 10/C initialization is next.
+  it returned through the diagnostic teardown to UEFI. Checkpoint 10 then passed after fixing
+  its pre-PE bootArgs access: XNU has entered `arm_init()`, with MMU/caches enabled before return.
 - The pinned kernel is XNU `xnu-8796.121.2`, configured for 4 KiB granules. Actual TCR from the
   prebuilt is `0x22a51a251a`; do not infer 16 KiB merely from CPU support.
 - `xnu/lancelot.patch` fixes checkpoint-only and early-exception return ordering; ordinary XNU
@@ -205,8 +211,42 @@ python tools/deploy-ubuntu-files.py `
   Artifacts/logs are in `local/lancelot-cp10-pefix-20261023/`:
   kernel SHA-256 `8baa2dcc630db2a0999729fef409f19eca83e12f50d36e90fac4fb3f0004ba2f`;
   checkpoint-10 XNUP `69ddb534a40bb48f6a1d8d2f2d8311b1f643553471931409f8626bfbc42e4787`.
-  This test retains the exact checkpoint-5 EFI loader and UEFI binaries. Deployment/capture
-  of this candidate is in progress; do not claim hardware success before reading its log.
+  This test retains the exact checkpoint-5 EFI loader and UEFI binaries.
+- **Repaired hardware checkpoint 10 PASSED**, log boot ID `0000000003b76e9b`:
+  `STOPPED AT CHECKPOINT 10` and `run finished; result=checkpoint 10 0`. Return was from
+  `arm_init()` after pre-sign/rebase and copying boot args, before `cpu_data_init()` and
+  `PE_init_platform()`. Its code fix is committed/pushed as `dfd8282`.
+  The returned SCTLR is `0x3454593d` (MMU/data/instruction cache enabled before the loader's
+  teardown), TCR `0x22a51a251a`, TTBR0 `0xc3e15000`, TTBR1 `0xc319f000`.
+  The log's low kernel-address `translation INVALID` is expected here: the C return helper
+  replaces TTBR0 with a table mapping the firmware return stub, while TTBR1 still maps XNU.
+- Current phone state: fixed UEFI in boot; repaired checkpoint-10 files in ESP; resident in
+  the loader after success, awaiting physical native-FASTBOOT entry for any next deployment.
+  Ubuntu's deployed iOS files were not modified. Next bring-up checkpoint is 11 (CPU data and
+  early platform setup), then topology/thread/VM/console initialization; iOS has not booted.
+
+## Continuous boot policy and package
+
+- `common/build-lancelot-kernel.sh` and `common/build-lancelot.sh` now default to `boot`.
+  The package omits the checkpoint entry; loader slot value 0 means disabled. It also omits
+  MMU probes, USB command wait and scheduled-return arguments. Panic/exception return remains
+  available to report real startup errors. The 30-second firmware USB capture window is only
+  before handoff, not a checkpoint stop during kernel execution.
+- Rebuild/package normally with `JOBS=4 bash common/build-lancelot-kernel.sh`.
+  The packing-only command takes the repaired `out/lancelot/mach.lancelot` by default.
+  If a real fault needs localization, explicitly use e.g.
+  `JOBS=4 CHECKPOINT=10 bash common/build-lancelot-kernel.sh checkpoint`; the `CHECKPOINT`
+  environment variable alone no longer changes normal boot into a stopped diagnostic run.
+- Continuous package: `local/lancelot-continuous-20261023/EFI/HackiOS/`;
+  XNUP size 15,144,624, SHA-256
+  `f95901abccdf63b5f72594f1fd19b85d42563ed879349bc6d3f1cb9c12526a75`.
+  Kernel is the hardware-tested `8baa2dcc...`; loader and UEFI are the same known binaries.
+  This is continuous **kernel** bring-up; native eMMC/ext4 reading of the already-deployed
+  iOS files remains to be implemented. It does not yet provide a bootable iOS root device.
+- `test-lancelot-payload.py --expect-boot` validates the absence of deliberate stop settings.
+  `test-lancelot-boot-policy.py` verifies actual generated payloads: normal boot accepted;
+  checkpoint, timer, forced panic, USB wait and MMU probe variants rejected. Packaging with
+  stale `CHECKPOINT=10` still produced an uninterrupted default boot package as required.
 
 ## Next AI: required sequence
 
@@ -225,8 +265,10 @@ python tools/deploy-ubuntu-files.py `
    The pinned source repositories are already present and must not be discarded. The failed
    20261023 `.partial` files are not usable archives. If a fresh download is actually needed,
    prefer a mirror and verify against the recorded hashes before extraction.
-4. Checkpoint 5 passed; the next prepared test is checkpoint 10 at the path/hash above. To
-   rebuild after source changes use `JOBS=4 CHECKPOINT=5 bash common/build-lancelot-kernel.sh`;
+4. Checkpoints 5 and 10 passed. Use the bootArgs-fixed kernel `8baa2dcc...` for continuous
+   boot; the initial checkpoint-5 kernel still contains the pre-PE return bug. Read the
+   continuous attempt's actual error log before choosing any further diagnostic stop. To
+   rebuild after source changes use `JOBS=4 bash common/build-lancelot-kernel.sh`;
    require make build exit 0 and the linked verifier. Do not package/flash the old `prebuilt/`
    as if it contained `xnu/lancelot.patch`. Keep the phone running Android during the build.
    Boot tests are now authorized; advance on the known single CPU and keep normal runtime MMU
