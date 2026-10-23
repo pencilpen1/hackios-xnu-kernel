@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile/run the native PIO controller simulation under ASan/UBSan."""
+"""Run counted-PIO and verified SDR-mode negotiation simulations under ASan/UBSan."""
 from pathlib import Path
 import subprocess
 import tempfile

@@ -90,3 +90,7 @@ inflate timings. The currently running older kernel does not contain the new cou
 Next throughput work is bounded multiblock reads and, after hardware validation, wider
 bus/high-speed modes or DMA. Any firmware source change still needs the user's approval
 and its own commit. Persistent writable data-image support remains a separate pending goal.
+
+The subsequent local candidate implements counted multiblock PIO and verified wide-SDR/HS52
+negotiation: see `LANCELOT-TRANSFER-UPGRADE.md`. Per the user's latest instruction, it stays
+in local commits pending validation; it is not on the phone or pushed to GitHub.

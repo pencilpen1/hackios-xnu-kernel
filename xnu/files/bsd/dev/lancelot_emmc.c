@@ -1,7 +1,7 @@
 /* Read-only MT6768 eMMC access to /hackios/20H392/ios-containers.img on Ubuntu.
  * Firmware hands over partition geometry and a superblock digest, not callbacks.
- * CMD17 PIO reads execute on the XNU CPU, serialized by a mutex. No media writes,
- * card reconfiguration, DMA or secondary firmware CPU are supported.
+ * Counted CMD18 PIO reads execute on the XNU CPU, serialized by a mutex. SDR
+ * width/clock negotiation is verified before use. No media writes or other CPU.
  */
 #include <kern/locks.h>
 #include <kern/kalloc.h>
@@ -21,6 +21,7 @@
 #include <sys/redwood_input.h>
 #include "lancelot_storage.h"
 #include "lancelot_msdc.h"
+#include "lancelot_mmc_mode.h"
 #define XNULOADER_NO_LIBC
 #include "lancelot_ext4.h"
 #include "lancelot_sha256.h"
@@ -37,10 +38,11 @@ static struct ext4_inode ios;
 static vm_offset_t registers;
 static bool ready, failed;
 static uint32_t device_block_size = 512;
-static uint8_t sector_buffer[512];
+static uint8_t sector_buffer[512] __attribute__((aligned(64)));
 static int block_major = -1;
 static uint64_t counter_frequency, sector_reads, io_errors, logical_reads, logical_bytes;
 static uint64_t pio_us, file_read_us, lock_wait_us, initial_cfg, bus_width;
+static uint64_t max_read_blocks = 1, active_clock_hz, mode_fallbacks;
 
 SYSCTL_DECL(_kern_redwood);
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_sectors, CTLFLAG_RD | CTLFLAG_LOCKED, &sector_reads, "successful 512-byte native reads, including ext4 metadata");
@@ -53,7 +55,13 @@ SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_lock_us, CTLFLAG_RD | CTLFLAG_
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_meta_hits, CTLFLAG_RD | CTLFLAG_LOCKED, &filesystem.metadata_hits, "extent metadata cache hits");
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_meta_reads, CTLFLAG_RD | CTLFLAG_LOCKED, &filesystem.metadata_reads, "extent metadata reads from storage");
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_cfg, CTLFLAG_RD | CTLFLAG_LOCKED, &initial_cfg, "inherited MSDC_CFG register");
-SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_bus_width, CTLFLAG_RD | CTLFLAG_LOCKED, &bus_width, "inherited data bus width in bits, zero if reserved");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_bus_width, CTLFLAG_RD | CTLFLAG_LOCKED, &bus_width, "verified active data bus width in bits");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_clock_hz, CTLFLAG_RD | CTLFLAG_LOCKED, &active_clock_hz, "active SDR clock, zero if source/mode unknown");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_batch_blocks, CTLFLAG_RD | CTLFLAG_LOCKED, &max_read_blocks, "maximum sectors per counted read");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_commands, CTLFLAG_RD | CTLFLAG_LOCKED, &controller.commands_sent, "card commands including setup and recovery");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_multi_reads, CTLFLAG_RD | CTLFLAG_LOCKED, &controller.multi_reads, "counted CMD18 transfers started");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_recoveries, CTLFLAG_RD | CTLFLAG_LOCKED, &controller.recoveries, "bounded read recovery attempts");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_mode_fallbacks, CTLFLAG_RD | CTLFLAG_LOCKED, &mode_fallbacks, "verified width/clock/multiblock fallbacks");
 
 bool
 lancelot_emmc_dev(dev_t dev)
@@ -82,6 +90,39 @@ mmc_ticks(__unused void *ctx)
 {
 	return __builtin_arm_rsr64("CNTVCT_EL0");
 }
+static uint64_t mmc_enter(__unused void *ctx) { return ml_set_interrupts_enabled(FALSE); }
+static void mmc_leave(__unused void *ctx, uint64_t state) { ml_set_interrupts_enabled((boolean_t)state); }
+static void
+mmc_fifo_words(__unused void *ctx, uint8_t *out, unsigned words)
+{
+	volatile uint32_t *fifo = (volatile uint32_t *)(registers + LM_RX);
+	if (((uintptr_t)out & 3) == 0) {
+		/* One indirect callback per FIFO burst; aligned word stores on ARM64 LE. */
+		for (unsigned i = 0; i < words; i++) {
+			uint32_t value = *fifo;
+			__builtin_memcpy(__builtin_assume_aligned(out + i * 4, 4), &value, 4);
+		}
+	} else {
+		for (unsigned i = 0; i < words; i++) {
+			uint32_t value = *fifo;
+			for (unsigned j = 0; j < 4; j++) out[i * 4 + j] = (uint8_t)(value >> (j * 8));
+		}
+	}
+}
+/* Probe reads do not poison the device on a rejected mode: negotiation must
+ * restore and verify a known configuration before it is allowed to fall back. */
+static int
+mmc_verify_super(void *ctx)
+{
+	uint8_t super[1024], digest[32];
+	uint32_t count = ctx ? *(const uint32_t *)ctx : 1;
+	for (unsigned i = 0; i < 2; i += count) {
+		uint32_t sector = (uint32_t)((offer.partition_offset + 1024) / 512) + i;
+		if (lancelot_msdc_read(&controller, sector, count, super + i * 512, sizeof(super) - i * 512) != LM_OK) return 0;
+	}
+	sha256(super, sizeof(super), digest);
+	return memcmp(digest, offer.superblock_sha256, sizeof(digest)) == 0;
+}
 static int
 partition_read(__unused void *ctx, uint64_t offset, size_t size, void *out)
 {
@@ -89,24 +130,31 @@ partition_read(__unused void *ctx, uint64_t offset, size_t size, void *out)
 	if (failed || offset > offer.partition_bytes || size > offer.partition_bytes - offset) return 0;
 	while (size) {
 		uint64_t absolute = offer.partition_offset + offset;
-		size_t within = (size_t)(absolute & 511), n = 512 - within;
-		if (n > size) n = size;
-		/* Avoid scheduler/IRQ delays while a sector fills the small hardware FIFO. */
-		boolean_t interrupts = ml_set_interrupts_enabled(FALSE);
+		size_t within = (size_t)(absolute & 511), n;
+		uint32_t count = 1;
+		uint8_t *target = sector_buffer;
+		if (!within && size >= 512) {
+			count = (uint32_t)((size / 512 > max_read_blocks) ? max_read_blocks : size / 512);
+			n = (size_t)count * 512;
+			target = p;
+		} else {
+			n = 512 - within;
+			if (n > size) n = size;
+		}
 		uint64_t start = mmc_ticks(NULL);
-		int status = lancelot_msdc_sector(&controller, (uint32_t)(absolute >> 9), sector_buffer);
+		int status = lancelot_msdc_read(&controller, (uint32_t)(absolute >> 9), count, target, (size_t)count * 512);
 		uint64_t finish = mmc_ticks(NULL);
-		ml_set_interrupts_enabled(interrupts);
 		pio_us += elapsed_us(start, finish);
 		if (status != LM_OK) {
 			io_errors++;
 			failed = true;
-			printf("lancelot-emmc: read failed LBA=%llu status=%d stage=%u int=%x response=%x\n",
-			    absolute >> 9, status, controller.last_stage, controller.last_int, controller.last_response);
+			printf("lancelot-emmc: read failed LBA=%llu count=%u status=%d cmd=%u stage=%u int=%x response=%x recovery=%d\n",
+			    absolute >> 9, count, status, controller.last_command, controller.last_stage,
+			    controller.last_int, controller.last_response, controller.recovery_status);
 			return 0;
 		}
-		sector_reads++;
-		memcpy(p, sector_buffer + within, n);
+		sector_reads += count;
+		if (target != p) memcpy(p, sector_buffer + within, n);
 		p += n; offset += n; size -= n;
 	}
 	return 1;
@@ -220,12 +268,17 @@ lancelot_emmc_init(void)
 	unsigned int size;
 	if (ready || registers || SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
 	    SecureDTGetProperty(chosen, "lancelot-emmc", &property, &size) != kSuccess) return;
-	if (size != sizeof(offer)) return;
-	memcpy(&offer, property, sizeof(offer));
-	if (offer.magic != LANCELOT_STORAGE_MAGIC || offer.version != 1 || offer.size != sizeof(offer) ||
+	if (size != LANCELOT_STORAGE_V1_SIZE && size != sizeof(offer)) return;
+	memset(&offer, 0, sizeof(offer));
+	memcpy(&offer, property, size);
+	if (offer.magic != LANCELOT_STORAGE_MAGIC || offer.size != size ||
+	    !((offer.version == 1 && size == LANCELOT_STORAGE_V1_SIZE) || (offer.version == 2 && size == sizeof(offer))) ||
 	    offer.mmio != 0x11230000 || offer.partition_bytes != LANCELOT_UBUNTU_BYTES ||
 	    !offer.partition_offset || (offer.partition_offset & 511) ||
 	    offer.partition_offset >= (1ULL << 41) || offer.partition_bytes > (1ULL << 41) - offer.partition_offset) return;
+	if (offer.version == 1) { offer.rca = 1; offer.max_bus_width = 1; offer.hs_timing = 1; } /* known legacy firmware contract */
+	if (!offer.rca || offer.rca > 65535 || offer.source_clock_hz > 1000000000 ||
+	    offer.hs_timing > 3 || offer.reserved || (offer.max_bus_width != 1 && offer.max_bus_width != 4 && offer.max_bus_width != 8)) return;
 	uint64_t frequency = __builtin_arm_rsr64("CNTFRQ_EL0");
 	if (!frequency || frequency > 1000000000) return;
 	counter_frequency = frequency;
@@ -233,19 +286,44 @@ lancelot_emmc_init(void)
 	if (!registers) return;
 	controller.ctx = NULL; controller.read = mmc_read_register; controller.write = mmc_write_register;
 	controller.ticks = mmc_ticks; controller.timeout = frequency / 2; /* 500 ms maximum per phase */
+	controller.read_fifo = mmc_fifo_words; controller.critical_enter = mmc_enter; controller.critical_exit = mmc_leave;
+	controller.rca = offer.rca;
 	initial_cfg = mmc_read_register(NULL, LM_CFG);
-	uint32_t width = (mmc_read_register(NULL, 0x30) >> 16) & 3;
+	uint32_t width = (mmc_read_register(NULL, LM_BUS_CFG) >> 16) & 3;
 	bus_width = width == 0 ? 1 : width == 1 ? 4 : width == 2 ? 8 : 0;
 	printf("lancelot-emmc: inherited cfg=%llx width=%llu clock-mode=%llu divisor=%llu, Ubuntu byte %llu; CMD17 read-only\n",
 	    initial_cfg, bus_width, (initial_cfg >> 20) & 3, (initial_cfg >> 8) & 0xfff, offer.partition_offset);
-	uint8_t super[1024], digest[32];
 	static uint8_t header[4096];
-	if (!partition_read(NULL, 1024, sizeof(super), super)) return;
-	sha256(super, sizeof(super), digest);
-	if (memcmp(digest, offer.superblock_sha256, sizeof(digest))) {
+	if (!mmc_verify_super(NULL)) {
 		printf("lancelot-emmc: native superblock does not match firmware digest\n");
 		failed = true; return;
 	}
+	uint32_t tune = 1, wanted_width = offer.max_bus_width, wanted_blocks = LM_MAX_BLOCKS;
+	(void)PE_parse_boot_argn("lancelot_mmc_tune", &tune, sizeof(tune));
+	(void)PE_parse_boot_argn("lancelot_mmc_width", &wanted_width, sizeof(wanted_width));
+	(void)PE_parse_boot_argn("lancelot_mmc_blocks", &wanted_blocks, sizeof(wanted_blocks));
+	if ((wanted_width != 1 && wanted_width != 4 && wanted_width != 8) || wanted_width > offer.max_bus_width ||
+	    !wanted_blocks || wanted_blocks > LM_MAX_BLOCKS) { printf("lancelot-emmc: invalid transfer settings\n"); return; }
+	active_clock_hz = lm_clock_hz((uint32_t)initial_cfg, offer.source_clock_hz);
+	if (tune) {
+		struct lancelot_mmc_mode mode;
+		int status = lancelot_msdc_negotiate(&controller, wanted_width, offer.source_clock_hz, offer.hs_timing, mmc_verify_super, NULL, &mode);
+		if (status != LM_OK) { printf("lancelot-emmc: could not verify negotiated/rollback mode (%d)\n", status); failed = true; return; }
+		bus_width = mode.width; active_clock_hz = mode.clock_hz; mode_fallbacks = mode.fallbacks;
+	}
+	if (wanted_blocks > 1) {
+		uint32_t probe_blocks = 2;
+		if (mmc_verify_super(&probe_blocks)) max_read_blocks = wanted_blocks;
+		else {
+			mode_fallbacks++;
+			if (controller.recovery_status != LM_OK || !mmc_verify_super(NULL)) {
+				printf("lancelot-emmc: counted-read probe and recovery failed\n"); failed = true; return;
+			}
+			printf("lancelot-emmc: counted reads rejected; verified CMD17 fallback\n");
+		}
+	}
+	printf("lancelot-emmc: verified width=%llu clock=%llu Hz batch=%llu sectors fallbacks=%llu\n",
+	    bus_width, active_clock_hz, max_read_blocks, mode_fallbacks);
 	if (!ext4_open(&filesystem, partition_read, NULL, offer.partition_bytes) ||
 	    !ext4_lookup(&filesystem, "/hackios/20H392/ios-containers.img", &ios) ||
 	    ios.size != LANCELOT_IOS_BYTES || !ext4_read_file(&filesystem, &ios, 0, sizeof(header), header) ||

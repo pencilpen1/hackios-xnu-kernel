@@ -125,13 +125,27 @@ lancelot_ubuntu_bootstrap(void)
 	if (!lancelot_ubuntu_read(bio, 1024, sizeof(superblock), superblock)) return 0;
 	memset(&mtk_storage_info, 0, sizeof(mtk_storage_info));
 	mtk_storage_info.magic = LANCELOT_STORAGE_MAGIC;
-	mtk_storage_info.version = 1;
+	mtk_storage_info.version = 2;
 	mtk_storage_info.size = sizeof(mtk_storage_info);
 	mtk_storage_info.mmio = 0x11230000;
 	mtk_storage_info.partition_offset = ubuntu_partition_offset;
 	mtk_storage_info.partition_bytes = UBUNTU_PARTITION_BYTES;
 	sha256(superblock, sizeof(superblock), mtk_storage_info.superblock_sha256);
+	/* Pinned MT6768 firmware assigns RCA 1 and muxes DAT0..DAT7; the Android
+	 * board DT also declares an 8-bit eMMC bus. No firmware source is changed. */
+	mtk_storage_info.rca = 1;
+	mtk_storage_info.max_bus_width = 8;
+	mtk_storage_info.hs_timing = 1; /* CardSetBusMode in the pinned firmware selects HS timing. */
+	static const efi_guid clock_guid = EFI_MTK_CLOCK_GUID;
+	efi_mtk_clock *clock;
+	uint32_t clock_id;
+	uint64_t source_hz;
+	if (!EFI_ERROR(BS->locate_protocol(&clock_guid, NULL, (void **)&clock)) && clock && clock->get_id && clock->get_frequency &&
+	    !EFI_ERROR(clock->get_id("TOP_MSDC50_0", &clock_id)) &&
+	    !EFI_ERROR(clock->get_frequency(clock_id, &source_hz)) && source_hz > 0 && source_hz <= 1000000000)
+		mtk_storage_info.source_clock_hz = source_hz;
 	print("ubuntu: bootstrap ready: flashboot=md0, root=md1; firmware reads complete before XNU\n");
 	print("ubuntu: native MSDC handoff: partition byte %x, superblock digest recorded\n", ubuntu_partition_offset);
+	print("ubuntu: eMMC RCA=1 wired-width=8 source-clock=%d Hz\n", mtk_storage_info.source_clock_hz);
 	return 1;
 }

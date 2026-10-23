@@ -202,6 +202,14 @@ typedef struct efi_block_io {
 	efi_status (EFIAPI *flush_blocks)(struct efi_block_io *self);
 } efi_block_io;
 
+/* Read-only subset of the existing MediaTek clock protocol (no This argument). */
+typedef struct {
+	efi_status (EFIAPI *get_id)(const char *name, uint32_t *id);
+	void *get_name, *set_enable, *is_enabled;
+	efi_status (EFIAPI *get_frequency)(uint32_t id, uint64_t *hz);
+} efi_mtk_clock;
+#define EFI_MTK_CLOCK_GUID { 0x79c0d079, 0x75c1, 0xa84a, { 0x80, 0x14, 0x42, 0x60, 0xcb, 0x97, 0x35, 0x33 } }
+
 /* Block I/O 2: the same reads, asynchronous -- a token's event is signalled when one is done */
 typedef struct {
 	void *event;

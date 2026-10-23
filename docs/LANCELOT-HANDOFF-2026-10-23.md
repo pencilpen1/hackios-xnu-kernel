@@ -2,6 +2,12 @@
 
 ## Latest user constraints
 
+- Latest instruction: **only local Git commits for the transfer upgrade; do not push to
+  GitHub until it is validated and stable**. Keep the current phone boot running. See
+  `docs/LANCELOT-TRANSFER-UPGRADE.md` for the local multiblock/8-bit/HS52 candidate.
+  Its host tests and final build passed; artifacts are in
+  `local/lancelot-transfer-upgrade-20261023/` (kernel `8b7c530a...`, handoff v2/96 bytes).
+  It has not been flashed. The checked-in notes below about older pushed builds are historical.
 - The user subsequently **authorized reboots and flashing the UEFI/test images**. The earlier
   no-reboot restriction is superseded for phone bring-up. Host Windows reboot is unnecessary.
   Checkpoints 5 and 10 have now passed on hardware. The latest continuous-boot XNUP is on ESP
