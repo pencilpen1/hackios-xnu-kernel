@@ -1,5 +1,9 @@
 # Lancelot service-log analysis / handoff — 2026-10-23
 
+Final update: see `NEXT-AI-HANDOFF-2026-10-23-END-OF-DAY.md` for the independent
+end-of-day handoff. File deployment and read-only readback have now completed;
+the candidate has not been boot-tested. The phone is left in Android.
+
 ## Actual hardware results
 
 Runtime transport commit `22a2efb` was deployed with verified Ubuntu/ESP readback,

@@ -1,5 +1,9 @@
 # Lancelot boot-loop fix / transfer upgrade handoff — 2026-10-23
 
+End-of-day authoritative state: `NEXT-AI-HANDOFF-2026-10-23-END-OF-DAY.md`.
+The service-log files are now deployed/readback-verified; the phone is in Android,
+with the new candidate's first boot deliberately left for the next session.
+
 Latest evidence and next candidate: `LANCELOT-SERVICE-LOG-2026-10-23.md`.
 Runtime USB now exports user-space logs; real mediaserverd SIGSEGV and backboardd
 spawn EACCES loops have been observed. Stable desktop remains unverified.
