@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
 SOURCE=$(realpath "${1:?usage: common/build-local-ios.sh PATH_TO_IMPORTED_IOS}")
 test -f "$SOURCE/source.json"
-for PATCH in common/patches/userland-local-ios.patch common/patches/userland-prebuilt-tests.patch; do
+for PATCH in common/patches/userland-local-ios.patch common/patches/userland-prebuilt-tests.patch common/patches/userland-job-env-name.patch; do
   if git apply --unidiff-zero --check "$PATCH" 2>/dev/null; then
     git apply --unidiff-zero "$PATCH"
   else

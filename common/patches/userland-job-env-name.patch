@@ -1,0 +1,21 @@
+diff --git a/userland/mkjobs.py b/userland/mkjobs.py
+--- a/userland/mkjobs.py
++++ b/userland/mkjobs.py
+@@ -283,5 +283,5 @@
+     # that never appears.
+-    for name in ('RWA_PACKED16',):
+-        if os.environ.get(name):
+-            job.setdefault('EnvironmentVariables', {})[name] = os.environ[name]
++    for env_name in ('RWA_PACKED16',):
++        if os.environ.get(env_name):
++            job.setdefault('EnvironmentVariables', {})[env_name] = os.environ[env_name]
+     # a job that is named is wanted, whatever hardware it says it is for: wifid's asks for a node "wlan" in the
+@@ -324,5 +324,5 @@
+         # that never appears.
+-        for name in ('RWA_PACKED16',):
+-            if os.environ.get(name):
+-                job.setdefault('EnvironmentVariables', {})[name] = os.environ[name]
++        for env_name in ('RWA_PACKED16',):
++            if os.environ.get(env_name):
++                job.setdefault('EnvironmentVariables', {})[env_name] = os.environ[env_name]
+         if label in oslog:

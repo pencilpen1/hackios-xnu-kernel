@@ -1,5 +1,8 @@
 # Lancelot handoff — 2026-10-23
 
+Latest combined boot-loop/transfer investigation: read
+`LANCELOT-HANDOFF-2026-10-23-BOOTFIX.md` first for the current candidate and validation status.
+
 ## Latest user constraints
 
 - Latest instruction: **only local Git commits for the transfer upgrade; do not push to
