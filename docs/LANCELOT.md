@@ -112,7 +112,11 @@ A 4 MiB `flashboot.apfs` (stage0 + mount points) also passed readback checks.
 `tools/prepare-lancelot-flash.py` converted the original local DMGs to consecutive APFS
 containers: root 5,635,047,424 bytes, OS cryptex 2,743,074,816 bytes, App 10,485,760 bytes.
 Output SHA-256: `0c5685be9960495afccbdd7f0fd257b35620931f7b456ae793c2a55c7241b51a`.
-This image has **not been written to Ubuntu yet**; hardware boot/ABI compatibility is unverified.
+This image and the three prepared APFS files were deployed to the existing Ubuntu ext4
+directory `/hackios/20H392` on 2026-10-23. All four SHA-256 checks passed after transfer and
+after a read-only remount, then Ubuntu was unmounted; Android remains running. See
+`docs/LANCELOT-HANDOFF-2026-10-23.md` for logs, hashes and the no-reboot constraint.
+These are files inside ext4, not a raw APFS partition; hardware boot/ABI compatibility is unverified.
 If 16.7 userspace is incompatible, the user authorizes the upstream `ios165/fetch.sh`
 download of matching 16.5. Keep the two versions in separate source directories.
 
@@ -173,13 +177,21 @@ JOBS=4 CHECKPOINT=5 bash common/build-lancelot-kernel.sh
 ```
 
 Archives are pinned to the upstream Theos toolchain/16.5 SDK and macOS 13.3 SDK for
-pre-generated DriverKit headers. Ranges, archive integrity and hashes are checked; only
-macOS SDK has a published hash. No Apple IPSW or phone firmware is downloaded by this step.
+pre-generated DriverKit headers. The complete Windows `local/build-deps-20261022` archives
+passed SHA-256 and XZ verification and were installed successfully in the WSL workspace.
+Use those before downloading again. Fresh downloads prefer `https://ghfast.top` (override
+with `--mirror HTTPS_PREFIX`, repeatable, or `HACKIOS_GITHUB_MIRROR`), then direct GitHub.
+Exact ranges and reference hashes are checked: only macOS SDK has a publisher hash; the
+other two reference hashes are from the verified direct-origin download. No Apple IPSW or
+phone firmware is downloaded by this step.
 
-`build-lancelot-kernel.sh` refuses an absent/stale kernel and verifies checkpoints 1–5
-in the actual machine code before packaging. Upstream's post-link export errors are
-not treated as success unless a fresh verified kernel exists. `mach.lancelot` is a local
-artifact; the old prebuilt stays untouched. Deployment then uses
+`build-lancelot-kernel.sh` requires XNU's `make build` target to succeed and verifies
+checkpoints 1–5 in the linked machine code before packaging. A compile/link failure stops
+packaging even if an old kernel is present. Up-to-date repaired kernels can be reused by
+make. The full `all/config` target still reports DriverKit RPC export/symbolset failures
+from upstream's incomplete `iig` stubs (`xnu/README.md`); the checkpoint-only build does not
+claim to fix those or produce a complete DriverKit SDK. `mach.lancelot` is a local artifact.
+With later device-test authorization, deployment uses
 `tools/deploy-lancelot.py --adb PATH --serial SERIAL --files DIRECTORY` with readback hashes,
 and the already-authorized UEFI image only. No Ubuntu partition write is needed for this test.
 

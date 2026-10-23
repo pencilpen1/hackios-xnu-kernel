@@ -91,6 +91,9 @@ stage1() {
 
 	# --- host tools ----------------------------------------------------------------------------
 	mkdir -p host/bin
+	# XNU's LLDB syntax checker uses /usr/bin/env python; Ubuntu only installs python3.
+	# Keep the compatibility name local to the build PATH rather than changing /usr/bin.
+	link "$(command -v python3)" host/bin/python
 	# mig: Apple's own does not build on glibc; this is a port that does
 	if [ ! -x host/bin/migcom ] || [ ! -x host/bin/mig ]; then
 		log "building mig"
