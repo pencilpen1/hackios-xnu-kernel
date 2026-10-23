@@ -1,5 +1,9 @@
 # Lancelot boot-loop fix / transfer upgrade handoff — 2026-10-23
 
+Latest evidence and next candidate: `LANCELOT-SERVICE-LOG-2026-10-23.md`.
+Runtime USB now exports user-space logs; real mediaserverd SIGSEGV and backboardd
+spawn EACCES loops have been observed. Stable desktop remains unverified.
+
 ## Goal and current policy
 
 - User supplied `D:\AI_rom\iOSforLava\IOSnewproblem.md`: Apple-logo boot stalls while

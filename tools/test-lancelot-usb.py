@@ -13,6 +13,14 @@ spec = importlib.util.spec_from_file_location("lancelot_log", root / "tools/read
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
+assert module.log_version(b"log-version: KLOG2\r\nFinished. Total time: 0.01s\r\n") == "KLOG2"
+assert module.log_version(b"(bootloader) log-version: LLOG1\n") == "LLOG1"
+try:
+    module.log_version(b"FAILED (remote: 'diagnostic getvar/oem log only')")
+except ValueError:
+    pass
+else:
+    raise AssertionError("a rejected command is not a supported runtime protocol")
 for size in (0, 1, 63, 64, 65, 4096, 16384):
     data = bytes(i % 256 for i in range(size))
     blob = struct.pack("<8sQQQII", b"KLOG2\0\0\0", 123, 777, 777 + size, zlib.crc32(data), size) + data

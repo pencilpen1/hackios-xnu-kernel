@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture the existing MTK UEFI LLOG1 protocol using Windows or Linux fastboot.
+"""Capture MTK firmware LLOG1 and XNU KLOG2 using Windows or Linux fastboot.
 
 This is fastboot INFO transport, not CDC ACM. No libusb/WSL USB forwarding is
 needed when --fastboot points to the Windows platform-tools executable.
@@ -56,6 +56,13 @@ def parse_klog(data):
     return Batch(boot, start, end, payload)
 
 
+def log_version(data):
+    match = re.search(rb"(?:^|\n)(?:\(bootloader\)\s*)?log-version:\s*(LLOG1|KLOG2)\b", data)
+    if not match:
+        raise ValueError("device did not advertise a supported log protocol")
+    return match[1].decode("ascii")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--fastboot", default="fastboot")
@@ -63,13 +70,15 @@ def main():
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--duration", type=float, default=120)
     ap.add_argument("--once", action="store_true")
-    ap.add_argument("--runtime", action="store_true", help="capture XNU KLOG2 via fastboot upload; keep retrying through handoff")
+    ap.add_argument("--runtime", action="store_true", help="automatically follow firmware LLOG1 into XNU KLOG2")
     ap.add_argument("--quiet", action="store_true", help="save all bytes without echoing the phone's log to the terminal")
     args = ap.parse_args()
     if not 0 < args.duration < float("inf"):
         ap.error("duration must be finite and positive")
     args.out.parent.mkdir(parents=True, exist_ok=True)
     cursor, boot, total = 0, None, 0
+    protocol, runtime_total, probe_at, progress_at = None, 0, 0, 0
+    last_error, error_at = None, 0
     deadline = time.monotonic() + args.duration
     with tempfile.TemporaryDirectory(prefix="klog-", dir=args.out.parent) as staging, \
             args.out.open("ab") as output, args.out.with_suffix(args.out.suffix + ".fastboot").open("ab") as raw:
@@ -90,7 +99,16 @@ def main():
                     if result.returncode:
                         raise ValueError("fastboot command failed: " + result.stdout.decode(errors="replace").strip())
                     return result.stdout
-                if args.runtime:
+                now = time.monotonic()
+                if args.runtime and now >= probe_at:
+                    detected = log_version(command("getvar", "log-version"))
+                    probe_at = now + 2
+                    if detected != protocol:
+                        protocol = detected
+                        note("XNU runtime KLOG2 connected" if protocol == "KLOG2" else
+                             "firmware LLOG1 connected; waiting for XNU handoff")
+                binary = args.runtime and protocol == "KLOG2"
+                if binary:
                     snapshot = Path(staging) / "snapshot.bin"
                     snapshot.unlink(missing_ok=True)
                     command("oem", "klog", f"{cursor:016x}")
@@ -112,18 +130,28 @@ def main():
                 if chunk and not args.quiet:
                     print(chunk.decode("utf-8", errors="replace"), end="", flush=True)
                 total += len(chunk)
+                if binary:
+                    runtime_total += len(chunk)
+                last_error = None
                 cursor = max(cursor, batch.end)
-                if len(batch.data) < (16384 if args.runtime else 4096):
-                    if args.once:
+                if args.runtime and time.monotonic() >= progress_at:
+                    note(f"received {runtime_total} runtime bytes, {total} bytes overall; cursor={cursor:016x}")
+                    progress_at = time.monotonic() + 15
+                if len(batch.data) < (16384 if binary else 4096):
+                    if args.once and (not args.runtime or binary):
                         return 0
                     time.sleep(0.2)
             except (ValueError, subprocess.TimeoutExpired) as error:
-                note(str(error))
+                message = "USB unavailable during handoff; retrying" if isinstance(error, subprocess.TimeoutExpired) else str(error)
+                if message != last_error or time.monotonic() >= error_at:
+                    note(message)
+                    last_error, error_at = message, time.monotonic() + 15
+                probe_at = 0
                 if args.once:
                     return 1
                 time.sleep(0.5)
-        note(f"saved {total} {'kernel/userland' if args.runtime else 'firmware'} bytes")
-    return 0 if total else 1
+        note(f"saved {total} bytes overall" + (f", {runtime_total} XNU runtime bytes" if args.runtime else ""))
+    return 0 if (runtime_total if args.runtime else total) else 1
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@
 #include <pexpert/device_tree.h>
 #include <sys/errno.h>
 #include <sys/systm.h>
+#include <sys/proc.h>
 #include <sys/sysctl.h>
 #include "lancelot_musb.h"
 
@@ -18,6 +19,8 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern size_t loader_log_snapshot(uint64_t, uint64_t *, uint8_t *, size_t);
 extern void loader_log_write(const char *, size_t);
 void lancelot_usb_stop(void);
+void lancelot_usb_user_fault(uint64_t pc, uint64_t lr, uint64_t sp, uint64_t fp,
+    uint32_t esr, uint64_t far, uint64_t code);
 static struct lancelot_musb usb;
 static vm_offset_t registers;
 static thread_call_t poll_call;
@@ -96,6 +99,19 @@ static void lancelot_usb_init(void)
 	usb_schedule(30);
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, lancelot_usb_init);
+
+/* Called only after VM recovery has failed, immediately before normal Mach
+ * exception delivery. Records original registers without dereferencing user
+ * memory, replacing exception handlers or changing the fault result. */
+void lancelot_usb_user_fault(uint64_t pc, uint64_t lr, uint64_t sp, uint64_t fp,
+    uint32_t esr, uint64_t far, uint64_t code)
+{
+	if (!attached || stopped) return;
+	char name[64] = {0};
+	proc_selfname(name, sizeof(name));
+	printf("user-fault: %s[%d] pc=%llx lr=%llx sp=%llx fp=%llx esr=%x far=%llx code=%llu\n",
+	    name, proc_selfpid(), pc, lr, sp, fp, esr, far, code);
+}
 
 SYSCTL_DECL(_kern_redwood);
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, usb_log_polls, CTLFLAG_RD | CTLFLAG_LOCKED, &usb.polls, "MUSB runtime service steps");

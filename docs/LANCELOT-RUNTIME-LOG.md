@@ -1,5 +1,10 @@
 # Lancelot runtime USB log — 2026-10-23
 
+**Hardware update:** runtime USB works: boot `8000000003f74d4f`, 1,908,135 bytes
+received in a 300-second capture with no reported CRC errors or cursor gaps. The
+first implementation missed framebuffer-only kernel printf. Read
+`LANCELOT-SERVICE-LOG-2026-10-23.md` for the corrected candidate and actual service failures.
+
 ## Implementation
 
 The original LLOG1 interface runs in the UEFI MUSB poll callback. That callback cannot
@@ -44,7 +49,8 @@ Host checks passed: actual MUSB EP0 status/address sequencing, FS descriptors,
 backpressure, resets, malformed/oversize requests, binary upload byte integrity,
 CRC/length rejection, and production console head/tail/wrap/future-cursor cases under
 ASan/UBSan. XNU `make build` and continuous XNUP validation passed. These checks are
-not hardware validation; the new USB takeover and stable desktop still require a run.
+not desktop validation. USB takeover has subsequently passed the capture above;
+the combined boot has not passed.
 
 ## Capture
 
@@ -54,8 +60,10 @@ python tools/read-lancelot-log.py --runtime --quiet `
   --out local/lancelot-runtime-log-20261023/xnu-runtime.log --duration 600
 ```
 
-Keep the reader running through firmware/kernel USB re-enumeration. It retries until
-the runtime transport answers, and saves the complete decoded stream plus `.fastboot`
+Keep the reader running through firmware/kernel USB re-enumeration. It now queries
+`log-version`, captures LLOG1 during firmware loading and switches to KLOG2 on handoff.
+It reports received-byte progress every 15 seconds instead of treating the firmware's
+unsupported `oem klog` response as a repeated error. It saves the decoded stream plus `.fastboot`
 command diagnostics. Legacy firmware-only capture omits `--runtime`.
 
 First analysis targets: actual MMC `width/hz/batch/errors`, successful continuous reads,

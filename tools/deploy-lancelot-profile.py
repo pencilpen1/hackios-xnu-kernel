@@ -23,7 +23,7 @@ def main():
         raise SystemExit("unexpected bootstrap profile")
     files = {"root.apfs": args.image, "profile.json": args.metadata}
     hashes = {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in files.items()}
-    if hashes["root.apfs"] != "2a77f18e5f8870133baf00094201634de5467221164f9ad7f0296731f1c959bc":
+    if hashes["root.apfs"] != "8089e522be3d774cb568b853e380421c02ed3defacffd23e4a3b263f20c5ae64":
         raise SystemExit("profile image does not match the loader's pinned hash")
     base = [args.adb, "-s", args.serial]
     def call(*command, timeout=60):
@@ -64,7 +64,7 @@ def main():
         if process is not None and process.poll() is None:
             process.terminate(); process.wait(timeout=15)
         call("forward", "--remove", f"tcp:{port}")
-    report = {"partition": "Ubuntu", "path": "/hackios/20H392/runtime-log-20261023", "verified": True, "files": hashes}
+    report = {"partition": "Ubuntu", "path": "/hackios/20H392/service-log-20261023", "verified": True, "files": hashes}
     args.log.with_suffix(args.log.suffix + ".json").write_text(json.dumps(report, indent=2) + "\n")
 
 

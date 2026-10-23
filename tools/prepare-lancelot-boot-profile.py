@@ -21,6 +21,16 @@ com.apple.powerd com.apple.analyticsd com.apple.logd_helper
 com.apple.iconservices.iconservicesagent com.apple.pluginkit.pkd com.apple.SpringBoard com.apple.wifid
 """.split()
 
+LOG_JOBS = {
+    "com.apple.SpringBoard": "SpringBoard",
+    "com.apple.backboardd": "backboardd",
+    "com.apple.mediaserverd": "mediaserverd",
+    "com.apple.lsd": "lsd",
+    "com.apple.lsd.system": "lsd-system",
+    "com.apple.wifid": "wifid",
+    "com.apple.coredatad": "coredatad",
+}
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
@@ -63,7 +73,7 @@ def main():
     # The copied output is ours; regenerate it from the actual full-root listing.
     shutil.rmtree(jobs)
     jobs.mkdir()
-    env = dict(os.environ, OSLOG="com.apple.SpringBoard com.apple.backboardd")
+    env = dict(os.environ, OSLOG=" ".join(LOG_JOBS))
     log = subprocess.check_output(["python3", str(workspace / "userland/mkjobs.py"), "--rest",
                                    "--root-volume", str(source / "rootfs.slt"),
                                    str(source / "rootfs"), str(jobs), *labels], env=env, stderr=subprocess.STDOUT)
@@ -71,10 +81,11 @@ def main():
     # Keep existing port service jobs, except the interactive CPU/surface stress demo.
     for path in (original / "LaunchDaemons").glob("com.redwood.*.plist"):
         if path.stem != "com.redwood.demo": shutil.copy2(path, jobs / path.name)
-    for label, name in (("com.apple.SpringBoard", "SpringBoard"), ("com.apple.backboardd", "backboardd")):
+    for label, name in LOG_JOBS.items():
         path = jobs / (label + ".plist")
         job = plistlib.loads(path.read_bytes())
         job["StandardOutPath"] = job["StandardErrorPath"] = f"/private/var/log/hackios/{name}.log"
+        job.setdefault("EnvironmentVariables", {})["OS_ACTIVITY_DT_MODE"] = "YES"
         path.write_bytes(plistlib.dumps(job, fmt=plistlib.FMT_BINARY))
     local_output(root / "bin")
     local_output(root / "bin/bootdiag")
@@ -84,13 +95,25 @@ def main():
             "RunAtLoad": True, "KeepAlive": True, "ProcessType": "Background", "ThrottleInterval": 30,
             "StandardOutPath": "/dev/console", "StandardErrorPath": "/dev/console"}
     (jobs / "com.hackios.bootdiag.plist").write_bytes(plistlib.dumps(diag, fmt=plistlib.FMT_BINARY))
-    with local_output(root / "etc/var.skel").open("a") as file:
-        file.write("d\t755\t0\t0\t/private/var/log/hackios\n")
+    # xpcproxy opens standard streams after changing to the job's uid. A
+    # root-owned 0755 directory blocked mobile's backboardd with spawn EACCES.
+    # Seed files as mobile too, so a root/system launch cannot create a log
+    # first with an owner that prevents the corresponding mobile launch.
+    local_output(root / "etc/bootdiag-empty").write_bytes(b"")
+    skeleton = local_output(root / "etc/var.skel")
+    lines = [line for line in skeleton.read_text().splitlines()
+             if not any(field == "/private/var/log/hackios" or field.startswith("/private/var/log/hackios/")
+                        for field in line.split("\t"))]
+    lines.append("d\t755\t501\t501\t/private/var/log/hackios")
+    for name in LOG_JOBS.values():
+        lines.append(f"f\t644\t501\t501\t/private/var/log/hackios/{name}.log\t/etc/bootdiag-empty")
+    skeleton.write_text("\n".join(lines) + "\n")
     report = {"build": manifest["build"], "version": manifest["version"], "previous_migration_seed": before,
               "migration_seed_scope": "fresh RAM data-volume template only; persisted restores remain authoritative",
               "jobs_before": len(list((original / "LaunchDaemons").glob("*.plist"))),
               "jobs_after": len(list(jobs.glob("*.plist"))), "stress_demo_removed": True,
               "wifid_present": (jobs / "com.apple.wifid.plist").exists(),
+              "detailed_log_jobs": LOG_JOBS, "log_file_owner": "501:501",
               "bootdiag_sha256": hashlib.sha256((root / "bin/bootdiag").read_bytes()).hexdigest()}
     if report["jobs_after"] <= report["jobs_before"] or not report["wifid_present"]:
         raise SystemExit("on-demand dependency generation did not produce the expected expanded profile")

@@ -156,25 +156,6 @@ index fd7a94b20794..69eaceedd248 100644
  	/* Bodge in the CLOCAL flag as the km device is always local */
  	case TIOCSETA_32:
  	case TIOCSETAW_32:
-@@ -252,6 +261,9 @@ fallthrough:
-  *		assumptions here, this routine should be static (and
-  *		inlined, given there is only one call site).
-  */
-+
-+extern void loader_log_putc(char c);
-+
- int
- kmputc(__unused dev_t dev, char c)
- {
-@@ -363,6 +375,8 @@ kmoutput(struct tty * tp)
- 		for (cp = buf; cp < &buf[cc]; cp++) {
- 			/* output the buffer one charatcer at a time */
- 			*cp = *cp & 0x7f;
-+			/* What user space writes to /dev/console also goes to the loader's log. */
-+			loader_log_putc((char)*cp);
- 		}
- 		if (cc > 1) {
- 			console_write((char *)buf, cc);
 diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
 index 7fd9be1a5f38..0d035255b030 100644
 --- a/bsd/dev/arm/systemcalls.c
@@ -3118,6 +3099,50 @@ index 3ad743fc3efb..ce036c5a2c26 100644
  #else
  void
  pe_init_fiq()
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1479,6 +1479,13 @@ handle_user_abort(arm_saved_state_t *state, uint32_t esr, vm_offset_t fault_addr,
+ 	if (user_fault_addr_matches_pac_error_code(fault_addr, is_data_abort)) {
+ 		exc |= EXC_PTRAUTH_BIT;
+ 	}
+ #endif /* __has_feature(ptrauth_calls) */
++	/* Diagnostic observation only: retain the original exception delivery. */
++	extern void lancelot_usb_user_fault(uint64_t, uint64_t, uint64_t, uint64_t,
++	    uint32_t, uint64_t, uint64_t);
++	lancelot_usb_user_fault(get_saved_state_pc(state), get_saved_state_lr(state),
++	    get_saved_state_sp(state), get_saved_state_fp(state), esr, fault_addr,
++	    (uint64_t)codes[0]);
++
+ 	exception_triage(exc, codes, numcodes);
+ 	__builtin_unreachable();
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -512,6 +512,12 @@
+ void
+ console_write(char *str, int size)
+ {
++#if defined(__arm64__)
++	/* Capture kernel printf as well as user-space console output, even when
++	 * the active console is the framebuffer or console rendering is disabled. */
++	extern void loader_log_write(const char *, size_t);
++	if (str != NULL && size > 0) loader_log_write(str, (size_t)size);
++#endif
+ 	assert(str != NULL);
+ 
+ 	char *write_ptr = NULL;
+@@ -590,6 +596,10 @@
+ void
+ console_write_unbuffered(char c)
+ {
++#if defined(__arm64__)
++	extern void loader_log_putc(char);
++	loader_log_putc(c);
++#endif
+ 	_cnputc(c, true);
+ }
+ 
 diff --git a/pexpert/arm/pe_kprintf.c b/pexpert/arm/pe_kprintf.c
 index 65144c74239c..ab6260d52d84 100644
 --- a/pexpert/arm/pe_kprintf.c
