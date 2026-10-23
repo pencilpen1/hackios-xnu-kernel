@@ -4,12 +4,11 @@
 
 - The user subsequently **authorized reboots and flashing the UEFI/test images**. The earlier
   no-reboot restriction is superseded for phone bring-up. Host Windows reboot is unnecessary.
-  Checkpoints 5 and 10 have now passed on hardware. The checkpoint-10 bootArgs-fixed XNUP is
-  on ESP and the previously authorized MSDC-fixed UEFI is on boot; the phone is resident in
-  UEFI for log retrieval. See the latest checkpoint-10 result below.
+  Checkpoints 5 and 10 have now passed on hardware. The latest continuous-boot XNUP is on ESP
+  and the previously authorized MSDC-fixed UEFI is on boot. See the continuous-boot result below.
 - Latest steering: **continuous boot by default**. Do not deliberately stop at each checkpoint.
   Only select a checkpoint for an observed startup blocker or a specific logging investigation.
-  The continuous package below is now being deployed/tested, superseding the checkpoint-10
+  The continuous package below has been deployed and booted, superseding the checkpoint-10
   resident state. There is no `loader_return_after` or other scheduled diagnostic return.
 - ESP corruption is resolved by the existing UEFI MSDC patch, as confirmed by the user.
   Every future authorized UEFI source change must receive its own Git commit; ask before
@@ -247,6 +246,16 @@ python tools/deploy-ubuntu-files.py `
   `test-lancelot-boot-policy.py` verifies actual generated payloads: normal boot accepted;
   checkpoint, timer, forced panic, USB wait and MMU probe variants rejected. Packaging with
   stale `CHECKPOINT=10` still produced an uninterrupted default boot package as required.
+- Continuous attempt completed its **host capture only**, not kernel execution:
+  `local/lancelot-continuous-20261023/xnu-boot.log`, boot ID `00000000056c0ab0`, 2,754 firmware
+  bytes. ESP readback hashes matched; loader logged `checkpoint 0` (disabled) and branched
+  to `0xc34464a8`. No checkpoint stop or return was observed. USB requests timed out after
+  the kernel took the only running CPU, as expected for the current firmware log transport.
+  Timeouts alone do not prove a kernel hang, successful root mount, or iOS startup.
+- The user reports **new kernel output or an error on the phone screen**. Exact text/photo is
+  still needed to identify the startup issue. Do not replace continuous boot with checkpoint
+  stepping merely because USB went quiet; first inspect that screen evidence. Phone has not
+  been stopped/rebooted by ending the capture. Code/default-policy commit: `c8d6190`.
 
 ## Next AI: required sequence
 
