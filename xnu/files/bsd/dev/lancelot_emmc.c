@@ -16,6 +16,7 @@
 #include <sys/errno.h>
 #include <sys/proc.h>
 #include <sys/systm.h>
+#include <sys/sysctl.h>
 #include <sys/uio.h>
 #include <sys/redwood_input.h>
 #include "lancelot_storage.h"
@@ -37,6 +38,33 @@ static vm_offset_t registers;
 static bool ready, failed;
 static uint32_t device_block_size = 512;
 static uint8_t sector_buffer[512];
+static int block_major = -1;
+static uint64_t counter_frequency, sector_reads, io_errors, logical_reads, logical_bytes;
+static uint64_t pio_us, file_read_us, lock_wait_us, initial_cfg, bus_width;
+
+SYSCTL_DECL(_kern_redwood);
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_sectors, CTLFLAG_RD | CTLFLAG_LOCKED, &sector_reads, "successful 512-byte native reads, including ext4 metadata");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &io_errors, "native transport errors");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_requests, CTLFLAG_RD | CTLFLAG_LOCKED, &logical_reads, "APFS image read requests");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &logical_bytes, "successful requested image bytes");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_pio_us, CTLFLAG_RD | CTLFLAG_LOCKED, &pio_us, "microseconds spent in native PIO transactions");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_read_us, CTLFLAG_RD | CTLFLAG_LOCKED, &file_read_us, "microseconds reading image data including extent mapping");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_lock_us, CTLFLAG_RD | CTLFLAG_LOCKED, &lock_wait_us, "microseconds waiting for storage serialization");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_meta_hits, CTLFLAG_RD | CTLFLAG_LOCKED, &filesystem.metadata_hits, "extent metadata cache hits");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_meta_reads, CTLFLAG_RD | CTLFLAG_LOCKED, &filesystem.metadata_reads, "extent metadata reads from storage");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_cfg, CTLFLAG_RD | CTLFLAG_LOCKED, &initial_cfg, "inherited MSDC_CFG register");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_bus_width, CTLFLAG_RD | CTLFLAG_LOCKED, &bus_width, "inherited data bus width in bits, zero if reserved");
+
+bool
+lancelot_emmc_dev(dev_t dev)
+{
+	return ready && major(dev) == block_major && minor(dev) == 0;
+}
+static uint64_t elapsed_us(uint64_t start, uint64_t end)
+{
+	uint64_t ticks = end - start;
+	return (ticks / counter_frequency) * 1000000 + (ticks % counter_frequency) * 1000000 / counter_frequency;
+}
 
 static uint32_t
 mmc_read_register(__unused void *ctx, uint32_t offset)
@@ -65,14 +93,19 @@ partition_read(__unused void *ctx, uint64_t offset, size_t size, void *out)
 		if (n > size) n = size;
 		/* Avoid scheduler/IRQ delays while a sector fills the small hardware FIFO. */
 		boolean_t interrupts = ml_set_interrupts_enabled(FALSE);
+		uint64_t start = mmc_ticks(NULL);
 		int status = lancelot_msdc_sector(&controller, (uint32_t)(absolute >> 9), sector_buffer);
+		uint64_t finish = mmc_ticks(NULL);
 		ml_set_interrupts_enabled(interrupts);
+		pio_us += elapsed_us(start, finish);
 		if (status != LM_OK) {
+			io_errors++;
 			failed = true;
 			printf("lancelot-emmc: read failed LBA=%llu status=%d stage=%u int=%x response=%x\n",
 			    absolute >> 9, status, controller.last_stage, controller.last_int, controller.last_response);
 			return 0;
 		}
+		sector_reads++;
 		memcpy(p, sector_buffer + within, n);
 		p += n; offset += n; size -= n;
 	}
@@ -82,8 +115,14 @@ partition_read(__unused void *ctx, uint64_t offset, size_t size, void *out)
 static int
 image_read(uint64_t offset, size_t size, void *out)
 {
+	uint64_t start = mmc_ticks(NULL);
 	lck_mtx_lock(&lancelot_mmc_lock);
+	uint64_t acquired = mmc_ticks(NULL);
+	lock_wait_us += elapsed_us(start, acquired);
+	logical_reads++;
 	int ok = ready && !failed && ext4_read_file(&filesystem, &ios, offset, size, out);
+	file_read_us += elapsed_us(acquired, mmc_ticks(NULL));
+	if (ok) logical_bytes += size;
 	lck_mtx_unlock(&lancelot_mmc_lock);
 	return ok ? 0 : EIO;
 }
@@ -189,12 +228,16 @@ lancelot_emmc_init(void)
 	    offer.partition_offset >= (1ULL << 41) || offer.partition_bytes > (1ULL << 41) - offer.partition_offset) return;
 	uint64_t frequency = __builtin_arm_rsr64("CNTFRQ_EL0");
 	if (!frequency || frequency > 1000000000) return;
+	counter_frequency = frequency;
 	registers = ml_io_map((vm_offset_t)offer.mmio, 4096);
 	if (!registers) return;
 	controller.ctx = NULL; controller.read = mmc_read_register; controller.write = mmc_write_register;
 	controller.ticks = mmc_ticks; controller.timeout = frequency / 2; /* 500 ms maximum per phase */
-	printf("lancelot-emmc: inherited MSDC0 cfg=%x, Ubuntu at byte %llu; CMD17 read-only\n",
-	    mmc_read_register(NULL, LM_CFG), offer.partition_offset);
+	initial_cfg = mmc_read_register(NULL, LM_CFG);
+	uint32_t width = (mmc_read_register(NULL, 0x30) >> 16) & 3;
+	bus_width = width == 0 ? 1 : width == 1 ? 4 : width == 2 ? 8 : 0;
+	printf("lancelot-emmc: inherited cfg=%llx width=%llu clock-mode=%llu divisor=%llu, Ubuntu byte %llu; CMD17 read-only\n",
+	    initial_cfg, bus_width, (initial_cfg >> 20) & 3, (initial_cfg >> 8) & 0xfff, offer.partition_offset);
 	uint8_t super[1024], digest[32];
 	static uint8_t header[4096];
 	if (!partition_read(NULL, 1024, sizeof(super), super)) return;
@@ -217,6 +260,7 @@ lancelot_emmc_init(void)
 	    !devfs_make_node(makedev(cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0440, "rlancelot_ios")) {
 		printf("lancelot-emmc: device node allocation failed\n"); return;
 	}
+	block_major = bmajor;
 	ready = true;
 	printf("lancelot-emmc: /dev/lancelot_ios ready, %llu bytes; native superblock SHA256 matched\n", ios.size);
 }

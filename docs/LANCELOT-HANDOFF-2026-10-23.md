@@ -360,6 +360,23 @@ python tools/deploy-ubuntu-files.py `
   Obtain those before diagnosing the next issue or claiming full iOS launchd startup.
   Native writes are still unimplemented; the user's requested persistent read/write phase is next.
 
+### Apple-logo progress and performance investigation
+
+- The user now reports an Apple logo/progress bar after about 20 minutes, with loading still
+  progressing. Preserve this live run: no restart or deployment for the performance check.
+  It is progress into the system boot UI, not confirmation that SpringBoard finished booting.
+- Source analysis found CMD17 per 512 bytes, uncached ext4 extent nodes per 4 KiB, an APFS
+  RAM-disk misclassification, and the firmware's 1-bit/50 MHz configuration. See
+  `docs/LANCELOT-STORAGE-PERFORMANCE.md` for evidence, measured host request amplification,
+  prepared cache/classification fixes and future timing counters. No actual eMMC throughput
+  has been measured from this live kernel; do not call it a hardware defect or assign a
+  measured speedup to the host-only changes.
+- The revised performance/metrics build passed and is archived (not deployed) under
+  `local/lancelot-perf-20261023/`, kernel SHA-256
+  `6c5a730708ed3ddfc58b8e55c7a5b919bde087b84519a893c2c51575fd3505bc`.
+  The phone still runs the earlier native-storage build; do not confuse the new host output
+  in `out/lancelot` with the active ESP payload. All work on this investigation was host-side.
+
 ## Next AI: required sequence
 
 1. Read this file and `docs/LANCELOT.md`. Deployment is done; evidence and four payload hashes

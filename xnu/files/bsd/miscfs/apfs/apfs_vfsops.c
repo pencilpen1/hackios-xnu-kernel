@@ -1120,7 +1120,12 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 		dev_t rdev = vnode_specrdev(devvp);
 		uint32_t cheap;
 
-		am->am_nx.cheap_requests = !redwood_ufs_dev(rdev) && !redwood_virtio_blk_dev(rdev);
+		bool mtk_pio = lancelot_emmc_dev(rdev);
+		am->am_nx.cheap_requests = !redwood_ufs_dev(rdev) && !redwood_virtio_blk_dev(rdev) && !mtk_pio;
+		/* PIO still pays per 512-byte command. Release the APFS lock for I/O,
+		 * but avoid speculative metadata amplification until multiblock reads
+		 * are validated. An explicit apfs_meta_cluster remains authoritative. */
+		if (mtk_pio && am->am_nx.meta_cluster == 0) am->am_nx.meta_cluster = 1;
 		if (PE_parse_boot_argn("apfs_cheap", &cheap, sizeof(cheap))) {
 			am->am_nx.cheap_requests = (cheap != 0);
 		}

@@ -29,7 +29,8 @@ if ! cmp -s xnu/files/osfmk/arm64/loader_return.c "$RETURN_SOURCE"; then
 fi
 python3 tools/test-loader-early-return.py "$RETURN_SOURCE"
 for file in bsd/dev/lancelot_emmc.c bsd/dev/lancelot_msdc.h bsd/dev/lancelot_storage.h \
-            bsd/dev/lancelot_ext4.h bsd/dev/lancelot_sha256.h bsd/dev/redwood_input.c bsd/sys/redwood_input.h; do
+            bsd/dev/lancelot_ext4.h bsd/dev/lancelot_sha256.h bsd/dev/redwood_input.c bsd/sys/redwood_input.h \
+            bsd/miscfs/apfs/apfs_vfsops.c; do
   if ! cmp -s "xnu/files/$file" "xnu-src/xnu-8796.121.2/$file"; then
     echo "$file differs from the tracked port source; reconcile local XNU edits before building" >&2
     exit 1

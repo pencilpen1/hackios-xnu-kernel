@@ -20,6 +20,10 @@ struct ext4_fs {
 	uint16_t inode_size, desc_size;
 	/* Caller-owned scratch keeps freestanding firmware off large stack frames. */
 	uint8_t node[4096], directory[4096];
+	/* Extent metadata is immutable during this read-only mount. Reopening the
+	 * filesystem invalidates all entries; never cache file contents here. */
+	struct { uint64_t block; int valid; uint8_t data[4096]; } metadata[8];
+	uint64_t metadata_hits, metadata_reads;
 };
 struct ext4_inode {
 	uint64_t size;
@@ -33,6 +37,22 @@ static int
 e4_read(struct ext4_fs *fs, uint64_t offset, size_t size, void *out)
 {
 	return offset <= fs->bytes && size <= fs->bytes - offset && fs->read(fs->ctx, offset, size, out);
+}
+static int
+e4_extent_node(struct ext4_fs *fs, uint64_t block, void *out)
+{
+	unsigned slot = (unsigned)(block & 7);
+	if (fs->metadata[slot].valid && fs->metadata[slot].block == block) {
+		fs->metadata_hits++;
+	} else {
+		fs->metadata[slot].valid = 0;
+		fs->metadata_reads++;
+		if (!e4_read(fs, block * fs->block_size, fs->block_size, fs->metadata[slot].data)) return 0;
+		fs->metadata[slot].block = block;
+		fs->metadata[slot].valid = 1;
+	}
+	memcpy(out, fs->metadata[slot].data, fs->block_size);
+	return 1;
 }
 static int
 ext4_open(struct ext4_fs *fs, ext4_read_fn read, void *ctx, uint64_t bytes)
@@ -124,7 +144,7 @@ e4_map(struct ext4_fs *fs, const struct ext4_inode *inode, uint32_t logical, uin
 			}
 		}
 		if (!depth || !have) return 1;
-		if (!e4_read(fs, chosen * fs->block_size, fs->block_size, node)) return 0;
+		if (!e4_extent_node(fs, chosen, node)) return 0;
 		size = fs->block_size;
 		expected--;
 	}
@@ -139,6 +159,18 @@ ext4_read_file(struct ext4_fs *fs, const struct ext4_inode *inode, uint64_t offs
 		size_t within = (size_t)(offset % fs->block_size), n = fs->block_size - within;
 		if (logical > UINT32_MAX || !e4_map(fs, inode, (uint32_t)logical, &physical)) return 0;
 		if (n > size) n = size;
+		/* Preserve physical extent/hole boundaries, but do not split a contiguous
+		 * read into 4 KiB callbacks. Cap batches for firmware buffers/latency. */
+		size_t limit = size < 128 * 1024 ? size : 128 * 1024;
+		while (n < limit && (within + n) % fs->block_size == 0) {
+			uint64_t blocks = (within + n) / fs->block_size, next;
+			if (logical + blocks > UINT32_MAX) break;
+			if (!e4_map(fs, inode, (uint32_t)(logical + blocks), &next)) return 0;
+			if (physical ? next != physical + blocks : next != 0) break;
+			size_t add = fs->block_size;
+			if (add > limit - n) add = limit - n;
+			n += add;
+		}
 		if (physical) {
 			if (!e4_read(fs, physical * fs->block_size + within, n, p)) return 0;
 		} else memset(p, 0, n);
