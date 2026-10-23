@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Stream the new 20H392 boot profile onto Ubuntu and verify it after a read-only remount."""
+"""Stream the 20H392 bootstrap directly onto Ubuntu; verify after a read-only remount."""
 import argparse
+import base64
 import hashlib
 import io
 import json
 from pathlib import Path
-import socket
 import subprocess
 import tarfile
+import uuid
 
 
 def main():
@@ -25,46 +26,54 @@ def main():
     hashes = {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in files.items()}
     if hashes["root.apfs"] != "8089e522be3d774cb568b853e380421c02ed3defacffd23e4a3b263f20c5ae64":
         raise SystemExit("profile image does not match the loader's pinned hash")
+    archive_data = io.BytesIO()
+    with tarfile.open(fileobj=archive_data, mode="w") as archive:
+        for name, path in files.items():
+            info = tarfile.TarInfo(name); info.size = path.stat().st_size; info.mode = 0o644
+            with path.open("rb") as file: archive.addfile(info, file)
+        sums = "".join(value + "  " + name + "\n" for name, value in hashes.items()).encode()
+        info = tarfile.TarInfo("SHA256SUMS"); info.size = len(sums); info.mode = 0o644
+        archive.addfile(info, io.BytesIO(sums))
+    encoded = base64.encodebytes(archive_data.getvalue())
+    lines = encoded.count(b"\n")
     base = [args.adb, "-s", args.serial]
-    def call(*command, timeout=60):
-        return subprocess.check_output([*base, *command], stderr=subprocess.STDOUT, timeout=timeout)
     args.log.parent.mkdir(parents=True, exist_ok=True)
-    if args.log.exists(): raise SystemExit("log exists; refusing to replace it")
     script = Path(__file__).resolve().parent / "android/deploy-lancelot-profile.sh"
-    remote = "/data/local/tmp/hackios-profile-deploy.sh"
-    call("push", str(script), remote)
-    port = int(call("forward", "tcp:0", "tcp:5561").strip())
-    process = None
-    try:
-        with args.log.open("xb") as log:
-            process = subprocess.Popen([*base, "exec-out", "su -c 'sh " + remote + "'"], stdout=subprocess.PIPE, stderr=log)
-            ready = process.stdout.readline()
-            log.write(ready); log.flush()
-            if not ready.startswith(b"READY"):
-                raise RuntimeError("profile receiver not ready: " + repr(ready))
-            with socket.create_connection(("127.0.0.1", port), timeout=60) as stream:
-                class Writer:
-                    def write(self, data):
-                        stream.sendall(data)
-                        return len(data)
-                with tarfile.open(fileobj=Writer(), mode="w|") as archive:
-                    for name, path in files.items():
-                        info = tarfile.TarInfo(name); info.size = path.stat().st_size; info.mode = 0o644
-                        with path.open("rb") as file: archive.addfile(info, file)
-                    data = "".join(value + "  " + name + "\n" for name, value in hashes.items()).encode()
-                    info = tarfile.TarInfo("SHA256SUMS"); info.size = len(data); info.mode = 0o644
-                    archive.addfile(info, io.BytesIO(data))
-                stream.shutdown(socket.SHUT_WR)
-            output = process.communicate(timeout=300)[0]
-            log.write(output); log.flush()
-            print(output.decode(errors="replace"))
-            if process.returncode or b"PROFILE VERIFIED AND UNMOUNTED" not in output:
-                raise RuntimeError("profile deployment/verification failed")
-    finally:
-        if process is not None and process.poll() is None:
-            process.terminate(); process.wait(timeout=15)
-        call("forward", "--remove", f"tcp:{port}")
-    report = {"partition": "Ubuntu", "path": "/hackios/20H392/service-log-20261023", "verified": True, "files": hashes}
+    token = uuid.uuid4().hex
+    remote = f"/data/local/tmp/hackios-profile-{token}.sh"
+    with args.log.open("xb") as log:
+        def call(*command, data=None, timeout=120):
+            log.write(("COMMAND " + repr(command) + "\n").encode())
+            log.flush()
+            try:
+                result = subprocess.run([*base, *command], stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, input=data, timeout=timeout)
+            except subprocess.TimeoutExpired as error:
+                log.write(error.stdout or b"")
+                log.write(b"\nHOST TIMEOUT; remote mount cleanup will be attempted\n")
+                log.flush()
+                raise
+            log.write(result.stdout); log.flush()
+            print(result.stdout.decode(errors="replace"), end="", flush=True)
+            result.check_returncode()
+            return result.stdout
+
+        def control(action):
+            return call("exec-out", f"su -c 'sh {remote} {action} {token}'")
+
+        call("push", str(script), remote)
+        try:
+            output = call("shell", "-T", f"su -c 'sh {remote} receive {token} {lines}'",
+                          data=encoded, timeout=180)
+            if b"PROFILE VERIFIED AND UNMOUNTED" not in output:
+                raise RuntimeError("profile verification did not complete")
+            for name, value in hashes.items():
+                if output.count((value + "  " + name).encode()) != 2:
+                    raise RuntimeError("missing write/read-only hash evidence: " + name)
+        finally:
+            control("cleanup")
+    report = {"partition": "Ubuntu", "path": "/hackios/20H392/service-log-20261023",
+              "transport": "bounded base64 over ADB stdin directly to Ubuntu", "verified": True, "files": hashes}
     args.log.with_suffix(args.log.suffix + ".json").write_text(json.dumps(report, indent=2) + "\n")
 
 
