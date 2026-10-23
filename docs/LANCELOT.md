@@ -158,8 +158,9 @@ if a real error needs localization. The build wrapper refuses a stale/different
 Continuous boot was subsequently deployed with checkpoint disabled and no return timer:
 `local/lancelot-continuous-20261023/xnu-boot.log` (boot `00000000056c0ab0`). No return was
 observed during the 180-second host capture. Same-core USB silence is not a hang diagnosis.
-The user reports new kernel output/error on the screen; obtain its text/photo before
-choosing a targeted diagnostic. Default boot remains uninterrupted.
+The user confirms an on-screen kernel panic ending in a successful stackshot (4,088 traced,
+11,504 uncompressed bytes), but the panic reason and full LR/FP backtrace are not yet provided.
+Obtain a photo of the panic header before identifying the fault. Default boot remains uninterrupted.
 
 The pinned prebuilt actually uses **4 KiB kernel pages**, not 16 KiB: disassembly has
 2 MiB L2 blocks, 4 KiB table spacing and `_sysreg_restore` TCR `0x22a51a251a`

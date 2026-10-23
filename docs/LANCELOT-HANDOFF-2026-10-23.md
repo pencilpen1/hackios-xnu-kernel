@@ -252,10 +252,15 @@ python tools/deploy-ubuntu-files.py `
   to `0xc34464a8`. No checkpoint stop or return was observed. USB requests timed out after
   the kernel took the only running CPU, as expected for the current firmware log transport.
   Timeouts alone do not prove a kernel hang, successful root mount, or iOS startup.
-- The user reports **new kernel output or an error on the phone screen**. Exact text/photo is
-  still needed to identify the startup issue. Do not replace continuous boot with checkpoint
-  stepping merely because USB went quiet; first inspect that screen evidence. Phone has not
-  been stopped/rebooted by ending the capture. Code/default-policy commit: `c8d6190`.
+- The user subsequently confirmed an on-screen **kernel panic**, with task/thread/backtrace
+  details, tid 101, and `Stackshot Succeeded: Bytes Traced 4088, Uncompressed 11504`.
+  Transcription: `local/lancelot-continuous-20261023/screen-report.txt`. The actual
+  `panic(cpu ... caller ...): reason` line and complete LR/FP addresses are still missing;
+  obtain a clear photo of the panic header/backtrace before identifying the fault.
+  Stackshot success is crash-dump success, not successful boot. No panic cause has yet been
+  established. Continuous boot remains the default; targeted diagnosis is now justified by
+  the observed panic. Phone has not been stopped/rebooted by ending the host capture.
+  Code/default-policy commit: `c8d6190`.
 
 ## Next AI: required sequence
 
