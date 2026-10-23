@@ -184,6 +184,30 @@ python tools/deploy-ubuntu-files.py `
   `local/lancelot-cp10-hardware-20261023/EFI/HackiOS/`. Loader hash is unchanged; XNUP SHA-256
   `af3ad9b110964634ef8ee77d1a0fb1c6e94979fcd3373719222978a3542602ce`, 15,144,664 bytes.
 
+## Checkpoint-10 investigation — 2026-10-23
+
+- The initial checkpoint-10 package above was subsequently deployed, with matching ESP hashes,
+  and booted using the same fixed UEFI. It **did not return** during the 150-second capture.
+  `local/lancelot-cp10-hardware-20261023/xnu-cp10.log` records boot ID `000000000406f4cb`,
+  checkpoint slot 10, last branch at `0xc34464a8`, and 2,789 firmware bytes followed by USB
+  command timeouts. This does not distinguish failure before C from failure in the C return.
+- A concrete diagnostic-return bug was found: `arm_init()` invokes checkpoint 10 before
+  `PE_init_platform(FALSE, args)`, but `loader_jump()` parsed `bootcpu` through
+  `PE_boot_args()`, which dereferences the still-null `PE_state.bootArgs`.
+  `xnu/files/osfmk/arm64/loader_return.c` now guards that optional parse until bootArgs exists.
+  Normal boot/MMU behavior is unchanged; initialized secondary-CPU shutdown is retained.
+- `tools/test-loader-early-return.py` compiles the actual affected block with ASan/UBSan:
+  pre-PE return, initialized same-core and secondary-core cases pass. Removing the guard
+  reproduces the pre-PE failure. The kernel builder checks that its working `loader_return.c`
+  matches the tracked source and runs this test before building, preventing an unnoticed stale
+  file in an existing XNU workspace. Reconcile local source edits before copying an update.
+- Rebuilt candidate: `make build` exit 0, linked checkpoint and XNUP checks passed.
+  Artifacts/logs are in `local/lancelot-cp10-pefix-20261023/`:
+  kernel SHA-256 `8baa2dcc630db2a0999729fef409f19eca83e12f50d36e90fac4fb3f0004ba2f`;
+  checkpoint-10 XNUP `69ddb534a40bb48f6a1d8d2f2d8311b1f643553471931409f8626bfbc42e4787`.
+  This test retains the exact checkpoint-5 EFI loader and UEFI binaries. Deployment/capture
+  of this candidate is in progress; do not claim hardware success before reading its log.
+
 ## Next AI: required sequence
 
 1. Read this file and `docs/LANCELOT.md`. Deployment is done; evidence and four payload hashes

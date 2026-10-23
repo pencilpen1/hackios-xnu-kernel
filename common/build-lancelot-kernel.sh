@@ -17,6 +17,12 @@ else
   git -C xnu-src/xnu-8796.121.2 apply --reverse --check "$PWD/xnu/lancelot.patch"
 fi
 python3 tools/test-checkpoint-teardown.py xnu-src/xnu-8796.121.2/osfmk/arm64/start.s
+RETURN_SOURCE=xnu-src/xnu-8796.121.2/osfmk/arm64/loader_return.c
+if ! cmp -s xnu/files/osfmk/arm64/loader_return.c "$RETURN_SOURCE"; then
+  echo "loader_return.c differs from the tracked port source; reconcile local XNU edits before building" >&2
+  exit 1
+fi
+python3 tools/test-loader-early-return.py "$RETURN_SOURCE"
 KERNEL=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
 # XNU's build target performs setup/header export/compile/link. The all/config
 # target additionally checks unavailable DriverKit RPC exports and builds kext

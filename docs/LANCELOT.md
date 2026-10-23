@@ -141,6 +141,12 @@ MMU. Log: `local/lancelot-cp5-hardware-20261023/xnu-cp5.log`, boot ID `000000000
 `STOPPED AT CHECKPOINT 5`, `result=checkpoint 5 0`. Its entry PA is `0xc34464a8`.
 Next is checkpoint 10/C initialization; iOS userspace has not run.
 
+The first checkpoint-10 test did not return (`local/lancelot-cp10-hardware-20261023/`).
+Its early C return helper could parse `bootcpu` before `PE_init_platform()` initialized
+`PE_state.bootArgs`. A guarded parse and regression test now cover this case; the rebuilt
+candidate is in `local/lancelot-cp10-pefix-20261023/`. Hardware retest is pending. The build
+wrapper refuses a stale/different `loader_return.c` in an existing XNU workspace.
+
 The pinned prebuilt actually uses **4 KiB kernel pages**, not 16 KiB: disassembly has
 2 MiB L2 blocks, 4 KiB table spacing and `_sysreg_restore` TCR `0x22a51a251a`
 (TG0=0/TG1=2, T0SZ=T1SZ=26, IPS=40-bit). The loader checks TGran4 accordingly.
