@@ -79,6 +79,7 @@ def main():
     cursor, boot, total = 0, None, 0
     protocol, runtime_total, probe_at, progress_at = None, 0, 0, 0
     last_error, error_at = None, 0
+    transport_failed = False
     deadline = time.monotonic() + args.duration
     with tempfile.TemporaryDirectory(prefix="klog-", dir=args.out.parent) as staging, \
             args.out.open("ab") as output, args.out.with_suffix(args.out.suffix + ".fastboot").open("ab") as raw:
@@ -91,9 +92,16 @@ def main():
         while time.monotonic() < deadline:
             try:
                 def command(*parts):
-                    result = subprocess.run([args.fastboot, "-s", args.serial, *parts],
-                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                            timeout=min(10, max(0.1, deadline - time.monotonic())))
+                    # Duration limits starting another snapshot, not finishing
+                    # its DATA reply. Cancelling get_staged at the deadline
+                    # leaves payload bytes queued ahead of the next command.
+                    try:
+                        result = subprocess.run([args.fastboot, "-s", args.serial, *parts],
+                                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10)
+                    except subprocess.TimeoutExpired as error:
+                        raw.write(error.stdout or b"")
+                        raw.flush()
+                        raise
                     raw.write(result.stdout)
                     raw.flush()
                     if result.returncode:
@@ -142,6 +150,10 @@ def main():
                         return 0
                     time.sleep(0.2)
             except (ValueError, subprocess.TimeoutExpired) as error:
+                if isinstance(error, subprocess.TimeoutExpired) and protocol == "KLOG2":
+                    note("KLOG2 command timed out; stopped to avoid consuming an incomplete reply. Reconnect USB before retrying.")
+                    transport_failed = True
+                    break
                 message = "USB unavailable during handoff; retrying" if isinstance(error, subprocess.TimeoutExpired) else str(error)
                 if message != last_error or time.monotonic() >= error_at:
                     note(message)
@@ -151,7 +163,7 @@ def main():
                     return 1
                 time.sleep(0.5)
         note(f"saved {total} bytes overall" + (f", {runtime_total} XNU runtime bytes" if args.runtime else ""))
-    return 0 if (runtime_total if args.runtime else total) else 1
+    return 0 if not transport_failed and (runtime_total if args.runtime else total) else 1
 
 
 if __name__ == "__main__":

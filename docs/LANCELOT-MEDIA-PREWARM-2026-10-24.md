@@ -7,9 +7,11 @@ phone. The original MSDC-fixed UEFI was hash-verified, flashed to `boot`, and
 rebooted; no firmware source was changed. The phone is currently in continuous
 XNU boot with the `lancelot-uefi` **KLOG2** interface, not Android.
 
-The next media-fix candidate is **built and checked, but not yet deployed or
-boot-tested**. A physical return to native FASTBOOT is required to regain the
-Android deployment path. No GitHub push is authorized by these partial results.
+**Later update:** the media-fix candidate was deployed/readback-verified and
+boot-tested for 900 seconds (see the results below). The phone was left in XNU,
+but its diagnostic interface did not re-enumerate after USB replug. A separate
+graphics-mode control payload is now built, not yet deployed/tested. No GitHub
+push is authorized by these partial results.
 
 Evidence: `local/lancelot-service-firstboot-20261024/`.
 
@@ -134,7 +136,7 @@ The focused userland source change is saved in local commit `9df1db8`; existing
 The kernel repository carries the matching patch and evidence document. All
 commits remain local until the combined hardware test passes.
 
-## Built candidate, pending device deployment
+## Media candidate artifacts (now deployed and boot-tested)
 
 Host artifacts: `local/lancelot-media-prewarm-20261024/` (Windows and WSL).
 The new tree is copied from the **final verified**
@@ -172,3 +174,78 @@ Next device steps, checking serial and every result:
    Then investigate remaining window-server 20H392 adaptations and activation.
 
 Neither a successful build nor the backboardd spawn fix is an overall pass.
+
+## Second hardware boot: media fix observed, overall pass still false
+
+`local/lancelot-media-prewarm-20261024/` now also contains successful
+`profile-deployment.log(.json)`, `esp-deployment.log`, `deployment-audit.txt`,
+`deployment-complete.json`, `boot-uefi.log`, `boot-manifest.json`,
+`services-first-boot.log(.fastboot)`, analysis and `hardware-observation.json`.
+Independent read-only readback matches the artifact table above; root/adbd
+mounts are clean, and ext4 state=1 before the UEFI boot.
+
+- New boot ID: `8000000003b69fdb`; 900 seconds, 1,078,075 reported runtime bytes.
+- Exact UUID/IMP/ABI verification and the prewarm replacement are logged.
+- **Zero `user-fault:` events**, versus 53 before the fix. Four observed media
+  samples keep PID 30/start 102.473459. SpringBoard 8, backboardd 13, lsd 27 and
+  wifid 11 also keep their recorded PID/start times.
+- Six eMMC samples: width=8, hz=48000000, batch=128, errors=0, fallback=0.
+  Last sectors=4,045,714, commands=120,420, PIO time=252,054,153 us.
+- PDSCDCache again recovers. New CloudKit errors explicitly identify **no iCloud
+  account** (CKAccountStatusNoAccount / NSCocoaErrorDomain 134400), not corruption.
+- The user still sees scrolling text, not a lock screen/desktop. Display logs
+  already contain IOSurface swaps with BGRA frames, including surfaces 1 and 3.
+  Do not equate rejected diagnostic hooks with proof that no frames are produced.
+
+### USB end-of-capture failure
+
+The old PC reader cancelled a `get_staged` transaction at its global deadline;
+the next getvar consumed pending CoreData payload as an invalid fastboot status.
+After the user's USB unplug/replug, a 180-second follow-up received zero bytes.
+Neither fastboot nor Windows present USB-device enumeration detected the phone.
+The reason the device failed to re-enumerate is **not established**; no kernel
+panic was captured. Do not claim replug recovery passed or repeatedly send
+commands into a pending binary reply.
+
+The reader now lets an already-started snapshot complete with its normal command
+timeout; the global duration prevents starting the next snapshot. A real KLOG2
+timeout stops capture with failure, preserves partial raw replies, and asks for
+reconnection instead of consuming them as another command. Six reader regression
+tests pass, including deadline and timeout-stop cases. Rebooted hardware must
+confirm the fix and investigate reconnect separately.
+
+## Next control test: graphics instead of framebuffer text
+
+Before changing any window-server hook, test the existing frame path without the
+forced `-v`. `common/build-lancelot.sh boot` previously always added it, despite
+the generic loader's default graphics behavior. The RAM USB console tap is
+before rendering suppression, so removing framebuffer text does not remove
+kernel/service fault logging.
+
+`common/build-lancelot.sh boot` now omits `-v`; checkpoint modes remain verbose.
+The payload validator's new `--expect-graphics` checks this policy, and generated
+continuous/checkpoint/timer/USB/graphics rejection tests pass. This is a control
+experiment, **not a declaration that the console caused every desktop problem**.
+
+Artifacts: `local/lancelot-graphics-20261024/`:
+
+| File | SHA-256 |
+|---|---|
+| loader.efi, 76800 bytes | `db8faee496e835172485d72dfcb42bd21799cc6efbde993625a6a4118d975829` |
+| boot.xnup, 15185416 bytes | `70dbb378ccdda87b78e202aaae1ca7c16e79553a7ee027ed71dc1ef7d2e2cce8` |
+
+The profile is still the **already deployed** media-prewarm root with SHA-256
+`48dde0f5...`, and the kernel remains `099d6539...`; no root redeployment is needed.
+Regain native FASTBOOT by physical buttons, restore Android, deploy only these
+matching ESP files with readback checks, then flash the same known UEFI and
+capture a fresh 900-second log using the corrected reader.
+
+If graphics mode still stalls, the next investigation has exact offline evidence:
+QuartzCore UUID `9E40B2EB-260C-3AF1-AE45-A1A551A8C1B9`, EAGLServer vtable
+`0x1d5b39ed0`, renderer slot `0x1d5b3a080` pointing to
+`CA::WindowServer::EAGLServer::renderer()` at `0x1882eaf3c`, and
+`-[CAWindowServer _detectDisplays]` at `0x1884e3150`, ABI `v16@0:8`.
+See `QuartzCore-renderer-slot.json`. These have **not** been installed as hooks.
+Also investigate actual GOP/physical scanout geometry and console handoff: the
+driver reports 1125x2436 logical / 1080x2340 GOP panel / stride 4352. Do not assume
+this matches the Redmi 9 physical panel or change firmware without permission.

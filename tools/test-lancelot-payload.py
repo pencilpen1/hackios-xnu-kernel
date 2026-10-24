@@ -8,6 +8,7 @@ ap = argparse.ArgumentParser(description=__doc__)
 ap.add_argument("payload", type=Path)
 ap.add_argument("--expect-boot", action="store_true", help="require uninterrupted boot, without diagnostic stops")
 ap.add_argument("--expect-ubuntu", action="store_true", help="require the verified Ubuntu bootstrap source")
+ap.add_argument("--expect-graphics", action="store_true", help="require graphics boot without a verbose framebuffer console")
 args = ap.parse_args()
 payload = args.payload.read_bytes()
 magic, size = struct.unpack_from("<II", payload)
@@ -35,6 +36,8 @@ if "ubuntu-boot" in entries:
 assert entries["kernel"][:4] == bytes.fromhex("cffaedfe")
 cmdline = entries["cmdline"].rstrip(b"\0").decode()
 assert "cpus=1" in cmdline.split()
+if args.expect_graphics:
+    assert "-v" not in cmdline.split(), "graphics boot must not force framebuffer text output"
 for word in cmdline.split():
     assert not word.startswith(("bootcpu=", "cpumask=", "ufs=", "ufs_native=", "ufs_write=")), word
 checkpoint = entries.get("checkpoint")
