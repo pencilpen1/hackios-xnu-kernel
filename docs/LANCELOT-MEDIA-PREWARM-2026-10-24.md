@@ -1,6 +1,7 @@
 # Lancelot 20H392: first service-log boot and guarded media candidate
 
 后续启动路径诊断见 `LANCELOT-SB-STARTUP-2026-10-24.md`；其最新部署/实测记录优先。
+后续 activation-only 候选已成功启动，用户明确授权推送本 XNU 仓库；以下为此前三轮历史记录。
 
 ## Result and current state
 

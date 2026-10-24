@@ -5,11 +5,25 @@ hardware and runs the **unmodified iOS 16.5 user space** on top of it: launchd �
 apps. Our own EFI loader, our own replacements for Apple's closed drivers, a UEFI port, and a Linux Wi-Fi driver
 on a compatibility layer make that possible.
 
-It runs in two places:
+The original targets are:
 
 - **POCO X5 Pro 5G (redwood, Snapdragon 778G)** — nothing is flashed: the UEFI is started with `fastboot boot`,
   the whole system lives in RAM, and after a reboot the phone is back in Android;
 - **QEMU** (`virt`, aarch64) — the same thing on any Linux computer, no phone needed.
+
+### Redmi 9 / lancelot (MT6768) — this fork
+
+The iOS **16.7.16 / 20H392** port successfully booted on hardware on 2026-10-24,
+confirmed by the device owner. A 900-second continuous graphics run recorded stable
+SpringBoard/backboardd/media processes, no captured user faults, and native eMMC at
+8-bit / 48 MHz / 128-sector batches without observed errors or fallback.
+See [startup results and verified recovery procedure](docs/LANCELOT-SB-STARTUP-2026-10-24.md).
+
+**This is not the feature-complete redwood port below:** `/private/var` is still volatile;
+touchscreen, GPU, Wi-Fi and audio/DSP are disabled in the tested lancelot payload.
+Its UEFI is flashed to **Boot**: returning to Android requires restoring the verified
+Android `boot.img`, not just rebooting. Lancelot boots continuously; PC log-capture
+duration does not stop the OS. No partition formatting or GPT change is required.
 
 This repository is half of the project:
 

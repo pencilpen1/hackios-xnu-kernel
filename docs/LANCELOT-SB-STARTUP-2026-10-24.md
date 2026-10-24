@@ -2,7 +2,7 @@
 
 ## 决策与当前状态
 
-继续 `LANCELOT-MEDIA-PREWARM-2026-10-24.md`。桌面尚未通过，已有媒体修复和
+继续 `LANCELOT-MEDIA-PREWARM-2026-10-24.md`，启动时桌面尚未通过。已有媒体修复和
 8-bit / 48 MHz eMMC 不改；不删除服务、不关闭 CPU 权限检查、不修改 UEFI 源码。
 
 **第一候选只观测原始启动行为，不伪造激活、不强制 setup reason=0。**
@@ -10,9 +10,11 @@
 新增方法都核验实际 20H392 UUID、IMP、类/实例方法种类及 ABI；读取 ivar 的两个
 manager 另外核验实例大小、ivar 类型及偏移。未知版本拒绝安装，旧钩子的保护保留。
 
-**续接状态：** 第一诊断候选已部署和完成 900 秒实测，手机仍为连续 XNU，
-serial=`lancelot-uefi`，Apple 标志未消失。实测已确认原激活 state=1 和 setup reason=2。
-根据这个证据构建了第二个 activation-only 候选，尚未部署/实测，详见后文。
+**最终续接状态：** 两个候选均完成部署、只读读回和900秒实测。
+第二个 activation-only 候选自然得到 setup reason=0 / BOOL=0，不再观察到Setup启动，
+用户确认**成功启动并明确要求将本 XNU 仓库推送 GitHub**。
+手机仍为连续 XNU，serial=`lancelot-uefi`，KLOG2在线；未恢复Android作为收工状态。
+持久化、触摸等完整移植功能仍未完成，不能把成功启动等同于全部功能通过。
 回 Android 必须按键进入原生 FASTBOOT，再由 AI 刷回
 `E:\shuaji\Lancelot\boot.img`，不能只执行 UEFI 普通 reboot。
 
@@ -148,7 +150,7 @@ Windows 准备候选本地提交=`965450b`，没有推送。
 - 采集未报告 CRC/cursor gap，结束后单次 `getvar log-version` 正常返回 KLOG2。
   正常日志通道通过，USB物理拔插仍未验证。没有后台采集遗留。
 
-## 第二候选：只适配已证实的未激活结果
+## 第二候选：只适配已证实的未激活结果（已部署并测试）
 
 不启用旧“所有 setup reason强制0”的策略。新头文件默认仍是纯观测，
 **只有同时存在完整 token `sbstartup=observe sbactivation=local gpu=0 root_apfs=lancelot_ios`**
@@ -184,4 +186,41 @@ pin=`/hackios/20H392/sb-activation-20261024/root.apfs`，新的专用连续图�
 与匹配ESP并读回，再刷同一既有UEFI、连续采集至少900秒。
 需要验证 local mapping日志、原setup自然请求reason0/返回0、Setup是否仍启动、
 各服务和eMMC以及实际锁屏/桌面。若设置路径退出但画面仍不变，继续调查显示/窗口服务器，
-不再用激活兼容解释所有故障。整体桌面仍未通过，所有提交只保存在本地。
+不再用激活兼容解释所有故障。此处准备候选时尚未通过；随后实机及用户确认结果如下。
+
+## Activation-only 实机成功及发布范围
+
+证据：`local/lancelot-sb-activation-20261024/` 的恢复Boot、profile/ESP部署、
+`deployment-audit.txt`、`boot-manifest.json`、原始日志、分析和`hardware-observation.json`。
+用户再一次进入原生FASTBOOT后，AI先还原并读回验证 Android Boot，再部署新目录。
+旧 sb-startup 诊断profile读回仍匹配，Ubuntu clean且两命名空间卸载，再刷同一既有UEFI。
+
+- boot ID=`80000000040d889f`，900秒，**1,881,828 runtime bytes**。
+- 六个方法保护校验通过，`local_activation=1`。原查询执行并返回state1后，
+  日志明确标记`native activation state=1 -> local compatibility state=2; not server activation`。
+- 原 `updateInSetupMode` **自行请求reason0**，原setter返回`isInSetupMode=0`。
+  没有强制setup参数、没有删除Setup服务；本轮未观察到Setup/purplebuddy启动。
+  system-services、application launch、main scene、dispatch queue和runloop仍完成。
+- 用户明确反馈**成功启动**，并授权推送`hackios-xnu-kernel`。本轮没有额外截图、
+  触摸操作或完整功能测试，不将用户反馈扩写成已验证全部输入/应用/持久化功能。
+- zero user-fault。SpringBoard PID7/start53.315177，24次；backboardd PID13/start53.594002，
+  23次；mediaserverd PID30/start98.835735，23次；lsd PID26/start92.122487，23次；
+  wifid PID11/start53.405303，24次；mobileactivationd PID44/start121.309160，22次。
+  各进程均保持同一PID和start，媒体UUID/IMP/ABI修复保持启用。
+- 24次eMMC：width8、48MHz、batch128、errors0、fallback0；最后sectors3,533,706、
+  commands102,800、pio_us310,875,100。仍不是独立吞吐量基准。
+- 显示由先前少数启动帧变为持续送帧，后段统计约6–8帧/秒。不是GPU加速或流畅度通过；
+  framebuffer逻辑1125×2436 / panel1080×2340 / stride4352不改。
+- SpringBoard/backboardd/mediaserverd文件非零；lsd/lsd-system/wifid/coredatad四组24次仍空。
+  lsd进程和CPU-monitor拒绝需区别，未关闭CPU检查。PDSCDCache在本轮明确恢复成功；
+  未观察到新的CoreData崩溃证据；RedwoodAudio没有新增实机音频功能验收。
+- 无报告CRC/cursor gap；结束后单次`getvar log-version`正常KLOG2。
+  没有后台采集或部署任务，系统继续运行；USB物理拔插依然没有通过。
+
+按用户最新明确授权发布 **本 Windows XNU 仓库 main** 的本地提交，包括之前未推送的
+eMMC、日志、服务修复、兼容源码补丁和本轮证据。独立`.userland.git`及固件仓库不推送。
+原始手机日志、Apple缓存/镜像、备份和本地构建产物都在ignored local目录，不上传。
+远端推送结果由`local/lancelot-sb-activation-20261024/github-push.json`保存并校验。
+
+下一阶段优先实现真正持久化写入，再适配输入与评估性能；不得为提速激活未验证
+HS200/HS400/DMA。回Android仍需原生FASTBOOT还原已验证Boot，不能普通reboot假装恢复。
