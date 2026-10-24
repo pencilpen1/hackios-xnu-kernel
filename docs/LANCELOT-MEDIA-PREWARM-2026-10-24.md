@@ -7,11 +7,12 @@ phone. The original MSDC-fixed UEFI was hash-verified, flashed to `boot`, and
 rebooted; no firmware source was changed. The phone is currently in continuous
 XNU boot with the `lancelot-uefi` **KLOG2** interface, not Android.
 
-**Later update:** the media-fix candidate was deployed/readback-verified and
-boot-tested for 900 seconds (see the results below). The phone was left in XNU,
-but its diagnostic interface did not re-enumerate after USB replug. A separate
-graphics-mode control payload is now built, not yet deployed/tested. No GitHub
-push is authorized by these partial results.
+**Final continuation state:** both the media-fix candidate and graphics-mode
+control payload were deployed/readback-verified and boot-tested for 900 seconds
+each. The phone is now in **continuous graphics-mode XNU**, showing an Apple
+logo/loading screen. KLOG2 responds after capture; a stable lock screen/desktop
+has not passed. A prior USB physical reconnect failure remains unresolved.
+No GitHub push is authorized by these partial results.
 
 Evidence: `local/lancelot-service-firstboot-20261024/`.
 
@@ -216,6 +217,8 @@ confirm the fix and investigate reconnect separately.
 
 ## Next control test: graphics instead of framebuffer text
 
+This control test has now run; the result is recorded in the next section.
+
 Before changing any window-server hook, test the existing frame path without the
 forced `-v`. `common/build-lancelot.sh boot` previously always added it, despite
 the generic loader's default graphics behavior. The RAM USB console tap is
@@ -249,3 +252,66 @@ See `QuartzCore-renderer-slot.json`. These have **not** been installed as hooks.
 Also investigate actual GOP/physical scanout geometry and console handoff: the
 driver reports 1125x2436 logical / 1080x2340 GOP panel / stride 4352. Do not assume
 this matches the Redmi 9 physical panel or change firmware without permission.
+
+## Third hardware boot: current deployed graphics-mode result
+
+`local/lancelot-graphics-20261024/` contains `esp-deployment.log`, independent
+`deployment-audit.txt`, `deployment-complete.json`, `boot-manifest.json`,
+`services-first-boot.log(.fastboot)`, analysis and `hardware-observation.json`.
+The already valid media profile was **not rewritten**. ESP/root readback matched,
+and Ubuntu state=1 before reboot. Boot still uses the original known UEFI.
+
+- Boot ID **800000000380974f**; 900 seconds; **2,305,683 reported runtime bytes**.
+- Actual command line has no `-v`, checkpoint or timed return. Kernel/profile
+  hashes are unchanged; the current deployed ESP hashes are the graphics table.
+- No reported CRC mismatch/cursor gap, **zero user-fault records**, and the media
+  UUID/IMP/ABI guard is still confirmed active.
+- SpringBoard PID 8/start 52.568320 in 27 samples; backboardd PID 13/start
+  52.766119 in 26; mediaserverd PID 36/start 110.323014 in 25; lsd PID 26/start
+  90.621361 in 26; wifid PID 11/start 52.639224 in 27. No observed restart of these
+  processes. mobileactivationd starts as PID 51 and also remains sampled alive.
+- All **27 eMMC samples** remain width=8, hz=48000000, batch=128, errors=0,
+  fallback=0. Last sectors=4,234,122, commands=125,706, PIO time=269,578,224 us.
+- With framebuffer text disabled, the observer produced 27 samples, versus 6
+  during the preceding verbose run with the same kernel/media profile. This is
+  evidence of substantial console overhead, not a controlled storage benchmark.
+- The corrected reader finishes without the prior truncated-DATA status problem;
+  `fastboot -s lancelot-uefi getvar log-version` immediately returns KLOG2 afterwards.
+  This validates normal capture completion, **not physical USB unplug/replug**.
+- Android geometry was independently read before this boot: `wm size` physical
+  1080x2340; fb0 virtual size 1088x7104; depth 32; stride 4352. The GOP panel
+  dimensions/stride agree with Android. Logical 1125x2436 is the iPhone mode scaled
+  by the display adapter, not itself proof of a wrong physical framebuffer.
+- The user explicitly reports **Apple logo/loading screen**, not a lock screen
+  or desktop. Overall pass is still false. Do not push the commits yet.
+
+## Next targeted work: SpringBoard startup compatibility ABI
+
+`local/lancelot-graphics-20261024/SpringBoard-compat-metadata.json` records actual
+20H392 metadata and ivar layout, read from the UUID-matched cache without changing
+any hook:
+
+```text
+Image: /System/Library/PrivateFrameworks/SpringBoard.framework/SpringBoard
+UUID:  22034ABA-9A9A-3B94-93A5-A0DE02BEFD2E
+
+-[SBLockdownManager _setupActivationState]
+IMP: 0x1c5991a78; ABI: v16@0:8
+instance size: 32; _state: int at +8; _settingUpActivationState: BOOL at +12
+
+-[SBSetupManager _setSetupRequiredReason:]
+IMP: 0x1c5aa608c; ABI: B24@0:8Q16
+instance size: 48; _setupRequiredReason: unsigned long at +8
+```
+
+The original `inject_sb.c` compatibility layer still refuses both new IMPs.
+Crucially, its setup setter is declared **void(long)**, but the actual 20H392
+method is **BOOL(unsigned long)**. Merely replacing the expected address would
+lose a meaningful return value and is not a valid ABI adaptation.
+
+Continue by inspecting the actual method code/callers and startup/activation
+state, then adapt only proven startup compatibility behavior with image UUID,
+method ABI and ivar-layout guards. Keep other graphics/media/snapshot/battery
+guards unchanged. The observed Apple logo does not yet prove either of these
+methods is its sole cause. Physical reboots still require native FASTBOOT;
+normal USB logging is currently available, and no collector is left running.

@@ -7,7 +7,8 @@ iOS 中等描述，均以本文的最终状态为准。
 
 **2026-10-24 续接记录：** `LANCELOT-MEDIA-PREWARM-2026-10-24.md`。
 service-log 候选现已实机启动，backboardd 越过 EACCES；mediaserverd 已符号化到
-CoreImage 的空 GL 调用。新媒体修复候选已构建，部署/启动状态以续接记录和本地审计为准。
+CoreImage 的空 GL 调用并完成针对性修复。媒体修复版及无 `-v` 图形模式已部署实测；
+当前停在 Apple 标志、KLOG2 在线，尚未通过桌面。以续接记录和本地审计为准。
 
 ## 1. 先读结论
 
