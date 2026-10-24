@@ -1,8 +1,8 @@
 # Lancelot / Redmi 9：硬件适配待办清单
 
 按用户指定顺序：**触摸 → GPU → 侧边按键 → 待机/亮起 → Wi-Fi → 震动 → 传感器**。
-本文件是计划，不表示已完成驱动；触摸参考源码已取得，见
-`LANCELOT-TOUCH-SOURCE-2026-10-24.md`。未启用未验证硬件，回Android补采时另行通知。
+本文件是计划，不表示已完成驱动；触摸参考源码、正确固件和Android输入基线已取得，见
+`LANCELOT-TOUCH-SOURCE-2026-10-24.md`。当前保持Android，尚未启用或刷写XNU触摸驱动。
 
 ## 基线与执行约束
 
@@ -52,20 +52,23 @@ DT compatible 同时列出 NVT 与 FocalTech 备选，但旧实机驱动实际�
   固定commit与旧设备配置已核对，新Android运行身份仍需复验；不能用通用HOSTDL目录替代。
 - [x] 配套 MTK SPI 控制器、GPIO/pinctrl、clock、PMIC/PWRAP参考源码/DT引用已下载。
   寄存器/供电的实机初始化状态仍需采集，不代表驱动已经完成。
-- [ ] **设备实际选择的触摸固件/配置文件**及芯片/固件/面板 ID、版本、加载日志。
+- [x] 已采集**设备实际选择的触摸固件**`nvt_dj_fw.bin`（118784 bytes、版本0x08），
+  trim ID、Dijing A面板和正常加载日志；文件和手机hash匹配。CRC/装载的XNU验证未完成。
   文件名从源码加载路径与运行日志确定，不预先猜文件名，不需要上传整个 vendor 分区。
-- [ ] 运行时 `spi0.0` 的 driver、modalias、uevent、of_node，以及已知安全的版本节点。
-- [ ] 输入能力：`getevent -lp`，实际触摸设备的 ABS_X/Y 或 ABS_MT_POSITION_X/Y、
+- [x] 已采集运行时 `spi0.0` 的 driver、modalias、uevent、of_node；版本由正常启动日志取得。
+  GPIO_SYSFS/DEBUG_FS关闭，实时pinmux/clock导出未取得；不通过盲目寄存器读写补齐。
+- [x] 已采集输入能力：`getevent -lp`，实际触摸设备的 ABS_X/Y 或 ABS_MT_POSITION_X/Y、
   SLOT、TRACKING_ID、压力/面积范围。event编号可变，按名称识别，不能硬编码 event2。
-- [ ] 触摸事件轨迹：单点点击/抬起、边缘滑动、拖动、两指交叉、多指与全部抬起。
+- [x] 已采集30秒触摸事件轨迹，4161条事件、实际5指及最终全部抬起，无SYN_DROPPED。
   记录原始事件及对应操作；屏幕损坏区域不强求，注明可用区域和物理缺陷。
-- [ ] 触摸前后 `/proc/interrupts` 对照，正常启动/熄屏/亮屏时的 NVT 初始化日志。
+- [x] 已采集触摸前后 `/proc/interrupts` 对照（NVT +891）与正常启动/部分休眠日志。
   本阶段只记录恢复依赖，不提前宣称第4项待机已经实现。
 
 **什么时候需要回 Android：** 可先离线分析已保存的 DT、配置、输入代码与参考源码；
 在真实触摸驱动初始化/协议实现定稿和首次触摸候选刷写前，需要一次针对性的 Android
 补采，取得上述缺失的固件/ABS/事件信息。届时明确通知用户，再由 AI 还原 Boot。
 用户只需配合按键返回 FASTBOOT，以及采样时执行指定触摸动作，不必手工打包全系统。
+本轮第一次补采已经完成，当前手机在Android；下一次候选/实机操作需要时再通知用户。
 
 禁止盲目读取/写入 `/proc/NVTflash`、厂测、固件更新、校准/复位节点；某些“read”处理
 也会操作硬件，须先审查源码。不得通过升级/擦除触控固件来采集基线。

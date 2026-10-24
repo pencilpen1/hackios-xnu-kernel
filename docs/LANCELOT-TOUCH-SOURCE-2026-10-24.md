@@ -11,8 +11,9 @@
 - 保存：`local/lancelot-touch-source-20261024/source/`
 - **135 个文件，4,597,028 bytes；全部通过镜像站下载并核验。**
 
-这是一组按触摸依赖选择的参考文件，**不是完整 Android 内核构建树**，没有下载/执行
-整个内核、修改设备、重启或刷写。厂商固件本体仍需从手机提取，不能从源码常量假定版本。
+这是一组按触摸依赖选择的参考文件，**不是完整 Android 内核构建树**。下载阶段没有执行
+厂商代码或操作设备；随后按用户确认还原Android Boot并完成补采，结果见后文。
+不能从源码常量假定设备固件版本。
 
 每个文件均按 GitHub 固定提交目录元数据核验长度和 **Git blob SHA-1**
 （包含 `blob <length>\0`），另记录 SHA-256；HTML错误页、截断、错hash会拒绝。
@@ -91,3 +92,77 @@ AI按已验证流程还原 `E:\shuaji\Lancelot\boot.img` 并读回确认，然�
 
 不改变SPI速率、GPIO/供电、触摸设置，不刷触摸固件。原始采集和固件只留本地，
 不推GitHub；新触摸驱动尚未实现或刷写。恢复Boot与采集状态以随后实机审计为准。
+
+## Android补采完成：最终状态与有效资料
+
+用户确认进入原生FASTBOOT并配合触摸采样；AI还原已验证Android Boot，
+整分区读回SHA-256仍为`b5de01520fc62fd3ccd18fffb098f295d0b301838d2b82b1077b05ddf47f7e84`。
+**手机现在保持Android，ADB/root在线，电量100%，没有刷回UEFI或新触摸候选。**
+Ubuntu/ESP在root/adbd两命名空间均未挂载，Ubuntu ext4 state=1。
+
+采集目录：`local/lancelot-touch-android-20261024/`。
+入口：`collection-complete.json`、`touch-details.json`、`touch-gestures.analysis.json`、
+`firmware-offline-check.json`、`final-device-audit.txt`。
+恢复/一般采集日志保存在相邻`local/lancelot-touch-android-20261024.*.log/.json`。
+
+### 硬件/固件已确认
+
+- 新运行配置仍启用NT36672、SPI_MT65XX、MT6768/Paris pinctrl，通用HOSTDL选项关闭。
+  内核标识：`4.19.325-cip136-st20-ShockwaveKernel-S+`，构建日期2026-09-25。
+  当前分支快照不自动等于整个运行内核的精确Git提交；触摸9文件与旧参考相同、
+  配置/运行驱动/初始化日志都一致，作为本次触摸参考依据。
+- `spi0.0`实际绑定`NVT-ts`，of_node为`/spi0@1100a000/novatek36672@0`；
+  正常启动日志确认 **SPI mode0，max_speed_hz=8000000**。
+- 新cmdline确认Dijing A面板；Android驱动实际请求 **`nvt_dj_fw.bin`**，不是猜测。
+  文件来自`/vendor/firmware/nvt_dj_fw.bin`，**118784 bytes**，手机和PC的SHA-256均为
+  `c41ba8aca0d0a96db5471af8a6a54fe6c6c55fc9759f26ca7381d9e2de34902d`。
+  保存为`firmware-nvt_dj_fw.bin`，只留ignored本地目录。
+- 源码规则与文件独立校验：有效装载长度**110592 bytes / 0x1b000**，末尾标志NVT，
+  固件版本`0x08`、补码`0xf7`；启动日志也显示fw_ver0x08、fw_type0x01。
+  这里只证明读回hash、末尾/版本匹配，不宣称完成全部固件分区CRC或XNU装载验证。
+- trim ID为**`0a 00 00 72 66 03`**。按源码mask表匹配NT36672A_memory_map、hw_crc=1；
+  EVENT_BUF_ADDR=`0x21c00`。这是**通过SPI访问的芯片内部地址**，不是SoC MMIO物理地址。
+- DT物理GPIO/EINT为1，Android日志的Linux GPIO为326，虚拟IRQ为135。
+  `/proc/interrupts`确认`mt-eint 1 Edge NVT-ts`，probe的trigger_type=1对应上升沿。
+  **不要把Linux GPIO326/IRQ135作为XNU物理寄存器编号或GIC号。**
+
+### 输入能力及实际轨迹
+
+按名称识别本轮输入节点为`/dev/input/event2`，不是硬编码旧编号。
+`getevent-capabilities.txt`确认：
+
+- ABS_MT_POSITION_X：0…1080；Y：0…2340；SLOT：0…9（10槽）。
+- TOUCH_MAJOR：0…255；PRESSURE：0…1000；软件TRACKING_ID：0…65535。
+  Android的跟踪ID不等于芯片点包的硬件finger ID，不能把它直接用作0…9数组下标。
+
+用户配合30秒安全页面触摸，`touch-gestures-30s.log`保存**303753 bytes / 4161条事件**，
+612个SYN_REPORT。实际观察到槽0…4、最多5指，最后BTN_TOUCH=UP、全部接触释放；
+没有SYN_DROPPED或越界槽。NVT IRQ总计数655→1546，增加891。
+轨迹覆盖X131…1079、Y2…2108；不宣称覆盖坏屏区域、全屏或实际10指测试。
+
+采集开始时已有一指在移动，初始接触状态未知，所以tracking开始99次、结束100次；
+分析在第一次明确全抬起后才建立确定状态，不能把这一个差值当作丢帧或粘指。
+活动期SYN_REPORT间隔中位数约8.367ms，只是本次evdev轨迹统计，不等于控制器扫描率承诺。
+**这是evdev输出，不是实际SPI点包抓取，也不代表XNU触摸已经通过。**
+
+### 保留的资料缺口与安全边界
+
+- 运行配置关闭GPIO_SYSFS和DEBUG_FS：gpiochip/pinctrl导出为空，clk_summary不存在。
+  某些su包装会把cat错误输出到stdout且返回0；已把这些资料标为不可用，不按exit0算成功。
+- SPI子设备runtime_status为`unsupported`，平台SPI在采样后为`suspended`；
+  这不等于触摸失败，也不是可直接照搬的XNU初始化状态。
+- 未开启debugfs、导出GPIO、运行厂测、改变触摸参数、刷触摸固件或直接读写寄存器。
+  正常Android启动时其驱动自身的固件RAM装载不是AI主动执行的更新/厂测命令。
+- 未主动打开nvt_fw_version/nvt_tp_info；版本取自正常启动日志，
+  只读取已审查的缓存`/proc/tp_lockdown_info`。芯片内部raw/baseline和SPI原包未采集。
+
+## 接下来可以离线做什么
+
+当前源码、正确固件、运行身份、ABS范围及单/多点事件基线已具备。先离线实现/测试
+NT36672A点包解析与接触状态机，再建立机型隔离的MTK SPI/GPIO/EINT/clock访问，
+完成身份读取、受控RAM固件装载和HID事件链路。保留范围、超时、checksum/CRC和异常释放保护。
+运行pinmux/clock状态仍是未取得信息，必须从匹配源码/DT和后续受控诊断验证，不拼凑。
+
+在候选通过保护条件/构建/读回前不启用`touchscreen=1`，不调用Qualcomm Goodix驱动；
+保留五指误退出防护这一独立必做项。此阶段不启动GPU或后续六项功能，不自动推GitHub。
+下一次需要真实SPI/候选实机验证时再通知用户；目前保持Android，不必立即刷回iOS。
