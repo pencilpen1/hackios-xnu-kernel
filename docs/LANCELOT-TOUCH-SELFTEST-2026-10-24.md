@@ -42,3 +42,23 @@
 本阶段不改Mu-Silicium源码，不写触摸固件，不改GPT或格式化；Android Boot备份保留。
 
 此文提交时host共享测试已通过；正式编译、部署、启动自测和900秒回归结果以随后证据补记为准。
+
+## 正式构建与部署（已完成）
+
+- 编译前本地提交：`2151e6d`；主机及XNU源树同步均按已知旧hash检查，备份位于
+  WSL `local/lancelot-touch-selftest-20261024/before-build/`，旧未提交改动保留。
+- `xnu-build.sh -j4 build`退出0，新输入和解析器对象实际编译/链接，未用旧prebuilt。
+  新文件没有编译诊断；日志仅有既有jobserver/工具选项警告。
+- 新kernel：15185912 bytes，SHA-256
+  `57aa8146d0adf4f1a5c1cde1550e0366fa9cbb496819058ba1976e238bf9bff6`。
+  检查点teardown/连续图形XNUP校验通过，静态selftest可能内联，解析器符号及两个日志串均存在。
+- loader仍为`0a8052965d122175be4e6ab82304633fe9af2e18218e5bd7ded5abc1a28df484`。
+  新XNUP：15186184 bytes，SHA-256
+  `edcd2d735ea7b0894c6ea9559455d287545af57f9b227bc75260b46f80767bd8`。
+- Android部署并独立只读重挂载读回，三处ESP文件hash匹配。旧成功XNUP
+  `279566f64ab0c347b85643c037b9c70c9ce77f597268c7745abdf0518bca6fe4`保存在
+  ESP `/EFI/HackiOS/before-touch-selftest-20261024/`，原本地候选也未覆盖。
+- 成功activation root/profile未改，读回hash匹配；部署后Android Boot仍匹配，
+  Ubuntu ext4 state=1，root/adbd两命名空间Ubuntu/ESP均卸载。
+- eMMC/SDR、MUSB/KLOG2和日志host回归通过，连续启动策略拒绝检查点/USB等待/返回计时器。
+  正在按授权启动900秒实机采集；结果不提前写成通过，不自动推GitHub。
