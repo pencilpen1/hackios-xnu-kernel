@@ -21,10 +21,23 @@ ln_bus_valid(const struct ln_device *d)
 }
 
 static int
+ln_transfer(struct ln_device *d, const uint8_t *tx, uint8_t *rx, uint32_t length)
+{
+	/* Vendor CTP_SPI_READ/WRITE allows five bounded controller retries.
+	 * Page selection and same-address RAM/register writes are idempotent.
+	 * Retry delay is outside the interrupt-off SPI message. */
+	for (unsigned i = 0; i < 5; i++) {
+		if (d->transfer(d->ctx, tx, rx, length) == 0) return LN_OK;
+		if (i < 4) d->delay_us(d->ctx, 100);
+	}
+	return LN_IO;
+}
+
+static int
 ln_page(struct ln_device *d, uint32_t address)
 {
 	uint8_t tx[3] = {0xff, (uint8_t)(address >> 15), (uint8_t)(address >> 7)};
-	return d->transfer(d->ctx, tx, NULL, 3) == 0 ? LN_OK : LN_IO;
+	return ln_transfer(d, tx, NULL, 3);
 }
 
 int
@@ -32,9 +45,10 @@ ln_read(struct ln_device *d, uint32_t address, uint8_t *data, uint32_t length)
 {
 	if (!ln_bus_valid(d) || !data || !length || length > 256 || address >= 0x40000 || length > 0x40000 - address) return LN_ARGUMENT;
 	uint8_t tx[258] = {0}, rx[258];
+	d->last_address = address; d->last_length = length; d->last_write = false;
 	if (ln_page(d, address) != LN_OK) return LN_IO;
 	tx[0] = (uint8_t)(address & 0x7f);
-	if (d->transfer(d->ctx, tx, rx, length + 2) != 0) return LN_IO;
+	if (ln_transfer(d, tx, rx, length + 2) != LN_OK) return LN_IO;
 	/* Two SPI RX bytes precede payload: command phase and dummy byte. */
 	memcpy(data, rx + 2, length);
 	return LN_OK;
@@ -45,10 +59,11 @@ ln_write(struct ln_device *d, uint32_t address, const uint8_t *data, uint32_t le
 {
 	if (!ln_bus_valid(d) || !data || !length || length > 256 || address >= 0x40000 || length > 0x40000 - address) return LN_ARGUMENT;
 	uint8_t tx[257];
+	d->last_address = address; d->last_length = length; d->last_write = true;
 	if (ln_page(d, address) != LN_OK) return LN_IO;
 	tx[0] = (uint8_t)((address & 0x7f) | 0x80);
 	memcpy(tx + 1, data, length);
-	return d->transfer(d->ctx, tx, NULL, length + 1) == 0 ? LN_OK : LN_IO;
+	return ln_transfer(d, tx, NULL, length + 1);
 }
 
 static int
@@ -178,17 +193,28 @@ ln_boot_firmware(struct ln_device *d, const uint8_t *data, size_t length)
 	if (ln_read(d, 0x3f30e, &bld, 1) != LN_OK || ln_write8(d, 0x3f30e, bld | 0x80) != LN_OK ||
 	    ln_write8(d, LN_EVENT + 0x60, 0) != LN_OK || ln_write8(d, LN_EVENT + 0x50, 0xae) != LN_OK ||
 	    ln_write8(d, 0x3f10d, 1) != LN_OK) return LN_IO;
+	/* Capture BLD CRC immediately, before application init reuses R_DLM for
+	 * info/overlay CRCs (on-device r3 observed the Header partition CRC).
+	 * One 20-byte register burst fits a single FIFO and includes both results
+	 * plus DONE/error flags. Never accept mismatching results or DONE=0. */
+	for (unsigned i = 0; i < 100; i++) {
+		uint8_t crc[20];
+		if (ln_read(d, 0x3f120, crc, sizeof(crc)) != LN_OK) return LN_IO;
+		d->ilm_crc = ln_le32(crc); d->dlm_crc = ln_le32(crc + 4);
+		d->crc_status = crc[0x13];
+		if ((d->crc_status & 7) == 4 && d->ilm_crc == plan.part[0].crc && d->dlm_crc == plan.part[1].crc) break;
+		if (i == 99 || ((d->crc_status & 4) && (d->crc_status & 3))) return LN_CRC;
+		d->delay_us(d->ctx, 100);
+	}
 	d->delay_us(d->ctx, 5000);
 	for (unsigned i = 0; i < 51; i++) {
 		if (ln_read(d, LN_EVENT + 0x60, &d->reset_state, 1) != LN_OK) return LN_IO;
-		if (d->reset_state >= 0xa1 && d->reset_state <= 0xaf) break;
+		/* A1 is only automatic ReK start; A3 is NORMAL_RUN. No factory or
+		 * baseline command is sent: wait for the firmware's own startup. */
+		if (d->reset_state >= 0xa3 && d->reset_state <= 0xaf) break;
 		if (i == 50) return LN_BOOT;
 		d->delay_us(d->ctx, 10000);
 	}
-	uint8_t crc[8];
-	if (ln_read(d, 0x3f133, &d->crc_status, 1) != LN_OK || ln_read(d, 0x3f120, crc, 8) != LN_OK) return LN_IO;
-	d->ilm_crc = ln_le32(crc); d->dlm_crc = ln_le32(crc + 4);
-	if ((d->crc_status & 7) != 4 || d->ilm_crc != plan.part[0].crc || d->dlm_crc != plan.part[1].crc) return LN_CRC;
 	uint8_t info[16];
 	if (ln_read(d, LN_EVENT + 0x78, info, 16) != LN_OK) return LN_IO;
 	d->version = info[0];

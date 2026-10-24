@@ -22,6 +22,8 @@ struct ln_device {
 	bool identified, running;
 	uint8_t trim[6], version, reset_state, crc_status;
 	uint32_t ilm_crc, dlm_crc;
+	uint32_t last_address, last_length;
+	bool last_write;
 };
 int ln_read(struct ln_device *, uint32_t address, uint8_t *data, uint32_t length);
 int ln_write(struct ln_device *, uint32_t address, const uint8_t *data, uint32_t length);

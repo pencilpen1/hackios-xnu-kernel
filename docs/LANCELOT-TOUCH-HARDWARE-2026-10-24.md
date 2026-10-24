@@ -83,3 +83,111 @@ hash先验拒绝、CRC/启动错误、半途I/O失败；实际XNU入口的off/mo
 
 下一步已通知用户：从当前原生FASTBOOT还原校验Android Boot，再部署新目录/读回、卸载，
 之后刷同一已验证UEFI直接试真实触摸链路；不将内存/模型测试当作实机通过。
+
+## 实机定位：资源保护退出；r1已读到真实trim
+
+用户确认原候选处于iOS桌面且点击无反应。短时间KLOG2抓取成功，
+`local/lancelot-touch-hardware-20261024/desktop-diagnostic.log`保存了启动期关键三行：
+
+```
+lancelot-touch: stage=3 inherited clock=0x1000101 gate=0 mode1=0 spi-mode=0x1111 dir=0xcf43d098/0x287e ies=0xffffffff
+lancelot-touch: resource setup refused/failed -2
+lancelot-touch: worker ended (stage=3); system continues
+```
+
+这说明原候选并非成功启动触摸但HID失灵，而是在任何SPI传输前被共享时钟保护拒绝。
+PC采集已结束；这次短采有ring overrun，**不宣称全部运行日志完整**。
+
+修正不是删除保护/强制切换26MHz。代码现在只读共享spi_sel和MAINPLL，按MT6768源码的
+22-bit PCW、8 integer bits、CON1[26:24] postdiv和/10、/14、/12计算继承source；
+SPI0分频和CS setup据此配置。共享TOP clock与PLL从准备到回退均**零写入**。
+关闭/隔离/不稳定或不合理parent继续在任何写入前失败；SPI0自身门控bit1和pinmux仍有界配置/回退。
+host模型覆盖四个parent、PLL电源隔离、parent关闭、其他SPI全部启用和回退，并禁止所有TOP/PLL写。
+SPI PAUSE判定按匹配Linux驱动检查bit1，status=2/3均为PAUSE，FINISH-only仍拒绝，非忽略错误。
+
+用户切回原生FASTBOOT后，r1经Android Boot恢复及块设备hash校验部署；旧ESP候选另存
+`EFI/HackiOS/touch-hardware-before-clock-r1/`并读回，两个root profile均hash正确未改。
+新XNUP hash=`6b9ca34fe64b2e9ba8dcb30d221c35eb8cf88396161c9f847b54d8b3d6caa683`，
+kernel=`8b2290d4dee90a6cfeebc6ca3a5e9fa731f447c853e4ef110c159fd14abb7cb7`。
+ESP只读重挂载读回、Ubuntu ext4 clean，再刷同一UEFI；未改UEFI源码。
+
+`clock-r1/startup.log`首次取得真实SPI成功证据：
+
+```
+lancelot-touch: preserved shared parent source=109200000Hz PLL=0xff8001e1/0x81150000/0x80000001 result=0
+lancelot-touch: trim=0a0000726603 result=0; GPIO92 untouched
+lancelot-touch: SPI status=0x2 messages=2 errors=0 timing=0x190037/0x37/0x1b001b
+lancelot-touch: RAM firmware result=-11 version=00 reset=00 CRC=00 ILM=00000000 DLM=00000000
+lancelot-touch: resource restore=0
+```
+
+**目前仅资源、SPI短传输和真实trim通过；RAM装载返回LN_IO，尚无CRC或真实点包通过。**
+下一r2增加最后NVT地址、读写/长度、SPI完成字节数、status0/status1、CMD和累计错误诊断，
+不改固件hash、CRC、身份或启动验证，继续定位实际失败传输。触摸完全验收前不推GitHub。
+
+### r2/r3：间歇SPI完成事件缺失和CRC寄存器复用
+
+r2仍可能在首次page传输超时。r3加入与eMMC PIO同样的成对短critical_enter/exit，
+SPI单消息上限10ms（实际2MHz、最多258 bytes约1.1ms线速），所有退出路径恢复原中断状态；
+NVT传输按原厂CTP_SPI_READ/WRITE最多五次重试，重试间100us等待在critical之外。
+host测试覆盖timeout/FINISH/非法配置恢复、瞬态恢复和持续五次错误拒绝。
+
+r3实机仍有175/1511条SPI失败；不能声称短critical修复了根因。
+首八条错误均为`wire=0/3 status=0/0x1 cmd=0x33010`：page命令已经PAUSE，未捕获status0事件。
+对照匹配Linux驱动发现原实现把PAUSE/IE配置与ACT合在同一次写入；r4改为先配置并读回，再单独ACT，
+host模型禁止在IE/PAUSE未预先配置时启动。该差异仍须用r4实机错误计数确认，不凭源码宣称解决。
+
+r3成功运行到`reset=a1 CRC=04 ILM=c95c6998 DLM=98257076`，但驱动按既定校验返回LN_CRC，
+没有上报真实点包。私有固件ILM golden为`c95c6998`、DLM为`e4fd411f`；
+读到的DLM `98257076`恰为实际第14条Header分区的CRC（BIN=0、SRAM=0x24c70、last=0xff）。
+这提示应用初始化后R_DLM被复用，并非可以跳过DLM验证。
+r4将两个结果和DONE/error位用单FIFO寄存器快照在BOOT_RDY后立即有界捕获，
+必须同时匹配ILM/DLM golden且DONE=1、错误位=0，才继续等a1/版本/分辨率；
+host模型模拟5ms后R_DLM被Header CRC覆盖，保证保存的是复用前两段实际CRC。
+
+所有候选通过Android恢复hash、旧候选ESP另存/hash、两个root profile hash、ESP读回和Ubuntu clean流程；
+UEFI始终使用原已验证二进制，没有UEFI源码改动。
+
+r4实机没有证实prepare-before-ACT已解决问题：仍有187/1488条失败，
+最终在Header分区`0x24c70`写入持续五次失败，返回LN_IO，**尚未执行新CRC快照**。
+r5继续按coreboot增加STATUS1启动握手，再按实际分频等待本chunk线速时间+2us，
+之后才首次读read-to-clear STATUS0，避免在短page传输尚进行时紧密清读完成事件锁存器。
+仍必须看到PAUSE完成事件，STATUS1绝不当成成功替代；超时仍有界reset并回退。
+host模型延迟event有效时间并禁止提前清读，不把即刻完成的理想模型当作真实时序证据。
+
+### r5：SPI与两段真实CRC首次完全通过，点包仍未验收
+
+实机`clock-r5/startup.log`：
+
+```
+lancelot-touch: RAM firmware result=0 version=08 reset=a1 CRC=04 ILM=c95c6998 DLM=e4fd411f
+lancelot-touch: last read addr=0x21c78 length=16 SPI=18/18 status=0x2/0x1 cmd=0x33010 messages=1344 errors=0
+lancelot-touch: real reports enabled, mode0 FIFO only, poll=8000us; no EINT/GIC touch IRQ enabled
+lancelot-touch: stopping after 100 consecutive invalid reads
+```
+
+这证明当前SPI传输和BOOT_RDY早期双CRC核验链路已实机通过，不再是仅host模型；
+但真实点包未通过，用户触摸未验收。原代码在固件A1（ReK开始）就读EVENT，
+且无视Android只在ready IRQ才读点包的条件，可能反复读空闲/未初始化EVENT。
+当前修正等待固件自身到A3 NORMAL_RUN（没有发送厂测或baseline指令），
+以GPIO1 active-low作为空闲读取条件；接触活动期间继续读最后点包，以捕获抬起。
+前四个无效包记录完整66 bytes和解析错误，便于继续定位；checksum、ID、边界和100次坏读停止规则不变。
+
+用户更新要求：**后续不再额外保留测试候选**。自这一修正起统一使用私有`current/`验证产物，
+部署不新增旧候选ESP归档；只保留必要诊断和恢复基线，之前已存在的备份不自动删除。
+触摸通过前不推GitHub的要求不变。
+
+### 当前点包处理按Redwood结构、NT36672原厂语义修订
+
+r6再次通过真实SPI、版本08、NORMAL_RUN=a3、双CRC，1368条传输errors=0。
+最初四个点包完全相同，十个槽位标记均FF，其余为未变化的SRAM内容，checksum不成立。
+这不能当成有效空帧，也不能证明有真实点击。原100次坏包退出依然使线程在用户触摸前终止。
+
+用户明确可以参考Redwood，再按Lancelot硬件及内核源码适配。
+已对照`redwood_goodix.c:1472…1499`的长期GPIO轮询/80ms漏就绪兜底，及匹配
+`NT36672/nt36672.c:1375…1380,1488…1492`的坏checksum仅丢弃本帧、保持驱动存活。
+当前采用同一结构：坏帧仍严格拒绝、接触状态机释放旧点、记录bad计数，但不因初始化空闲垃圾永久退出；
+100次连续**SPI I/O失败**才停止，WDT最多两次哈希固定固件恢复的保护仍保留。
+GPIO1低即读；接触活动时持续读以收抬起；空闲GPIO高每80ms兜底一次以免漏短脉冲。
+没有接受坏checksum、伪造HID事件，亦未直接使用Redwood的Qualcomm寄存器或芯片协议。
+仍需用户真实点击/滑动/多指后确认点包变化和backboardd响应；当前不宣称触摸已修复。
