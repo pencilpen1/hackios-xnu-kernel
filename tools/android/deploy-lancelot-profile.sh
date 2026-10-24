@@ -12,7 +12,7 @@ case "$token" in ''|*[!0-9a-f]*) exit 1;; esac
 [ "${#token}" = 32 ]
 mountpoint=/data/local/tmp/hackios-profile-$token
 profile=${4:-service-log-20261023}
-case "$profile" in service-log-20261023|media-prewarm-20261024) ;; *) exit 1;; esac
+case "$profile" in service-log-20261023|media-prewarm-20261024|sb-startup-20261024) ;; *) exit 1;; esac
 dest=$mountpoint/hackios/20H392/$profile
 incoming=$dest.incoming-$token
 mounted_source() {

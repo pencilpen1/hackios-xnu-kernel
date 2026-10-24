@@ -64,6 +64,18 @@ static int contains(const char *line, const char *word)
 	}
 	return 0;
 }
+/* Report absent/empty/unreadable files explicitly, without starting a daemon,
+ * writing a log, or interpreting an empty stream as a successfully tested one. */
+static void log_status(const char *path)
+{
+	struct stat st;
+	int fd = open(path, O_RDONLY, 0);
+	if (fd < 0) { printf("bootdiag: file-status %s open_errno=%d\n", path, errno); return; }
+	if (fstat(fd, &st)) { printf("bootdiag: file-status %s stat_errno=%d\n", path, errno); close(fd); return; }
+	printf("bootdiag: file-status %s bytes=%lld uid=%u gid=%u mode=0x%x\n", path, st.st_size,
+	    st.st_uid, st.st_gid, st.st_mode);
+	close(fd);
+}
 static void tail(const char *path, off_t *cursor, off_t *forwarded)
 {
 	static char buffer[32769];
@@ -144,7 +156,10 @@ int main(int argc, char **argv, char **envp)
 		    (unsigned long long)metric("usb_log_polls"), (unsigned long long)metric("usb_log_resets"),
 		    (unsigned long long)metric("usb_log_commands"), (unsigned long long)metric("usb_log_sent"));
 		processes();
-		for (unsigned i = 0; i < LOG_COUNT; i++) tail(logfiles[i], &summaries[i], &forwarded[i]);
+		for (unsigned i = 0; i < LOG_COUNT; i++) {
+			log_status(logfiles[i]);
+			tail(logfiles[i], &summaries[i], &forwarded[i]);
+		}
 		do {
 			for (unsigned i = 0; i < LOG_COUNT; i++) forward(logfiles[i], &forwarded[i]);
 			usleep(100000);

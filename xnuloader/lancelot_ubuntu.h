@@ -87,7 +87,7 @@ lancelot_ubuntu_bootstrap(void)
 	static const struct {
 		const char *entry, *path, *hash;
 	} files[] = {
-		{"ramdisk", "/hackios/20H392/media-prewarm-20261024/root.apfs", "48dde0f5296da5a4fb65a64cd281ad60586875e07e686ae89af4235b99fd125c"},
+		{"ramdisk", "/hackios/20H392/sb-startup-20261024/root.apfs", "393a9d99172bc270dc85505b85b3eaf6704b2526b2b9d1730028c4547cbd8c43"},
 		{"bootdisk", "/hackios/20H392/flashboot.apfs", "14485e7c5ce125ef516168445c2500ac04ca5e40a908c2aef516b2d92c24ba0c"},
 	};
 	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {

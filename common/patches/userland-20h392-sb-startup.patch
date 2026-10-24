@@ -1,0 +1,227 @@
+diff --git a/userland/src/inject_sb.c b/userland/src/inject_sb.c
+--- a/userland/src/inject_sb.c
++++ b/userland/src/inject_sb.c
+@@ -187,6 +187,8 @@ set_setup_required_reason(id self, SEL selector, long reason)
+ 	original_set_setup_required_reason(self, selector, 0);
+ }
+ 
++#include "sb_startup_20h392.h"
++
+ /*
+  * +[XBApplicationSnapshotManifestImpl _outputFormatForSnapshot:] chooses the file format of the picture
+  * SpringBoard takes of an application that leaves the screen: 0 = PNG, 1 and 2 = ATX (an ASTC texture),
+@@ -1129,6 +1131,7 @@ redwood_springboard_init(void)
+ 	_dyld_register_func_for_add_image(image_added);         /* Siri's orb, whose framework comes late */
+ 	original_set_setup_required_reason = (void (*)(id, SEL, long))replace_method("SBSetupManager",
+ 	    "_setSetupRequiredReason:", 0x1c4cdd3a4UL, (IMP)set_setup_required_reason);
++	sb_startup_install();
+ 	snapshot_format = replace_method_of_kind('+', "XBApplicationSnapshotManifestImpl", "_outputFormatForSnapshot:",
+ 	    0x1f1c91480UL, (IMP)snapshot_output_format);
+ 	plain_vibrancy();
+diff --git a/userland/src/sb_startup_20h392.h b/userland/src/sb_startup_20h392.h
+new file mode 100644
+--- /dev/null
++++ b/userland/src/sb_startup_20h392.h
+@@ -0,0 +1,202 @@
++/* Read-only startup probes for the inspected 20H392 SpringBoard image.
++ * Included by inject_sb.c. No activation/setup value or original argument is
++ * changed. In particular the setup setter returns isInSetupMode, not "changed".
++ * Opt in with the complete boot-argument token sbstartup=observe.
++ */
++#include <mach-o/loader.h>
++#include <stddef.h>
++
++struct sb_startup_ivar {
++	const char *name, *types;
++	ptrdiff_t offset;
++};
++
++static bool
++sb_startup_observe_enabled(void)
++{
++	char args[1024] = "";
++	size_t size = sizeof(args) - 1;
++	const char *word = "sbstartup=observe", *p = args;
++	size_t length = strlen(word);
++	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0) return false;
++	args[sizeof(args) - 1] = 0;
++	while ((p = strstr(p, word)) != NULL) {
++		if ((p == args || p[-1] == ' ') && (p[length] == ' ' || p[length] == 0)) return true;
++		p += length;
++	}
++	return false;
++}
++
++static bool
++sb_startup_image_verified(IMP imp)
++{
++	static const unsigned char uuid[16] = {
++		0x22, 0x03, 0x4a, 0xba, 0x9a, 0x9a, 0x3b, 0x94,
++		0x93, 0xa5, 0xa0, 0xde, 0x02, 0xbe, 0xfd, 0x2e,
++	};
++	Dl_info info;
++	const struct mach_header_64 *header;
++	const unsigned char *cursor, *end;
++	bool found = false;
++	if (dladdr((const void *)imp, &info) == 0 || info.dli_fbase == NULL || info.dli_fname == NULL ||
++	    strcmp(info.dli_fname, "/System/Library/PrivateFrameworks/SpringBoard.framework/SpringBoard") != 0) return false;
++	header = info.dli_fbase;
++	if (header->magic != MH_MAGIC_64 || header->cputype != CPU_TYPE_ARM64 ||
++	    header->ncmds > 256 || header->sizeofcmds > 65536) return false;
++	cursor = (const unsigned char *)(header + 1);
++	end = cursor + header->sizeofcmds;
++	for (uint32_t i = 0; i < header->ncmds; i++) {
++		const struct load_command *cmd;
++		if ((size_t)(end - cursor) < sizeof(*cmd)) return false;
++		cmd = (const struct load_command *)cursor;
++		if (cmd->cmdsize < sizeof(*cmd) || cmd->cmdsize > (size_t)(end - cursor)) return false;
++		if (cmd->cmd == LC_UUID) {
++			if (found || cmd->cmdsize != sizeof(struct uuid_command) ||
++			    memcmp(((const struct uuid_command *)cmd)->uuid, uuid, sizeof(uuid)) != 0) return false;
++			found = true;
++		}
++		cursor += cmd->cmdsize;
++	}
++	return found && cursor == end;
++}
++
++static Method
++sb_startup_verified_method(char kind, const char *class_name, const char *selector, uintptr_t expected,
++    const char *types, size_t instance_size, const struct sb_startup_ivar *ivars, size_t count)
++{
++	Class cls = objc_getClass(class_name);
++	Method method = cls == NULL ? NULL : kind == '+' ? class_getClassMethod(cls, sel_registerName(selector)) :
++	    class_getInstanceMethod(cls, sel_registerName(selector));
++	IMP imp = method == NULL ? NULL : method_getImplementation(method);
++	const char *actual_types = method == NULL ? NULL : method_getTypeEncoding(method);
++	if (imp == NULL || (uintptr_t)imp != expected + slide || actual_types == NULL ||
++	    strcmp(actual_types, types) != 0 || !sb_startup_image_verified(imp)) return NULL;
++	if (instance_size != 0 && class_getInstanceSize(cls) != instance_size) return NULL;
++	for (size_t i = 0; i < count; i++) {
++		Ivar ivar = class_getInstanceVariable(cls, ivars[i].name);
++		const char *actual = ivar == NULL ? NULL : ivar_getTypeEncoding(ivar);
++		if (ivar == NULL || actual == NULL || ivar_getOffset(ivar) != ivars[i].offset ||
++		    strcmp(actual, ivars[i].types) != 0) return NULL;
++	}
++	return method;
++}
++
++static void (*sb_startup_original_activation)(id, SEL);
++static BOOL (*sb_startup_original_setup)(id, SEL, unsigned long);
++static id (*sb_startup_original_init)(id, SEL);
++static void (*sb_startup_original_services)(id, SEL);
++static void (*sb_startup_original_did_launch)(id, SEL, id);
++static void (*sb_startup_original_scene)(id, SEL, id);
++
++static void
++sb_startup_activation(id self, SEL selector)
++{
++	static unsigned calls;
++	unsigned call = __sync_add_and_fetch(&calls, 1);
++	if (call <= 8) say("sbstartup: activation enter call=%u state=%d settingUp=%u caller=%#lx\n", call,
++	    *(int *)((char *)self + 8), *(unsigned char *)((char *)self + 12),
++	    (uintptr_t)__builtin_return_address(0) - slide);
++	sb_startup_original_activation(self, selector);
++	if (call <= 8) say("sbstartup: activation exit call=%u state=%d settingUp=%u\n", call,
++	    *(int *)((char *)self + 8), *(unsigned char *)((char *)self + 12));
++}
++
++static BOOL
++sb_startup_setup(id self, SEL selector, unsigned long reason)
++{
++	static unsigned calls;
++	unsigned call = __sync_add_and_fetch(&calls, 1);
++	if (call <= 16) say("sbstartup: setup enter call=%u requested=%lu before=%lu caller=%#lx\n", call, reason,
++	    *(unsigned long *)((char *)self + 8), (uintptr_t)__builtin_return_address(0) - slide);
++	BOOL result = sb_startup_original_setup(self, selector, reason);
++	if (call <= 16) say("sbstartup: setup exit call=%u after=%lu isInSetupMode=%u\n", call,
++	    *(unsigned long *)((char *)self + 8), (unsigned)result);
++	return result;
++}
++
++static id
++sb_startup_init(id self, SEL selector)
++{
++	say("sbstartup: SpringBoard init enter\n");
++	id result = sb_startup_original_init(self, selector);
++	say("sbstartup: SpringBoard init exit object=%p\n", result);
++	return result;
++}
++
++static void
++sb_startup_services(id self, SEL selector)
++{
++	say("sbstartup: system-services enter\n");
++	sb_startup_original_services(self, selector);
++	say("sbstartup: system-services exit\n");
++}
++
++static void
++sb_startup_did_launch(id self, SEL selector, id notification)
++{
++	say("sbstartup: applicationDidFinishLaunching enter\n");
++	sb_startup_original_did_launch(self, selector, notification);
++	say("sbstartup: applicationDidFinishLaunching exit\n");
++}
++
++static void
++sb_startup_scene(id self, SEL selector, id scene)
++{
++	say("sbstartup: completeStartupAfterMainSceneConnect enter\n");
++	sb_startup_original_scene(self, selector, scene);
++	say("sbstartup: completeStartupAfterMainSceneConnect exit\n");
++}
++
++static void
++sb_startup_runloop(__unused CFRunLoopObserverRef observer, CFRunLoopActivity activity, __unused void *info)
++{
++	static unsigned turns;
++	if (activity == kCFRunLoopBeforeWaiting && ++turns <= 3) say("sbstartup: main-runloop before-wait turn=%u\n", turns);
++}
++
++static unsigned
++sb_startup_install(void)
++{
++	static const struct sb_startup_ivar lockdown[] = {{"_state", "i", 8}, {"_settingUpActivationState", "B", 12}};
++	static const struct sb_startup_ivar setup[] = {{"_setupRequiredReason", "Q", 8}, {"_inSetupModeReadyToExit", "B", 16},
++	    {"_setupWantedForDeviceMigration", "B", 17}};
++	Method method;
++	unsigned installed = 0;
++	if (!sb_startup_observe_enabled()) return 0;
++#define SB_STARTUP_PROBE(KIND, CLASS, SELECTOR, ADDRESS, TYPES, SIZE, IVARS, COUNT, ORIGINAL, TYPE, REPLACEMENT) do { \
++	method = sb_startup_verified_method(KIND, CLASS, SELECTOR, ADDRESS, TYPES, SIZE, IVARS, COUNT); \
++	if (method != NULL) { \
++		ORIGINAL = (TYPE)method_getImplementation(method); \
++		method_setImplementation(method, (IMP)REPLACEMENT); \
++		installed++; \
++		say("sbstartup: UUID/IMP/ABI/layout verified %c[%s %s]; observation only\n", KIND, CLASS, SELECTOR); \
++	} else { \
++		say("sbstartup: probe refused %c[%s %s]; original unchanged\n", KIND, CLASS, SELECTOR); \
++	} \
++} while (0)
++	SB_STARTUP_PROBE('-', "SBLockdownManager", "_setupActivationState", 0x1c5991a78UL, "v16@0:8", 32,
++	    lockdown, 2, sb_startup_original_activation, void (*)(id, SEL), sb_startup_activation);
++	SB_STARTUP_PROBE('-', "SBSetupManager", "_setSetupRequiredReason:", 0x1c5aa608cUL, "B24@0:8Q16", 48,
++	    setup, 3, sb_startup_original_setup, BOOL (*)(id, SEL, unsigned long), sb_startup_setup);
++	SB_STARTUP_PROBE('-', "SpringBoard", "init", 0x1c587f834UL, "@16@0:8", 0,
++	    NULL, 0, sb_startup_original_init, id (*)(id, SEL), sb_startup_init);
++	SB_STARTUP_PROBE('+', "SpringBoard", "initializeSystemServicesBeforeApplicationDidFinishLaunching", 0x1c587f5f4UL, "v16@0:8", 0,
++	    NULL, 0, sb_startup_original_services, void (*)(id, SEL), sb_startup_services);
++	SB_STARTUP_PROBE('-', "SpringBoard", "applicationDidFinishLaunching:", 0x1c58808a0UL, "v24@0:8@16", 0,
++	    NULL, 0, sb_startup_original_did_launch, void (*)(id, SEL, id), sb_startup_did_launch);
++	SB_STARTUP_PROBE('-', "SpringBoard", "_completeStartupAfterMainSceneConnect:", 0x1c58813c8UL, "v24@0:8@16", 0,
++	    NULL, 0, sb_startup_original_scene, void (*)(id, SEL, id), sb_startup_scene);
++#undef SB_STARTUP_PROBE
++	if (installed == 0) {
++		say("sbstartup: all probes refused; no observers registered\n");
++		return 0;
++	}
++	CFRunLoopObserverRef observer = CFRunLoopObserverCreate(NULL, kCFRunLoopBeforeWaiting, true, 0, sb_startup_runloop, NULL);
++	if (observer != NULL) {
++		CFRunLoopAddObserver(CFRunLoopGetMain(), observer, kCFRunLoopCommonModes);
++		CFRelease(observer);
++	}
++	dispatch_async(dispatch_get_main_queue(), ^{ say("sbstartup: main-dispatch-queue reached\n"); });
++	say("sbstartup: observation probes installed=%u/6; activation/setup behavior unchanged\n", installed);
++	return installed;
++}

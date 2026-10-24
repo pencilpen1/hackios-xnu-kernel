@@ -1,5 +1,7 @@
 # Lancelot 20H392: first service-log boot and guarded media candidate
 
+后续启动路径诊断见 `LANCELOT-SB-STARTUP-2026-10-24.md`；其最新部署/实测记录优先。
+
 ## Result and current state
 
 The previously deployed `service-log-20261023` candidate has now booted on the
