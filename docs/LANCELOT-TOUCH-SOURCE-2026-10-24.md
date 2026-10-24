@@ -1,5 +1,9 @@
 # Lancelot：Shockwave 17.0 触摸参考源码与 Android 补采
 
+后续状态：已基于本文数据开始真实MTK硬件链路实现，见
+`LANCELOT-TOUCH-HARDWARE-2026-10-24.md`（尚未实机验证）；此前内存自测见
+`LANCELOT-TOUCH-SELFTEST-2026-10-24.md`。手机最新为用户确认的原生FASTBOOT，不再是本文补采时的Android状态。
+
 ## 下载结果
 
 用户提供当前 Android 内核源码：

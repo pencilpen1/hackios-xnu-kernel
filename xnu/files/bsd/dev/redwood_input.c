@@ -286,12 +286,17 @@ redwood_input_init(void)
 	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-touch") == NULL) {
 		printf("redwood-touch: cannot create the device\n");
 	}
+	if (lancelot_touch_platform()) touch_exit_enabled = 0;
 	(void)PE_parse_boot_argn("touch_exit", &touch_exit_enabled, sizeof(touch_exit_enabled));
 	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
 	redwood_cpufreq_init();
 	redwood_virtio_input_init();
-	redwood_goodix_init();
-	redwood_buttons_init();
+	if (lancelot_touch_platform()) {
+		lancelot_touch_init();       /* never touch Qualcomm GPIO/SPI on MT6768 */
+	} else {
+		redwood_goodix_init();
+		redwood_buttons_init();
+	}
 	redwood_battery_init();
 	redwood_ufs_init();
 	lancelot_emmc_init();

@@ -41,6 +41,8 @@ void redwood_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
 void redwood_input_init(void);
 void redwood_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
 void redwood_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
+bool lancelot_touch_platform(void);     /* checked MT6768 loader metadata; no MMIO */
+void lancelot_touch_init(void);         /* lancelot_touch=1/2/3: snapshot / trim / firmware+reports */
 void redwood_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
 void redwood_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
 void lancelot_emmc_init(void);         /* native read-only MT6768 PIO, only with validated loader metadata */

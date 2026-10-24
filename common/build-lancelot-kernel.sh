@@ -31,6 +31,8 @@ python3 tools/test-loader-early-return.py "$RETURN_SOURCE"
 for file in bsd/dev/lancelot_usb.c bsd/dev/lancelot_musb.h bsd/dev/lancelot_emmc.c bsd/dev/lancelot_msdc.h bsd/dev/lancelot_mmc_mode.h bsd/dev/lancelot_storage.h \
             bsd/dev/lancelot_nt36672_protocol.c bsd/dev/lancelot_nt36672_protocol.h \
             bsd/dev/lancelot_touch_selftest.h bsd/dev/lancelot_touch_queue_selftest.h \
+            bsd/dev/lancelot_spi.h bsd/dev/lancelot_touch_platform.h bsd/dev/lancelot_touch.c \
+            bsd/dev/lancelot_nt36672_hw.c bsd/dev/lancelot_nt36672_hw.h \
             bsd/dev/lancelot_ext4.h bsd/dev/lancelot_sha256.h bsd/dev/redwood_input.c bsd/sys/redwood_input.h \
             bsd/miscfs/apfs/apfs_vfsops.c; do
   if ! cmp -s "xnu/files/$file" "xnu-src/xnu-8796.121.2/$file"; then
@@ -42,6 +44,7 @@ python3 tools/test-lancelot-msdc.py
 python3 tools/test-lancelot-usb.py
 python3 tools/test-lancelot-nt36672-protocol.py
 python3 tools/test-lancelot-touch-queue.py
+python3 tools/test-lancelot-touch-hardware.py
 KERNEL=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
 # XNU's build target performs setup/header export/compile/link. The all/config
 # target additionally checks unavailable DriverKit RPC exports and builds kext

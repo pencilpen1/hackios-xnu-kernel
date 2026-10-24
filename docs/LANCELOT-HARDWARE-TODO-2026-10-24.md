@@ -3,7 +3,8 @@
 按用户指定顺序：**触摸 → GPU → 侧边按键 → 待机/亮起 → Wi-Fi → 震动 → 传感器**。
 本文件是计划，不表示已完成驱动；触摸参考源码、正确固件和Android输入基线已取得，见
 `LANCELOT-TOUCH-SOURCE-2026-10-24.md`。已编译隔离的XNU内存自测候选并从Android部署；
-真实MTK触摸驱动仍未接入。候选/实机状态见`LANCELOT-TOUCH-SELFTEST-2026-10-24.md`。
+真实MTK触摸链路首版已开始实现，尚未实机验证；见`LANCELOT-TOUCH-HARDWARE-2026-10-24.md`。
+此前内存自测候选见`LANCELOT-TOUCH-SELFTEST-2026-10-24.md`；PC采集已按用户要求停止，手机最新为原生FASTBOOT。
 
 ## 基线与执行约束
 
@@ -77,7 +78,8 @@ DT compatible 同时列出 NVT 与 FocalTech 备选，但旧实机驱动实际�
 
 ### 实现与验收待办
 
-- [ ] 建立独立 Lancelot/MTK 触摸入口，避免调用 `redwood_goodix_init()` 的 Qualcomm SPI/GPIO。
+- [x] 建立独立 Lancelot/MTK 分级入口，按loader元数据隔离Qualcomm SPI/GPIO/按键入口；
+  启用保护已通过host测试。新硬件代码正式构建和实机验收另记，不以此勾选代替。
 - [ ] 按真实芯片协议实现供电/复位、SPI访问、身份核验、必要的固件装载、状态读取。
   确认是否为RAM装载方案，不能假设触控控制器在 XNU 接管时仍保留 Android 固件。
 - [x] 离线点包/接触状态机测试：真实同时十点、长度/校验/ID/坐标/特殊帧、按下移动抬起、
