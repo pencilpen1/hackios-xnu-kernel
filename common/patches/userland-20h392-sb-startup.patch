@@ -22,11 +22,13 @@ diff --git a/userland/src/sb_startup_20h392.h b/userland/src/sb_startup_20h392.h
 new file mode 100644
 --- /dev/null
 +++ b/userland/src/sb_startup_20h392.h
-@@ -0,0 +1,202 @@
-+/* Read-only startup probes for the inspected 20H392 SpringBoard image.
-+ * Included by inject_sb.c. No activation/setup value or original argument is
-+ * changed. In particular the setup setter returns isInSetupMode, not "changed".
+@@ -0,0 +1,224 @@
++/* Guarded startup probes for the inspected 20H392 SpringBoard image.
++ * Observation preserves activation/setup values and all original arguments.
++ * The setup setter always returns the original isInSetupMode, not "changed".
 + * Opt in with the complete boot-argument token sbstartup=observe.
++ * Additional sbactivation=local permits only the proven native state 1 -> 2
++ * mapping for the GPU-less offline root, never Apple server activation.
 + */
 +#include <mach-o/loader.h>
 +#include <stddef.h>
@@ -37,11 +39,11 @@ new file mode 100644
 +};
 +
 +static bool
-+sb_startup_observe_enabled(void)
++sb_startup_boot_arg(const char *word)
 +{
 +	char args[1024] = "";
 +	size_t size = sizeof(args) - 1;
-+	const char *word = "sbstartup=observe", *p = args;
++	const char *p = args;
 +	size_t length = strlen(word);
 +	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0) return false;
 +	args[sizeof(args) - 1] = 0;
@@ -50,6 +52,12 @@ new file mode 100644
 +		p += length;
 +	}
 +	return false;
++}
++
++static bool
++sb_startup_observe_enabled(void)
++{
++	return sb_startup_boot_arg("sbstartup=observe");
 +}
 +
 +static bool
@@ -112,6 +120,7 @@ new file mode 100644
 +static void (*sb_startup_original_services)(id, SEL);
 +static void (*sb_startup_original_did_launch)(id, SEL, id);
 +static void (*sb_startup_original_scene)(id, SEL, id);
++static bool sb_startup_local_activation;
 +
 +static void
 +sb_startup_activation(id self, SEL selector)
@@ -122,6 +131,16 @@ new file mode 100644
 +	    *(int *)((char *)self + 8), *(unsigned char *)((char *)self + 12),
 +	    (uintptr_t)__builtin_return_address(0) - slide);
 +	sb_startup_original_activation(self, selector);
++	/* Native 20H392 returned state=1 on the diagnostic boot, which made
++	 * updateInSetupMode request reason=2. This offline-port opt-in changes only
++	 * that known result, after the real query finishes. It is NOT Apple server
++	 * activation, and unknown/pending/error states and setup reasons are kept.
++	 */
++	if (sb_startup_local_activation && *(int *)((char *)self + 8) == 1 &&
++	    *(unsigned char *)((char *)self + 12) == 0) {
++		*(int *)((char *)self + 8) = 2;
++		say("sbstartup: native activation state=1 -> local compatibility state=2; not server activation\n");
++	}
 +	if (call <= 8) say("sbstartup: activation exit call=%u state=%d settingUp=%u\n", call,
 +	    *(int *)((char *)self + 8), *(unsigned char *)((char *)self + 12));
 +}
@@ -188,6 +207,8 @@ new file mode 100644
 +	Method method;
 +	unsigned installed = 0;
 +	if (!sb_startup_observe_enabled()) return 0;
++	sb_startup_local_activation = sb_startup_boot_arg("sbactivation=local") &&
++	    sb_startup_boot_arg("gpu=0") && sb_startup_boot_arg("root_apfs=lancelot_ios");
 +#define SB_STARTUP_PROBE(KIND, CLASS, SELECTOR, ADDRESS, TYPES, SIZE, IVARS, COUNT, ORIGINAL, TYPE, REPLACEMENT) do { \
 +	method = sb_startup_verified_method(KIND, CLASS, SELECTOR, ADDRESS, TYPES, SIZE, IVARS, COUNT); \
 +	if (method != NULL) { \
@@ -222,6 +243,7 @@ new file mode 100644
 +		CFRelease(observer);
 +	}
 +	dispatch_async(dispatch_get_main_queue(), ^{ say("sbstartup: main-dispatch-queue reached\n"); });
-+	say("sbstartup: observation probes installed=%u/6; activation/setup behavior unchanged\n", installed);
++	say("sbstartup: probes installed=%u/6; setup arguments/returns unchanged; local_activation=%u\n", installed,
++	    (unsigned)sb_startup_local_activation);
 +	return installed;
 +}

@@ -89,6 +89,12 @@ class ProfileTest(unittest.TestCase):
         self.argv[self.argv.index("--profile") + 1] = self.profile
         self.test_new_profile_payload_and_cleanup()
 
+    def test_activation_profile_payload_and_cleanup(self):
+        self.profile = "sb-activation-20261024"
+        self.metadata.write_text(json.dumps({"build": "20H392", "profile": self.profile}))
+        self.argv[self.argv.index("--profile") + 1] = self.profile
+        self.test_new_profile_payload_and_cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

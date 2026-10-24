@@ -92,6 +92,7 @@ static void reset(void) {
  method.imp=(IMP)(0x1c5aa608cUL+slide);method.types="B24@0:8Q16";
  missing_class=missing_method=missing_ivar=false;sysctl_error=0;replacements=0;
  automatic_tables=false;
+ sb_startup_local_activation=false;
  const uintptr_t addresses[]={0x1c5991a78UL,0x1c5aa608cUL,0x1c587f834UL,0x1c587f5f4UL,0x1c58808a0UL,0x1c58813c8UL};
  const char *types[]={"v16@0:8","B24@0:8Q16","@16@0:8","v16@0:8","v24@0:8@16","v24@0:8@16"};
  for(unsigned i=0;i<6;i++){probe_methods[i].imp=(IMP)(addresses[i]+slide);probe_methods[i].types=types[i];}
@@ -106,10 +107,12 @@ static id expected_self, expected_arg;
 static SEL expected_selector;
 static unsigned long expected_reason;
 static BOOL answer;
+static int native_state=1;
+static unsigned char native_pending=0;
 static void activation(id self, SEL sel) {
  assert(self==expected_self && sel==expected_selector);forwarded++;
  assert(*(int*)((char*)self+8)==3 && *((unsigned char*)self+12)==1);
- *(int*)((char*)self+8)=1;*((unsigned char*)self+12)=0;
+ *(int*)((char*)self+8)=native_state;*((unsigned char*)self+12)=native_pending;
 }
 static BOOL setup_call(id self,SEL sel,unsigned long reason) {
  assert(self==expected_self && sel==expected_selector && reason==expected_reason);forwarded++;
@@ -151,9 +154,18 @@ int main(void) {
  assert((uintptr_t)sb_startup_original_setup==0x1c5aa608cUL+slide);
  reset();automatic_tables=true;
  assert(sb_startup_verified_method('-',"SpringBoard","initializeSystemServicesBeforeApplicationDidFinishLaunching",0x1c587f5f4UL,"v16@0:8",0,NULL,0)==NULL);
+ for(unsigned i=0;i<5;i++) {
+  const char *bootargs[]={"sbstartup=observe sbactivation=local gpu=0 root_apfs=lancelot_ios",
+   "sbstartup=observe sbactivation=localX gpu=0 root_apfs=lancelot_ios",
+   "sbstartup=observe sbactivation=local gpu=1 root_apfs=lancelot_ios",
+   "sbstartup=observe sbactivation=local gpu=0 root_apfs=other",
+   "sbactivation=local gpu=0 root_apfs=lancelot_ios"};
+  reset();automatic_tables=true;args=bootargs[i];sb_startup_install();assert(sb_startup_local_activation==(i==0));
+ }
  /* Execute only our wrappers against real host functions; never execute fake cache IMPs. */
  union { unsigned long align; unsigned char bytes[48]; } obj;memset(&obj,0,sizeof(obj));
  expected_self=&obj;expected_selector="fixture";forwarded=0;
+ sb_startup_local_activation=false;
  *(int*)(obj.bytes+8)=3;obj.bytes[12]=1;sb_startup_original_activation=activation;
  sb_startup_activation(expected_self,expected_selector);
  assert(forwarded==1 && *(int*)(obj.bytes+8)==1 && obj.bytes[12]==0);
@@ -169,6 +181,14 @@ int main(void) {
  sb_startup_original_did_launch=phase_call;sb_startup_did_launch(expected_self,expected_selector,expected_arg);
  sb_startup_original_scene=phase_call;sb_startup_scene(expected_self,expected_selector,expected_arg);
  assert(forwarded==10);
+ for(native_state=0;native_state<4;native_state++)for(native_pending=0;native_pending<2;native_pending++)
+  for(unsigned local=0;local<2;local++) {
+   sb_startup_local_activation=local!=0;*(int*)(obj.bytes+8)=3;obj.bytes[12]=1;
+   unsigned before=forwarded;sb_startup_activation(expected_self,expected_selector);
+   int expected=local && native_state==1 && native_pending==0 ? 2 : native_state;
+   assert(forwarded==before+1 && *(int*)(obj.bytes+8)==expected && obj.bytes[12]==native_pending);
+  }
+ assert(forwarded==26);
  puts("startup UUID/IMP/ABI/layout/token guard and original forwarding fixtures passed");
 }
 '''
