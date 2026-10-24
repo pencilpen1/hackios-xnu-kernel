@@ -10,6 +10,11 @@ import subprocess
 import tarfile
 import uuid
 
+PROFILES = {
+    "service-log-20261023": "8089e522be3d774cb568b853e380421c02ed3defacffd23e4a3b263f20c5ae64",
+    "media-prewarm-20261024": "48dde0f5296da5a4fb65a64cd281ad60586875e07e686ae89af4235b99fd125c",
+}
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
@@ -18,14 +23,17 @@ def main():
     ap.add_argument("--image", type=Path, required=True)
     ap.add_argument("--metadata", type=Path, required=True)
     ap.add_argument("--log", type=Path, required=True)
+    ap.add_argument("--profile", choices=PROFILES, default="service-log-20261023")
     args = ap.parse_args()
     metadata = json.loads(args.metadata.read_text())
     if metadata["build"] != "20H392" or args.image.stat().st_size != 4194304:
         raise SystemExit("unexpected bootstrap profile")
     files = {"root.apfs": args.image, "profile.json": args.metadata}
     hashes = {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in files.items()}
-    if hashes["root.apfs"] != "8089e522be3d774cb568b853e380421c02ed3defacffd23e4a3b263f20c5ae64":
+    if hashes["root.apfs"] != PROFILES[args.profile]:
         raise SystemExit("profile image does not match the loader's pinned hash")
+    if args.profile != "service-log-20261023" and metadata.get("profile") != args.profile:
+        raise SystemExit("metadata/profile name mismatch")
     archive_data = io.BytesIO()
     with tarfile.open(fileobj=archive_data, mode="w") as archive:
         for name, path in files.items():
@@ -63,7 +71,7 @@ def main():
 
         call("push", str(script), remote)
         try:
-            output = call("shell", "-T", f"su -c 'sh {remote} receive {token} {lines}'",
+            output = call("shell", "-T", f"su -c 'sh {remote} receive {token} {lines} {args.profile}'",
                           data=encoded, timeout=180)
             if b"PROFILE VERIFIED AND UNMOUNTED" not in output:
                 raise RuntimeError("profile verification did not complete")
@@ -72,7 +80,7 @@ def main():
                     raise RuntimeError("missing write/read-only hash evidence: " + name)
         finally:
             control("cleanup")
-    report = {"partition": "Ubuntu", "path": "/hackios/20H392/service-log-20261023",
+    report = {"partition": "Ubuntu", "path": "/hackios/20H392/" + args.profile,
               "transport": "bounded base64 over ADB stdin directly to Ubuntu", "verified": True, "files": hashes}
     args.log.with_suffix(args.log.suffix + ".json").write_text(json.dumps(report, indent=2) + "\n")
 

@@ -1,0 +1,84 @@
+diff --git a/userland/src/inject_media.c b/userland/src/inject_media.c
+--- a/userland/src/inject_media.c
++++ b/userland/src/inject_media.c
+@@ -75,10 +75,58 @@ static uintptr_t slide;
+ 
+ /* +[BWCoreImageFilterRenderer prewarmPortraitFilterVersion:semanticStyleFilters:] */
+ static void
+-prewarm_portrait_filter(__unused id self, __unused SEL selector, __unused int version, __unused BOOL styles)
++prewarm_portrait_filter(__unused id self, __unused SEL selector, __unused unsigned int version, __unused BOOL styles)
+ {
+ }
+ 
++static bool boot_arg(const char *what);
++
++/* 20H392, CMCapture UUID 45D37488-2CC7-3028-8A4D-936BCE7A220B.
++ * The exact cache's method list has ABI v24@0:8I16B20 at 0x1a2165b8c.
++ * On lancelot gpu=0, CI::GLContext::init()+0xcc faults through a NULL
++ * glDisable slot. Adapt only the existing portrait-prewarm bypass, not the
++ * other 20F66 capture hooks. Unknown images, ABIs and GPU modes stay untouched.
++ */
++static bool
++portrait_prewarm_20h392(Method method, IMP implementation)
++{
++	static const unsigned char expected_uuid[16] = {
++		0x45, 0xd3, 0x74, 0x88, 0x2c, 0xc7, 0x30, 0x28,
++		0x8a, 0x4d, 0x93, 0x6b, 0xce, 0x7a, 0x22, 0x0b,
++	};
++	Dl_info info;
++	const char *types = method != NULL ? method_getTypeEncoding(method) : NULL;
++	const struct mach_header_64 *header;
++	const unsigned char *cursor, *end;
++
++	if ((uintptr_t)implementation != 0x1a2165b8cUL + slide || types == NULL ||
++	    strcmp(types, "v24@0:8I16B20") != 0 || !boot_arg("gpu=0") ||
++	    dladdr((const void *)implementation, &info) == 0 || info.dli_fbase == NULL ||
++	    info.dli_fname == NULL || strcmp(info.dli_fname,
++	    "/System/Library/PrivateFrameworks/CMCapture.framework/CMCapture") != 0) {
++		return false;
++	}
++	header = info.dli_fbase;
++	if (header->magic != MH_MAGIC_64 || header->cputype != CPU_TYPE_ARM64 ||
++	    header->ncmds > 256 || header->sizeofcmds > 65536) {
++		return false;
++	}
++	cursor = (const unsigned char *)(header + 1);
++	end = cursor + header->sizeofcmds;
++	for (uint32_t i = 0; i < header->ncmds; i++) {
++		const struct load_command *command;
++		if ((size_t)(end - cursor) < sizeof(*command)) return false;
++		command = (const struct load_command *)cursor;
++		if (command->cmdsize < sizeof(*command) || command->cmdsize > (size_t)(end - cursor)) return false;
++		if (command->cmd == LC_UUID) {
++			if (command->cmdsize != sizeof(struct uuid_command)) return false;
++			return memcmp(((const struct uuid_command *)command)->uuid, expected_uuid, sizeof(expected_uuid)) == 0;
++		}
++		cursor += command->cmdsize;
++	}
++	return false;
++}
++
+ /* ---- the flashlight ------------------------------------------------------------------------------- */
+ 
+ static int torch = -1;                  /* /dev/redwood-torch */
+@@ -623,7 +671,9 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_slide)
+ 		method = r->instance ? class_getInstanceMethod(cls, sel_registerName(r->selector)) :
+ 		    class_getClassMethod(cls, sel_registerName(r->selector));
+ 		original = method ? method_getImplementation(method) : NULL;
+-		if (original == NULL || (uintptr_t)original != r->expected + slide) {
++		bool verified_20h392 = r->replacement == (IMP)prewarm_portrait_filter &&
++		    portrait_prewarm_20h392(method, original);
++		if (original == NULL || ((uintptr_t)original != r->expected + slide && !verified_20h392)) {
+ 			say("redwood: %c[%s %s]: found %#lx, expected %#lx; left alone\n", r->instance ? '-' : '+', r->class_name,
+ 			    r->selector,
+ 			    original ? (uintptr_t)original - slide : 0, r->expected);
+@@ -633,6 +683,9 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_slide)
+ 			*r->original = original;
+ 		}
+ 		method_setImplementation(method, r->replacement);
++		if (verified_20h392) {
++			say("redwood: mediaserverd: 20H392 CMCapture UUID/IMP/ABI verified; gpu=0 portrait prewarm skipped\n");
++		}
+ 		say("redwood: mediaserverd: %c[%s %s] replaced\n", r->instance ? '-' : '+', r->class_name, r->selector);
+ 	}
+ }

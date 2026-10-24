@@ -11,7 +11,9 @@ token=${2:?deployment token required}
 case "$token" in ''|*[!0-9a-f]*) exit 1;; esac
 [ "${#token}" = 32 ]
 mountpoint=/data/local/tmp/hackios-profile-$token
-dest=$mountpoint/hackios/20H392/service-log-20261023
+profile=${4:-service-log-20261023}
+case "$profile" in service-log-20261023|media-prewarm-20261024) ;; *) exit 1;; esac
+dest=$mountpoint/hackios/20H392/$profile
 incoming=$dest.incoming-$token
 mounted_source() {
   awk -v p="$mountpoint" '$2 == p {print $1}' /proc/mounts
