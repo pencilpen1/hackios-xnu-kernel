@@ -222,5 +222,7 @@ eMMC、日志、服务修复、兼容源码补丁和本轮证据。独立`.userl
 原始手机日志、Apple缓存/镜像、备份和本地构建产物都在ignored local目录，不上传。
 远端推送结果由`local/lancelot-sb-activation-20261024/github-push.json`保存并校验。
 
-下一阶段优先实现真正持久化写入，再适配输入与评估性能；不得为提速激活未验证
-HS200/HS400/DMA。回Android仍需原生FASTBOOT还原已验证Boot，不能普通reboot假装恢复。
+后续用户指定硬件顺序为触摸、GPU、侧边按键、待机/亮起、Wi-Fi、震动、传感器，
+见 `LANCELOT-HARDWARE-TODO-2026-10-24.md`；当前先按此顺序准备，持久化未完成的需求保留。
+不得为提速激活未验证HS200/HS400/DMA。回Android仍需原生FASTBOOT还原已验证Boot，
+不能普通reboot假装恢复。
