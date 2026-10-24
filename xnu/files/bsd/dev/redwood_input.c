@@ -13,6 +13,7 @@
 #include <sys/systm.h>
 #include <sys/uio.h>
 #include <pexpert/pexpert.h>
+#include "lancelot_touch_selftest.h"
 
 #define TOUCH_QUEUE     512             /* records; a power of two */
 #define TOUCH_CONTACTS  10              /* matches backboardd's MAX_FINGERS */
@@ -63,6 +64,7 @@ static struct redwood_touch touch_queue[TOUCH_QUEUE];
 static uint32_t touch_head, touch_tail;        /* read from head, add at tail */
 static bool queued_contact[TOUCH_CONTACTS];
 static uint32_t queued_x[TOUCH_CONTACTS], queued_y[TOUCH_CONTACTS];
+static bool queued_button[REDWOOD_BUTTON_HOME + 1];
 
 /*
  * The way out when nothing else is at hand: five fingers held on the screen for a second and a
@@ -139,7 +141,9 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 
 	lck_mtx_lock(&touch_lock);
 	was_down = touch_record && finger < TOUCH_CONTACTS && queued_contact[finger];
-	if (touch_tail - touch_head >= TOUCH_QUEUE) {
+	/* An orphan MOVE takes two records (DOWN then MOVE), not one. */
+	if (touch_tail - touch_head > TOUCH_QUEUE -
+	    (touch_record && finger < TOUCH_CONTACTS && type == REDWOOD_TOUCH_MOVE && !was_down ? 2u : 1u)) {
 		/*
 		 * A dropped DOWN or UP can strand a virtual HID contact forever. Reset
 		 * the unread stream as a complete HID synchronization barrier: release
@@ -152,11 +156,21 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 		for (i = 0; i < TOUCH_CONTACTS; i++) {
 			touch_enqueue(REDWOOD_TOUCH_UP, i, queued_x[i], queued_y[i]);
 		}
+		for (i = REDWOOD_BUTTON_LOCK; i <= REDWOOD_BUTTON_HOME; i++) {
+			touch_enqueue(REDWOOD_BUTTON_UP, i, 0, 0);
+		}
 		for (i = 0; i < TOUCH_CONTACTS; i++) {
 			if (queued_contact[i]) {
 				touch_enqueue(REDWOOD_TOUCH_DOWN, i, queued_x[i], queued_y[i]);
 			}
 		}
+		for (i = REDWOOD_BUTTON_LOCK; i <= REDWOOD_BUTTON_HOME; i++) {
+			if (queued_button[i]) touch_enqueue(REDWOOD_BUTTON_DOWN, i, 0, 0);
+		}
+	}
+	if ((type == REDWOOD_BUTTON_DOWN || type == REDWOOD_BUTTON_UP) &&
+	    finger >= REDWOOD_BUTTON_LOCK && finger <= REDWOOD_BUTTON_HOME) {
+		queued_button[finger] = type == REDWOOD_BUTTON_DOWN;
 	}
 	if (touch_record && finger < TOUCH_CONTACTS && type == REDWOOD_TOUCH_MOVE && !was_down) {
 		/* Re-establish a move whose DOWN was among the discarded records. */
@@ -178,6 +192,8 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 	lck_mtx_unlock(&touch_lock);
 	wakeup(&touch_queue);
 }
+
+#include "lancelot_touch_queue_selftest.h"
 
 void
 redwood_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
@@ -253,7 +269,19 @@ static const struct cdevsw touch_cdevsw = {
 void
 redwood_input_init(void)
 {
-	int major = cdevsw_add(-1, &touch_cdevsw);
+	int major;
+	uint32_t selftest = 0;
+
+	/* No device node or producer exists yet. Test samples never reach HID. */
+	if (PE_parse_boot_argn("touch_selftest", &selftest, sizeof(selftest)) && selftest == 1) {
+		unsigned failure = lancelot_touch_protocol_selftest();
+		printf("lancelot-touch-selftest: protocol %s line=%u hardware=off HID=off\n",
+		    failure ? "FAIL" : "PASS", failure);
+		failure = lancelot_touch_queue_selftest();
+		printf("lancelot-touch-selftest: queue %s line=%u hardware=off HID=off\n",
+		    failure ? "FAIL" : "PASS", failure);
+	}
+	major = cdevsw_add(-1, &touch_cdevsw);
 
 	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-touch") == NULL) {
 		printf("redwood-touch: cannot create the device\n");

@@ -1,8 +1,8 @@
 /* NT36672A report format and contact state machine.
  *
  * This file deliberately has no XNU or hardware dependency.  The same bounded
- * parser is used by the hardware driver and by host fixtures before a device
- * candidate is built.
+ * parser can be shared by the future hardware driver and host/device selftests.
+ * There is not yet a hardware transport calling it.
  */
 #ifndef _LANCELOT_NT36672_PROTOCOL_H_
 #define _LANCELOT_NT36672_PROTOCOL_H_
@@ -24,6 +24,7 @@ enum lancelot_nt36672_packet_result {
 	LANCELOT_NT36672_PACKET_WDT_PATTERN = 3,
 	LANCELOT_NT36672_PACKET_RECOVERY = 4,
 	LANCELOT_NT36672_PACKET_MALFORMED = 5,
+	LANCELOT_NT36672_PACKET_PALM = 6,
 };
 
 struct lancelot_nt36672_contact {
@@ -36,6 +37,7 @@ struct lancelot_nt36672_contact {
 };
 
 struct lancelot_nt36672_report {
+	bool valid;                        /* only a complete, accepted contact frame */
 	uint16_t present_mask;
 	uint8_t first_id;
 	uint8_t first_event;
@@ -53,7 +55,8 @@ struct lancelot_nt36672_state {
 	uint8_t wdt_packets;
 };
 
-/* packet includes the SPI read dummy byte at packet[0]. */
+/* Vendor CTP_SPI_READ output: command/offset at [0], 65 data bytes at [1..65].
+ * Raw SPI RX is 67 bytes (two leading bytes); it must be unpacked first. */
 bool lancelot_nt36672_checksum_ok(const uint8_t *packet, uint32_t length);
 enum lancelot_nt36672_packet_result lancelot_nt36672_parse(
 	const uint8_t *packet, uint32_t length,

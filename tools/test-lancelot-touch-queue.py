@@ -23,12 +23,15 @@ SHIM = r'''
 #define REDWOOD_TOUCH_UP 3
 #define REDWOOD_BUTTON_DOWN 4
 #define REDWOOD_BUTTON_UP 5
+#define REDWOOD_BUTTON_LOCK 1
+#define REDWOOD_BUTTON_HOME 4
 struct redwood_touch { uint64_t time; uint32_t type, finger, x, y; };
 static struct redwood_touch touch_queue[TOUCH_QUEUE];
 static uint32_t touch_head, touch_tail;
 static bool queued_contact[TOUCH_CONTACTS];
 static uint32_t queued_x[TOUCH_CONTACTS], queued_y[TOUCH_CONTACTS];
-static bool touch_lat;
+static bool queued_button[REDWOOD_BUTTON_HOME + 1];
+static uint32_t touch_lat;
 static int lock_depth;
 static int touch_lock;
 static uint64_t clock_ticks;
@@ -46,6 +49,7 @@ MAIN = r'''
 static void drain_and_apply(bool state[10], uint32_t x[10], uint32_t y[10]) {
     while (touch_head != touch_tail) {
         struct redwood_touch t = touch_queue[touch_head++ % TOUCH_QUEUE];
+        if (t.type == REDWOOD_BUTTON_DOWN || t.type == REDWOOD_BUTTON_UP) continue;
         assert(t.finger < 10);
         if (t.type == REDWOOD_TOUCH_DOWN) {
             assert(!state[t.finger]); state[t.finger] = true;
@@ -81,6 +85,9 @@ int main(void) {
     touch_post(REDWOOD_TOUCH_UP,0,4321,5432,true);
     drain_and_apply(hid,hx,hy);
     assert(!hid[0]); for (unsigned i=1; i<10; ++i) assert(hid[i]);
+    unsigned failed = lancelot_touch_queue_selftest();
+    if (failed) { fprintf(stderr, "shared queue selftest failed at line %u\n", failed); return 1; }
+    assert(touch_head == touch_tail);
     puts("touch queue: 10-contact overflow barriers preserve DOWN/UP and coordinates");
 }
 '''
@@ -103,5 +110,5 @@ with tempfile.TemporaryDirectory(prefix="lancelot-touch-queue-") as directory:
     binary = root / "queue"
     c.write_text(SHIM + "\n" + actual + "\n" + MAIN)
     subprocess.run(["cc", "-std=c11", "-O1", "-Wall", "-Wextra", "-Werror",
-                    "-fsanitize=address,undefined", str(c), "-o", str(binary)], check=True)
+                    "-fsanitize=address,undefined", "-I", str(SOURCE.parent), str(c), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

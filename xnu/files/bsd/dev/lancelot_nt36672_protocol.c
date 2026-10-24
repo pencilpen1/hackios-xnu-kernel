@@ -10,6 +10,7 @@ zero_report(struct lancelot_nt36672_report *report)
 {
 	unsigned i;
 
+	report->valid = false;
 	for (i = 0; i < LANCELOT_NT36672_MAX_CONTACTS; i++) {
 		report->contact[i].present = false;
 		report->contact[i].id = (uint8_t)(i + 1);
@@ -71,11 +72,13 @@ lancelot_nt36672_parse(const uint8_t *packet, uint32_t length,
 {
 	unsigned i;
 
+	if (report != NULL) {
+		zero_report(report);
+	}
 	if (packet == NULL || report == NULL ||
 	    length != LANCELOT_NT36672_PACKET_BYTES) {
 		return LANCELOT_NT36672_PACKET_BAD_ARGUMENT;
 	}
-	zero_report(report);
 	if (handshake_pattern(packet)) {
 		return LANCELOT_NT36672_PACKET_RECOVERY;
 	}
@@ -84,6 +87,11 @@ lancelot_nt36672_parse(const uint8_t *packet, uint32_t length,
 	}
 	if (!lancelot_nt36672_checksum_ok(packet, length)) {
 		return LANCELOT_NT36672_PACKET_BAD_CHECKSUM;
+	}
+	/* Vendor DATA_PROTOCOL / FUNCPAGE_PALM: never interpret the payload as slots. */
+	if ((packet[1] >> 3) == 30 && packet[2] == 4) {
+		return packet[3] == 3 || packet[3] == 4 ?
+		    LANCELOT_NT36672_PACKET_PALM : LANCELOT_NT36672_PACKET_MALFORMED;
 	}
 
 	for (i = 0; i < LANCELOT_NT36672_MAX_CONTACTS; i++) {
@@ -132,6 +140,7 @@ lancelot_nt36672_parse(const uint8_t *packet, uint32_t length,
 			report->first_event = event;
 		}
 	}
+	report->valid = true;
 	return LANCELOT_NT36672_PACKET_OK;
 }
 
@@ -177,6 +186,7 @@ lancelot_nt36672_state_bad_packet(struct lancelot_nt36672_state *state,
 	if (state == NULL) {
 		return;
 	}
+	state->wdt_packets = 0;          /* transport/parse error breaks consecutive WDT frames */
 	if (state->bad_packets < 255) {
 		state->bad_packets++;
 	}
@@ -191,8 +201,11 @@ lancelot_nt36672_state_wdt_recovery(struct lancelot_nt36672_state *state,
 	const uint8_t *packet, uint32_t length, lancelot_nt36672_emit emit,
 	void *context)
 {
-	if (state == NULL || packet == NULL ||
-	    length != LANCELOT_NT36672_PACKET_BYTES) {
+	if (state == NULL) {
+		return false;
+	}
+	if (packet == NULL || length != LANCELOT_NT36672_PACKET_BYTES) {
+		state->wdt_packets = 0;
 		return false;
 	}
 	if (wdt_pattern(packet)) {
@@ -217,7 +230,7 @@ lancelot_nt36672_state_consume(struct lancelot_nt36672_state *state,
 {
 	unsigned i;
 
-	if (state == NULL || report == NULL) {
+	if (state == NULL || report == NULL || !report->valid) {
 		return false;
 	}
 	if ((report->present_mask & (uint16_t)~0x03ffu) != 0) {

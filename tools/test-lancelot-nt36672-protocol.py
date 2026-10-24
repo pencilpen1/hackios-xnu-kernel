@@ -16,6 +16,7 @@ FIXTURE = r'''
 #include <stdlib.h>
 #include <string.h>
 #include "lancelot_nt36672_protocol.h"
+#include "lancelot_touch_selftest.h"
 struct sample { uint32_t type, finger, x, y; };
 static struct sample out[128]; static unsigned out_count;
 static void emit(void *unused, uint32_t type, uint32_t finger, uint32_t x, uint32_t y) {
@@ -90,6 +91,35 @@ int main(void) {
         for (unsigned i = 0; i < sizeof(noise); ++i) noise[i] = (uint8_t)(i * 37u + n * 13u);
         (void)lancelot_nt36672_parse(noise, n, &r);
     }
+    unsigned failed = lancelot_touch_protocol_selftest();
+    if (failed) { fprintf(stderr, "shared protocol selftest failed at line %u\n", failed); return 1; }
+    /* Deterministic fuzz: real short allocations, checksum-valid noise and
+       valid random multi-contact frames. Failed parses must not be consumable. */
+    uint32_t seed = 0x36672a;
+    lancelot_nt36672_state_init(&s);
+    for (unsigned iteration = 0; iteration < 20000; ++iteration) {
+        unsigned len = iteration % 68;
+        uint8_t *buf = malloc(len ? len : 1); assert(buf);
+        for (unsigned j = 0; j < len; ++j) {
+            seed = seed * 1664525u + 1013904223u; buf[j] = (uint8_t)(seed >> 24);
+        }
+        if (len == 66 && (iteration & 1)) checksum(buf);
+        enum lancelot_nt36672_packet_result result = lancelot_nt36672_parse(buf, len, &r);
+        reset_out();
+        if (result == LANCELOT_NT36672_PACKET_OK) assert(lancelot_nt36672_state_consume(&s, &r, emit, NULL));
+        else assert(!r.valid && !lancelot_nt36672_state_consume(&s, &r, emit, NULL));
+        (void)lancelot_nt36672_state_wdt_recovery(&s, buf, len, emit, NULL);
+        free(buf);
+        memset(p, 0, sizeof(p));
+        for (unsigned j = 0; j < 10; ++j) {
+            seed = seed * 1664525u + 1013904223u;
+            if (seed & 1) slot(p, j, j + 1, 2, (seed >> 3) % 1081, (seed >> 12) % 2341);
+        }
+        checksum(p); reset_out();
+        assert(lancelot_nt36672_parse(p, 66, &r) == LANCELOT_NT36672_PACKET_OK);
+        assert(lancelot_nt36672_state_consume(&s, &r, emit, NULL));
+    }
+    puts("Shared boot fixtures plus 20000 deterministic short/noisy/valid-frame fuzz iterations passed");
     puts("NT36672 protocol: checksum, bounds, IDs, multi-touch, transitions, WDT recovery and release passed");
 }
 '''
