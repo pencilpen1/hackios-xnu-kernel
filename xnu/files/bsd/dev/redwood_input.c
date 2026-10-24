@@ -15,6 +15,7 @@
 #include <pexpert/pexpert.h>
 
 #define TOUCH_QUEUE     512             /* records; a power of two */
+#define TOUCH_CONTACTS  10              /* matches backboardd's MAX_FINGERS */
 
 /*
  * Boot-arg touch_lat=1: for measuring how long a touch takes to reach the panel, a line for every
@@ -60,6 +61,8 @@ static LCK_GRP_DECLARE(touch_lck_grp, "redwood-touch");
 static LCK_MTX_DECLARE(touch_lock, &touch_lck_grp);
 static struct redwood_touch touch_queue[TOUCH_QUEUE];
 static uint32_t touch_head, touch_tail;        /* read from head, add at tail */
+static bool queued_contact[TOUCH_CONTACTS];
+static uint32_t queued_x[TOUCH_CONTACTS], queued_y[TOUCH_CONTACTS];
 
 /*
  * The way out when nothing else is at hand: five fingers held on the screen for a second and a
@@ -73,6 +76,7 @@ extern void loader_return(void);
 
 static thread_call_t exit_call;
 static uint32_t fingers_down;           /* one bit for each finger a driver says is down */
+static uint32_t touch_exit_enabled = 1;  /* keep the historical escape gesture unless explicitly disabled */
 
 static void
 exit_hold_elapsed(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
@@ -89,7 +93,8 @@ count_fingers(uint32_t type, uint32_t finger)
 	int before = __builtin_popcount(fingers_down), now;
 	uint64_t deadline;
 
-	if (finger >= 32 || exit_call == NULL || (type != REDWOOD_TOUCH_DOWN && type != REDWOOD_TOUCH_UP)) {
+	if (!touch_exit_enabled || finger >= 32 || exit_call == NULL ||
+	    (type != REDWOOD_TOUCH_DOWN && type != REDWOOD_TOUCH_UP)) {
 		return;
 	}
 	if (type == REDWOOD_TOUCH_DOWN) {
@@ -107,14 +112,10 @@ count_fingers(uint32_t type, uint32_t finger)
 }
 
 static void
-touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver)
+touch_enqueue(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
 {
 	struct redwood_touch *t;
 
-	lck_mtx_lock(&touch_lock);
-	if (touch_tail - touch_head == TOUCH_QUEUE) {
-		touch_head++;                   /* nobody reads: drop the oldest */
-	}
 	t = &touch_queue[touch_tail++ % TOUCH_QUEUE];
 	t->time = mach_absolute_time();
 	if (latency_lines()) {
@@ -127,6 +128,50 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 	t->finger = finger;
 	t->x = x > 65535 ? 65535 : x;
 	t->y = y > 65535 ? 65535 : y;
+}
+
+static void
+touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver)
+{
+	bool touch_record = type >= REDWOOD_TOUCH_DOWN && type <= REDWOOD_TOUCH_UP;
+	bool was_down;
+	uint32_t i;
+
+	lck_mtx_lock(&touch_lock);
+	was_down = touch_record && finger < TOUCH_CONTACTS && queued_contact[finger];
+	if (touch_tail - touch_head >= TOUCH_QUEUE) {
+		/*
+		 * A dropped DOWN or UP can strand a virtual HID contact forever. Reset
+		 * the unread stream as a complete HID synchronization barrier: release
+		 * all ten possible HID slots, then restore the producer's current state.
+		 * A producer slot that is already up may still be down in unread HID state
+		 * (its UP may be among the discarded records), so release all ten.
+		 */
+		/* Leave the unread stream empty before inserting the barrier. */
+		touch_head = touch_tail;
+		for (i = 0; i < TOUCH_CONTACTS; i++) {
+			touch_enqueue(REDWOOD_TOUCH_UP, i, queued_x[i], queued_y[i]);
+		}
+		for (i = 0; i < TOUCH_CONTACTS; i++) {
+			if (queued_contact[i]) {
+				touch_enqueue(REDWOOD_TOUCH_DOWN, i, queued_x[i], queued_y[i]);
+			}
+		}
+	}
+	if (touch_record && finger < TOUCH_CONTACTS && type == REDWOOD_TOUCH_MOVE && !was_down) {
+		/* Re-establish a move whose DOWN was among the discarded records. */
+		touch_enqueue(REDWOOD_TOUCH_DOWN, finger, x, y);
+	}
+	touch_enqueue(type, finger, x, y);
+	if (touch_record && finger < TOUCH_CONTACTS) {
+		if (type == REDWOOD_TOUCH_DOWN || type == REDWOOD_TOUCH_MOVE) {
+			queued_contact[finger] = true;
+			queued_x[finger] = x > 65535 ? 65535 : x;
+			queued_y[finger] = y > 65535 ? 65535 : y;
+		} else {
+			queued_contact[finger] = false;
+		}
+	}
 	if (from_driver) {
 		count_fingers(type, finger);
 	}
@@ -213,6 +258,7 @@ redwood_input_init(void)
 	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-touch") == NULL) {
 		printf("redwood-touch: cannot create the device\n");
 	}
+	(void)PE_parse_boot_argn("touch_exit", &touch_exit_enabled, sizeof(touch_exit_enabled));
 	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
 	redwood_cpufreq_init();
 	redwood_virtio_input_init();
