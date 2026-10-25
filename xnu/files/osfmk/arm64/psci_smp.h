@@ -19,6 +19,7 @@ extern void             psci_smp_init(void);
 extern kern_return_t    psci_smp_start_cpu(int cpu);
 extern void             psci_smp_cpu_reached(uint32_t stage);
 extern void             psci_smp_cpu_running(void);
+extern void             psci_smp_report_caches(void);
 extern void             psci_smp_cpu_off(void) __dead2;
 
 extern void             psci_smp_stop_others(void);

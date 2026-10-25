@@ -34,6 +34,7 @@ for file in bsd/dev/lancelot_usb.c bsd/dev/lancelot_musb.h bsd/dev/lancelot_emmc
             bsd/dev/lancelot_spi.h bsd/dev/lancelot_touch_platform.h bsd/dev/lancelot_touch.c \
              bsd/dev/lancelot_nt36672_hw.c bsd/dev/lancelot_nt36672_hw.h \
              bsd/dev/lancelot_smp.h \
+             bsd/dev/lancelot_cache.h \
             bsd/dev/lancelot_ext4.h bsd/dev/lancelot_sha256.h bsd/dev/redwood_input.c bsd/sys/redwood_input.h \
             bsd/miscfs/apfs/apfs_vfsops.c; do
   if ! cmp -s "xnu/files/$file" "xnu-src/xnu-8796.121.2/$file"; then
@@ -47,6 +48,7 @@ python3 tools/test-lancelot-nt36672-protocol.py
 python3 tools/test-lancelot-touch-queue.py
 python3 tools/test-lancelot-touch-hardware.py
 python3 tools/test-lancelot-smp.py
+python3 tools/test-lancelot-cache.py
 KERNEL=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
 # XNU's build target performs setup/header export/compile/link. The all/config
 # target additionally checks unavailable DriverKit RPC exports and builds kext

@@ -31,6 +31,7 @@ extern uint32_t processor_avail_count;
 void psci_smp_init(void);
 kern_return_t psci_smp_start_cpu(int cpu);
 void psci_smp_cpu_running(void);
+void psci_smp_report_caches(void);
 void psci_smp_cpu_off(void) __dead2;
 void gic_v3_irq_signal(uint32_t phys_id);
 }
@@ -300,6 +301,7 @@ GenericARMPE::start(IOService * provider)
 		if (count > 1) {
 			IOLog("GenericARMPE: %u of %u processors are running\n", processor_avail_count, count);
 		}
+		psci_smp_report_caches(); /* prints captured per-CPU state from thread context */
 	}
 
 	if (cpus[master_cpu] == NULL) {

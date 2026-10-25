@@ -35,6 +35,9 @@
 #include <kern/debug.h>
 #include <kern/kalloc.h>
 #include <kern/misc_protos.h>
+#include <kern/thread.h>
+#include <kern/sched_prim.h>
+#include <kern/processor.h>
 #include <libkern/kernel_mach_header.h>
 #include <machine/atomic.h>
 #include <arm/caches_internal.h>
@@ -47,7 +50,9 @@
 #include <pexpert/device_tree.h>
 #include <pexpert/arm64/board_config.h>
 #include <vm/pmap.h>
+#include <vm/vm_kern.h>
 #include "../../bsd/dev/lancelot_smp.h"
+#include "../../bsd/dev/lancelot_cache.h"
 
 #if defined(GENERIC_PSCI_SMP)
 
@@ -91,6 +96,194 @@ _Static_assert(__builtin_offsetof(struct psci_smp_entry_note, vector) == 32 &&
     __builtin_offsetof(struct psci_smp_entry_note, final_el) == 64 &&
     __builtin_offsetof(struct psci_smp_entry_note, fault_esr) == 96, "entry assembly note offsets");
 static bool psci_smp_mtk;
+static bool psci_smp_cache_enabled;
+static bool psci_smp_cache_test_enabled, psci_smp_cache_test_started;
+extern kern_return_t thread_terminate(thread_t);
+static void psci_smp_cache_test(void *, wait_result_t);
+struct psci_smp_cache_snapshot {
+	uint64_t mpidr, midr, sctlr, ctr, clidr, mmfr2, ccsidr[7][2];
+	uint32_t ready;
+};
+static struct psci_smp_cache_snapshot psci_smp_caches[MAX_CPUS];
+
+/* Called on the CPU itself, IRQs masked by initCPU. CSSELR selection does
+ * not change cache data/configuration and must be restored. No console I/O. */
+static void
+psci_smp_capture_cache(void)
+{
+	struct psci_smp_cache_snapshot *s = &psci_smp_caches[cpu_number()];
+	s->mpidr = __builtin_arm_rsr64("MPIDR_EL1");
+	s->midr = __builtin_arm_rsr64("MIDR_EL1");
+	s->sctlr = __builtin_arm_rsr64("SCTLR_EL1");
+	s->ctr = __builtin_arm_rsr64("CTR_EL0");
+	s->clidr = __builtin_arm_rsr64("CLIDR_EL1");
+	s->mmfr2 = __builtin_arm_rsr64("ID_AA64MMFR2_EL1");
+	uint64_t saved = __builtin_arm_rsr64("CSSELR_EL1");
+	for (unsigned level = 0; level < 7; level++) {
+		unsigned type = (unsigned)(s->clidr >> (3 * level)) & 7;
+		if (!type) break;
+		if (type > 4) break; /* reserved: report raw CLIDR, do not select it */
+		if (type >= 2) {
+			__builtin_arm_wsr64("CSSELR_EL1", level << 1);
+			__builtin_arm_isb(ISB_SY);
+			s->ccsidr[level][0] = __builtin_arm_rsr64("CCSIDR_EL1");
+		}
+		if (type == 1 || type == 3) {
+			__builtin_arm_wsr64("CSSELR_EL1", (level << 1) | 1);
+			__builtin_arm_isb(ISB_SY);
+			s->ccsidr[level][1] = __builtin_arm_rsr64("CCSIDR_EL1");
+		}
+	}
+	__builtin_arm_wsr64("CSSELR_EL1", saved);
+	__builtin_arm_isb(ISB_SY);
+	os_atomic_store(&s->ready, 1, release);
+}
+
+void
+psci_smp_report_caches(void)
+{
+	if (!psci_smp_cache_enabled) return;
+	for (unsigned cpu = 0; cpu <= (unsigned)ml_get_max_cpu_number(); cpu++) {
+		struct psci_smp_cache_snapshot *s = &psci_smp_caches[cpu];
+		if (!os_atomic_load(&s->ready, acquire)) { printf("lancelot-cache: cpu=%u snapshot unavailable\n", cpu); continue; }
+		unsigned ccidx = (unsigned)(s->mmfr2 >> 20) & 15;
+		printf("lancelot-cache: cpu=%u MPIDR=%llx MIDR=%llx SCTLR=%llx MMU=%u D-cache=%u I-cache=%u CLIDR=%llx CTR=%llx CCIDX=%u\n",
+		    cpu, s->mpidr, s->midr, s->sctlr, !!(s->sctlr & 1), !!(s->sctlr & 4), !!(s->sctlr & 4096), s->clidr, s->ctr, ccidx);
+		for (unsigned level = 0; level < 7; level++) {
+			unsigned type = (unsigned)(s->clidr >> (3 * level)) & 7;
+			if (!type) {
+				for (unsigned absent = level; absent < 3; absent++) printf("lancelot-cache: cpu=%u L%u absent architecturally\n", cpu, absent + 1);
+				break;
+			}
+			if (type > 4) { printf("lancelot-cache: cpu=%u L%u reserved type=%u; not decoded\n", cpu, level + 1, type); break; }
+			for (unsigned kind = 0; kind < 2; kind++) {
+				if ((kind == 0 && type < 2) || (kind == 1 && type != 1 && type != 3)) continue;
+				struct lancelot_cache_geometry g;
+				if (!lancelot_cache_geometry(s->ccsidr[level][kind], ccidx, &g)) {
+					printf("lancelot-cache: cpu=%u L%u unsupported CCSIDR layout=%u\n", cpu, level + 1, ccidx); continue;
+				}
+				printf("lancelot-cache: cpu=%u L%u%s CCSIDR=%llx line=%u ways=%u sets=%u bytes=%llu\n", cpu, level + 1,
+				    kind ? "I" : type == 4 ? "U" : "D", s->ccsidr[level][kind], g.line, g.ways, g.sets, g.bytes);
+			}
+		}
+	}
+	printf("lancelot-cache: hardware configuration captured; hit latency/coherency still require functional tests\n");
+	if (psci_smp_cache_test_enabled && !psci_smp_cache_test_started) {
+		thread_t thread;
+		psci_smp_cache_test_started = true;
+		if (kernel_thread_start(psci_smp_cache_test, NULL, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+		else printf("lancelot-cache: functional test thread unavailable\n");
+	}
+}
+
+static bool
+psci_smp_cache_bind(unsigned cpu)
+{
+	if (cpu >= MAX_CPUS || !processor_array[cpu] || !os_atomic_load(&psci_smp_caches[cpu].ready, acquire)) return false;
+	thread_bind(processor_array[cpu]);
+	thread_block(THREAD_CONTINUE_NULL);
+	return cpu_number() == (int)cpu;
+}
+
+/* Release/acquire handshake over normal cached private RAM. No dc/ic/TLBI,
+ * no uncached mapping, and no interrupt masking in this functional test. */
+static struct {
+	uint64_t payload[8];
+	uint32_t turn, done, stop, bad;
+} psci_cache_coherence __attribute__((aligned(128)));
+
+static bool
+psci_cache_wait_turn(unsigned wanted, uint64_t deadline)
+{
+	while (os_atomic_load(&psci_cache_coherence.turn, acquire) != wanted) {
+		if (os_atomic_load(&psci_cache_coherence.stop, acquire) || mach_absolute_time() >= deadline) return false;
+	}
+	return true;
+}
+static void
+psci_cache_reader(void *arg, __unused wait_result_t result)
+{
+	unsigned cpu = (unsigned)(uintptr_t)arg;
+	uint64_t deadline; clock_interval_to_deadline(3, NSEC_PER_SEC, &deadline);
+	if (!psci_smp_cache_bind(cpu)) os_atomic_store(&psci_cache_coherence.bad, 1, release);
+	else for (unsigned round = 0; round < 1024; round++) {
+		if (!psci_cache_wait_turn(round * 2 + 1, deadline)) { os_atomic_store(&psci_cache_coherence.bad, 1, release); break; }
+		for (unsigned i = 0; i < 8; i++) {
+			uint64_t expected = ((uint64_t)round << 32) ^ ((uint64_t)cpu << 16) ^ (0x9e3779b97f4a7c15ULL * (i + 1));
+			if (psci_cache_coherence.payload[i] != expected) os_atomic_store(&psci_cache_coherence.bad, 1, release);
+		}
+		os_atomic_store(&psci_cache_coherence.turn, round * 2 + 2, release);
+	}
+	os_atomic_store(&psci_cache_coherence.done, 1, release);
+	thread_bind(PROCESSOR_NULL);
+	thread_terminate(current_thread());
+}
+static void
+psci_smp_cache_test(__unused void *arg, __unused wait_result_t result)
+{
+	/* Let normal startup run before taking measurements; diagnostic only. */
+	delay_for_interval(5, NSEC_PER_SEC);
+	const vm_size_t allocation = (4u << 20) + (65536u * sizeof(uint32_t));
+	vm_offset_t memory = 0;
+	if (kmem_alloc(kernel_map, &memory, allocation, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_DIAG) != KERN_SUCCESS) {
+		printf("lancelot-cache: functional allocation failed\n"); goto end;
+	}
+	uint32_t *order = (uint32_t *)(memory + (4u << 20));
+	const uint32_t sizes[] = {8192, 49152, 98304, 262144, 524288, 2097152, 4194304};
+	unsigned bad = 0;
+	for (unsigned cpu = 0; cpu <= (unsigned)ml_get_max_cpu_number(); cpu++) {
+		if (!psci_smp_cache_bind(cpu)) { printf("lancelot-cache: cpu=%u binding failed\n", cpu); bad++; continue; }
+		for (unsigned size = 0; size < sizeof(sizes) / sizeof(sizes[0]); size++) {
+			uint32_t nodes = sizes[size] / 64, index = 0, loops = nodes * (65536 / nodes + 1);
+			if (!lancelot_cache_ring((void *)memory, order, sizes[size], 64, 0x17a031u + cpu + size)) { bad++; break; }
+			index = order[0];
+			if (!lancelot_cache_chase((void *)memory, 64, nodes, nodes * 2, &index)) { bad++; break; }
+			uint64_t best = UINT64_MAX;
+			bool valid = true;
+			for (unsigned repeat = 0; repeat < 3; repeat++) {
+				uint64_t began = mach_absolute_time(), ns;
+				if (!lancelot_cache_chase((void *)memory, 64, nodes, loops, &index) || index != order[0]) { bad++; valid = false; break; }
+				absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+				if (ns < best) best = ns;
+			}
+			if (!valid || cpu_number() != (int)cpu || best == UINT64_MAX) {
+				printf("lancelot-cache: cpu=%u working-set=%u data/binding invalid; timing not accepted\n", cpu, sizes[size]);
+				bad++; break;
+			}
+			uint64_t tenth_ns = best * 10 / loops;
+			printf("lancelot-cache: cpu=%u working-set=%u dependent-load=%llu.%llu ns best-of-3 loops=%u data-valid=1\n",
+			    cpu, sizes[size], tenth_ns / 10, tenth_ns % 10, loops);
+		}
+	}
+	kmem_free(kernel_map, memory, allocation);
+	if (!psci_smp_cache_bind(0)) { bad++; goto finished; }
+	for (unsigned cpu = 1; cpu <= (unsigned)ml_get_max_cpu_number(); cpu++) {
+		psci_cache_coherence.turn = psci_cache_coherence.done = psci_cache_coherence.stop = psci_cache_coherence.bad = 0;
+		thread_t reader;
+		if (kernel_thread_start(psci_cache_reader, (void *)(uintptr_t)cpu, &reader) != KERN_SUCCESS) { bad++; break; }
+		thread_deallocate(reader);
+		uint64_t deadline; clock_interval_to_deadline(3, NSEC_PER_SEC, &deadline);
+		for (unsigned round = 0; round < 1024; round++) {
+			if (!psci_cache_wait_turn(round * 2, deadline)) { bad++; break; }
+			for (unsigned i = 0; i < 8; i++) psci_cache_coherence.payload[i] =
+			    ((uint64_t)round << 32) ^ ((uint64_t)cpu << 16) ^ (0x9e3779b97f4a7c15ULL * (i + 1));
+			os_atomic_store(&psci_cache_coherence.turn, round * 2 + 1, release);
+		}
+		if (!psci_cache_wait_turn(2048, deadline)) bad++;
+		os_atomic_store(&psci_cache_coherence.stop, 1, release);
+		while (!os_atomic_load(&psci_cache_coherence.done, acquire) && mach_absolute_time() < deadline) delay_for_interval(1, NSEC_PER_MSEC);
+		bool done = os_atomic_load(&psci_cache_coherence.done, acquire);
+		unsigned failed = os_atomic_load(&psci_cache_coherence.bad, acquire);
+		printf("lancelot-cache: coherence cpu0/cpu%u rounds=1024 %s done=%u\n", cpu, done && !failed ? "PASS" : "FAIL/timeout", done);
+		if (!done) { bad++; break; } /* do not reuse static storage while reader may still access it */
+		bad += failed;
+	}
+finished:
+	printf("lancelot-cache: bounded working-set/coherency test finished errors=%u; latency is not a per-level PMU hit proof\n", bad);
+end:
+	thread_bind(PROCESSOR_NULL);
+	thread_terminate(current_thread());
+}
 
 __attribute__((naked)) static void
 psci_smp_mtk_entry(void)
@@ -254,6 +447,10 @@ psci_smp_init(void)
 		psci_smp_hvc = 1;
 	}
 	psci_smp_mtk = lancelot_smp_boot_allowed(8);
+	uint32_t cache_mode = 0;
+	PE_parse_boot_argn("lancelot_cache", &cache_mode, sizeof(cache_mode));
+	psci_smp_cache_enabled = psci_smp_mtk && (cache_mode == 1 || cache_mode == 2);
+	psci_smp_cache_test_enabled = psci_smp_mtk && cache_mode == 2;
 }
 
 /* A processor other than the boot processor says how far it has come. */
@@ -267,6 +464,7 @@ psci_smp_cpu_reached(uint32_t stage)
 void
 psci_smp_cpu_running(void)
 {
+	if (psci_smp_cache_enabled) psci_smp_capture_cache();
 	psci_smp_cpu_reached(PSCI_SMP_CPU_RUNNING);
 	/* initCPU runs on the secondary with interrupts disabled. Publish the
 	 * atomic stage only; the CPU_ON caller prints after it observes RUNNING. */
