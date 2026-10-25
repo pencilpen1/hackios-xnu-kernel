@@ -47,6 +47,7 @@
 #include <pexpert/device_tree.h>
 #include <pexpert/arm64/board_config.h>
 #include <vm/pmap.h>
+#include "../../bsd/dev/lancelot_smp.h"
 
 #if defined(GENERIC_PSCI_SMP)
 
@@ -74,6 +75,42 @@ struct psci_smp_start_fault {
 	uint64_t valid, mpidr, esr, elr, far, lr, sp, unused;
 } psci_smp_start_fault __attribute__((aligned(64)));
 _Static_assert(sizeof(struct psci_smp_start_fault) == 64, "one cache line");
+
+/* MTK first-instruction evidence, supplied as PSCI context_id (physical).
+ * A separate cache line per CPU; no virtual pointers, stack or MMIO here. */
+struct psci_smp_entry_note {
+	uint64_t entered, mpidr, el, sctlr, vector, reset_data, entries, cpu_data;
+};
+static struct psci_smp_entry_note psci_smp_entry_notes[MAX_CPUS] __attribute__((aligned(64)));
+_Static_assert(sizeof(struct psci_smp_entry_note) == 64, "one physical evidence cache line");
+_Static_assert(__builtin_offsetof(struct psci_smp_entry_note, vector) == 32 &&
+    __builtin_offsetof(struct psci_smp_entry_note, reset_data) == 40 &&
+    __builtin_offsetof(struct psci_smp_entry_note, entries) == 48, "entry assembly note offsets");
+static bool psci_smp_mtk;
+
+__attribute__((naked)) static void
+psci_smp_mtk_entry(void)
+{
+	__asm__ volatile (
+	    "msr daifset, #0xf\n"
+	    "mov x9, #1\n"
+	    "str x9, [x0]\n"
+	    "mrs x9, mpidr_el1\n"
+	    "str x9, [x0, #8]\n"
+	    "mrs x9, CurrentEL\n"
+	    "str x9, [x0, #16]\n"
+	    "mrs x9, sctlr_el1\n"
+	    "str x9, [x0, #24]\n"
+	    "dc cvac, x0\n"
+	    "dsb sy\n"
+	    "ldr x9, [x0, #40]\n"
+	    "ldr x10, [x9, #8]\n" /* ResetHandlerData.cpu_data_entries */
+	    "str x10, [x0, #48]\n"
+	    "ldr x16, [x0, #32]\n"
+	    "dc cvac, x0\n"
+	    "dsb sy\n"
+	    "br x16\n"); /* unmodified reset_vector validates MPIDR and handler */
+}
 
 static uint32_t psci_smp_cpu_stage[MAX_CPUS];   /* PSCI_SMP_CPU_*, by cpu number */
 static uint32_t psci_smp_started;               /* a bit per core that CPU_ON was granted for */
@@ -124,6 +161,7 @@ psci_smp_init(void)
 	    size >= 3 && strncmp((const char *)prop, "hvc", 3) == 0) {
 		psci_smp_hvc = 1;
 	}
+	psci_smp_mtk = lancelot_smp_boot_allowed(8);
 }
 
 /* A processor other than the boot processor says how far it has come. */
@@ -138,6 +176,7 @@ void
 psci_smp_cpu_running(void)
 {
 	psci_smp_cpu_reached(PSCI_SMP_CPU_RUNNING);
+	printf("psci: cpu %d (MPIDR 0x%x) joined scheduler\n", cpu_number(), cpu_datap(cpu_number())->cpu_phys_id);
 }
 
 static void
@@ -163,6 +202,7 @@ psci_smp_start_cpu(int cpu)
 	uint32_t phys_id = cdp->cpu_phys_id, stage;
 	uint64_t entry = ml_static_vtop((vm_offset_t)&LowResetVectorBase);
 	uint64_t now, deadline;
+	uint64_t context = 0;
 	int64_t status;
 
 	/*
@@ -173,6 +213,17 @@ psci_smp_start_cpu(int cpu)
 	 * Clean, not flush: the processors that are running keep using all of it.
 	 */
 	psci_smp_start_fault.valid = 0;
+	if (psci_smp_mtk) {
+		struct psci_smp_entry_note *note = &psci_smp_entry_notes[cpu];
+		*note = (struct psci_smp_entry_note){.vector=entry,
+		    .reset_data=ml_static_vtop((vm_offset_t)&ResetHandlerData),
+		    .cpu_data=(uint64_t)(uintptr_t)CpuDataEntries[cpu].cpu_data_paddr};
+		context = ml_static_vtop((vm_offset_t)note);
+		printf("psci: cpu %d reset-data=0x%llx entries=0x%llx expected=0x%llx cpu-data=0x%llx handler=0x%llx\n",
+		    cpu, note->reset_data, (uint64_t)ResetHandlerData.cpu_data_entries,
+		    (uint64_t)ml_static_vtop((vm_offset_t)CpuDataEntries), note->cpu_data, (uint64_t)cdp->cpu_reset_handler);
+		entry = ml_static_vtop((vm_offset_t)&psci_smp_mtk_entry);
+	}
 	psci_smp_clean_segment("__TEXT");
 	psci_smp_clean_segment("__DATA_CONST");
 	psci_smp_clean_segment("__TEXT_EXEC");
@@ -183,10 +234,13 @@ psci_smp_start_cpu(int cpu)
 			CleanPoC_DcacheRegion((vm_offset_t)cpu_datap(other), sizeof(cpu_data_t));
 		}
 	}
+	CleanPoC_DcacheRegion((vm_offset_t)&ResetHandlerData, sizeof(ResetHandlerData));
+	CleanPoC_DcacheRegion((vm_offset_t)CpuDataEntries, sizeof(CpuDataEntries));
 	__builtin_arm_dsb(DSB_SY);
 
 	os_atomic_store(&psci_smp_cpu_stage[cpu], PSCI_SMP_CPU_ASKED, release);
-	status = psci_call(PSCI_CPU_ON, phys_id, entry, 0);
+	printf("psci: CPU_ON cpu %d MPIDR 0x%x entry=0x%llx\n", cpu, phys_id, entry);
+	status = psci_call(PSCI_CPU_ON, phys_id, entry, context);
 	if (status != 0) {
 		os_atomic_store(&psci_smp_cpu_stage[cpu], 0, release);
 		printf("psci: cpu %d (MPIDR 0x%x) was not started: the firmware answers %lld (%s)\n",
@@ -198,7 +252,7 @@ psci_smp_start_cpu(int cpu)
 	clock_interval_to_deadline(PSCI_SMP_START_SECONDS, NSEC_PER_SEC, &deadline);
 	do {
 		stage = os_atomic_load(&psci_smp_cpu_stage[cpu], acquire);
-		if (stage >= PSCI_SMP_CPU_RUNNING) {
+		if (stage == PSCI_SMP_CPU_RUNNING) {
 			return KERN_SUCCESS;
 		}
 		/* memory, not this processor's copy of it */
@@ -209,6 +263,12 @@ psci_smp_start_cpu(int cpu)
 		delay_for_interval(1, NSEC_PER_MSEC);
 		now = mach_absolute_time();
 	} while (now < deadline);
+	if (psci_smp_mtk) {
+		struct psci_smp_entry_note *note = &psci_smp_entry_notes[cpu];
+		FlushPoC_DcacheRegion((vm_offset_t)note, sizeof(*note));
+		printf("psci: cpu %d first-entry=%llu actual-MPIDR=0x%llx EL=%llu SCTLR=0x%llx reset-entries=0x%llx\n",
+		    cpu, note->entered, note->mpidr, note->el >> 2, note->sctlr, note->entries);
+	}
 
 	if (psci_smp_start_fault.valid != 0) {
 		struct psci_smp_start_fault *f = &psci_smp_start_fault;

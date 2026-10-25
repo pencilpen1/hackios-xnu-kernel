@@ -23,10 +23,10 @@ case "$MODE" in
   boot)
     # Continue through all checkpoints. Panic/exception return remains available.
     python3 xnuloader/mkpayload.py -o "$OUT/boot.xnup" "kernel=$KERNEL" \
-      --ubuntu-boot --cmdline 'cpus=1 touchscreen=0 gpu=0 wifi=0 adsp=0 root_apfs=lancelot_ios'
+      --ubuntu-boot --cmdline 'cpus=8 small_cores=0 small_cores_after=0 touchscreen=0 buttons=0 touch_exit=0 lancelot_touch=3 gpu=0 wifi=0 adsp=0 root_apfs=lancelot_ios sbstartup=observe sbactivation=local'
     # Runtime USB capture precedes console rendering; -v needlessly keeps the
     # framebuffer text console active and scrolling over iOS's first frames.
-    python3 tools/test-lancelot-payload.py "$OUT/boot.xnup" --expect-boot --expect-ubuntu --expect-graphics
+    python3 tools/test-lancelot-payload.py "$OUT/boot.xnup" --expect-boot --expect-ubuntu --expect-graphics --expect-cpus 8
     ;;
   checkpoint|sweep)
     # Checkpoint 1 is XNU's assembly entry, before MMU setup (C starts at 10).

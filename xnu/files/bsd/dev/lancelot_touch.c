@@ -15,6 +15,7 @@
 #include <sys/redwood_input.h>
 #include <sys/systm.h>
 #include "lancelot_storage.h"
+#include "lancelot_smp.h"
 #include "lancelot_spi.h"
 #include "lancelot_touch_platform.h"
 #include "lancelot_nt36672_hw.h"
@@ -246,7 +247,7 @@ lancelot_touch_init(void)
 	uint32_t mode = 0, cpus = 0;
 	thread_t thread;
 	if (started || !lancelot_touch_platform() || !PE_parse_boot_argn("lancelot_touch", &mode, sizeof(mode)) || !mode) return;
-	if (mode > 3 || !PE_parse_boot_argn("cpus", &cpus, sizeof(cpus)) || cpus != 1) {
+	if (mode > 3 || !PE_parse_boot_argn("cpus", &cpus, sizeof(cpus)) || !lancelot_smp_boot_allowed(cpus)) {
 		printf("lancelot-touch: refusing unsupported stage/SMP settings\n"); return;
 	}
 	started = true;

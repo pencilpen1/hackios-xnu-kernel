@@ -14,6 +14,7 @@
 #include <sys/proc.h>
 #include <sys/sysctl.h>
 #include "lancelot_musb.h"
+#include "lancelot_smp.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern size_t loader_log_snapshot(uint64_t, uint64_t *, uint8_t *, size_t);
@@ -76,7 +77,7 @@ static void lancelot_usb_init(void)
 	uint64_t offer[3]; uint32_t enabled = 1, cpus = 0;
 	PE_parse_boot_argn("lancelot_usb_log", &enabled, sizeof(enabled));
 	PE_parse_boot_argn("cpus", &cpus, sizeof(cpus));
-	if (!enabled || cpus != 1 || SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
+	if (!enabled || !lancelot_smp_boot_allowed(cpus) || SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
 	    SecureDTGetProperty(chosen, "lancelot-usb-log", &property, &size) != kSuccess || size != sizeof(offer)) return;
 	memcpy(offer, property, sizeof(offer));
 	if (offer[0] != 0x31474f4c4253554cULL || offer[1] != 0x11200000ULL) return;

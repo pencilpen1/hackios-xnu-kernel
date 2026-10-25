@@ -120,7 +120,8 @@ GenericARMCPU::start(IOService * provider)
 void
 GenericARMCPU::run(void)
 {
-	processor_start(machProcessor);
+	kern_return_t result = processor_start(machProcessor);
+	if (result != KERN_SUCCESS) IOLog("GenericARMCPU: cpu %u startup failed result=%d\n", (unsigned)getCPUNumber(), result);
 }
 
 /* On the processor itself, with its interrupts off, when it joins (or rejoins) the scheduler. */
@@ -268,6 +269,12 @@ GenericARMPE::start(IOService * provider)
 
 		PE_parse_boot_argn("small_cores_after", &later, sizeof(later));
 		cpus[master_cpu]->run();
+		/* The real platform expert and boot CPU are ready. Publish now,
+		 * before synchronous PSCI waits for other CPUs: seven bounded 5s
+		 * waits must not hide this initialized service from IOSecureBSDRoot's
+		 * 30s wait. Root validation still requires and calls this actual PE. */
+		registerService();
+		IOLog("GenericARMPE: initialized platform expert published before secondary CPU starts\n");
 		for (unsigned int number = 0; number < MAX_CPUS; number++) {
 			if (cpus[number] != NULL && number != (unsigned int)master_cpu) {
 				if (later != 0 && ml_get_topology_info()->cpus[number].l2_access_penalty != 0) {
@@ -295,8 +302,10 @@ GenericARMPE::start(IOService * provider)
 		}
 	}
 
-	/* BSD looks the platform expert up by class (IOSecureBSDRoot). */
-	registerService();
+	if (cpus[master_cpu] == NULL) {
+		IOLog("GenericARMPE: boot CPU unavailable; platform expert not published\n");
+		return false;
+	}
 
 	/* Stand-ins for the closed graphics drivers that the iOS window server talks to. */
 	MiniIOSurfaceStart(this);

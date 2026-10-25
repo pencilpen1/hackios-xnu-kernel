@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the actual generated MTK payload, including the boot-CPU-only policy."""
+"""Check the actual MTK payload, including an explicit expected CPU policy."""
 import argparse
 from pathlib import Path
 import struct
@@ -9,6 +9,7 @@ ap.add_argument("payload", type=Path)
 ap.add_argument("--expect-boot", action="store_true", help="require uninterrupted boot, without diagnostic stops")
 ap.add_argument("--expect-ubuntu", action="store_true", help="require the verified Ubuntu bootstrap source")
 ap.add_argument("--expect-graphics", action="store_true", help="require graphics boot without a verbose framebuffer console")
+ap.add_argument("--expect-cpus", type=int, choices=(1, 8), default=1, help="require exactly one cpus token, single-core or verified SMP")
 args = ap.parse_args()
 payload = args.payload.read_bytes()
 magic, size = struct.unpack_from("<II", payload)
@@ -35,7 +36,10 @@ if "ubuntu-boot" in entries:
     assert not {"ramdisk", "bootdisk", "rdres"}.intersection(entries), "conflicting bootstrap disks"
 assert entries["kernel"][:4] == bytes.fromhex("cffaedfe")
 cmdline = entries["cmdline"].rstrip(b"\0").decode()
-assert "cpus=1" in cmdline.split()
+assert [w for w in cmdline.split() if w.startswith("cpus=")] == [f"cpus={args.expect_cpus}"]
+if args.expect_cpus == 8:
+    assert "small_cores_after=0" in cmdline.split(), "all cores must start immediately"
+    assert "small_cores=0" in cmdline.split(), "MTK 6+2 topology must not use Redwood's 1:1 SMT pairing"
 if args.expect_graphics:
     assert "-v" not in cmdline.split(), "graphics boot must not force framebuffer text output"
 for word in cmdline.split():
@@ -52,4 +56,4 @@ if checkpoint is None:
 else:
     assert checkpoint in (b"1\0", b"2\0", b"3\0", b"4\0", b"5\0", b"10\0", b"998\0")
     mode = "checkpoint " + checkpoint.rstrip(b"\0").decode()
-print("XNUP validated: Mach-O kernel, bounded entries, boot-CPU-only arguments,", mode)
+print(f"XNUP validated: Mach-O kernel, bounded entries, cpus={args.expect_cpus},", mode)

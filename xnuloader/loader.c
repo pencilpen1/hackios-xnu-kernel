@@ -11,6 +11,7 @@
  */
 #include "efi.h"
 #include "identity.h"         /* who iOS shall think we are: from the iPhone's own device tree (mkidentity.py) */
+#include "../xnu/files/bsd/dev/lancelot_smp.h"
 
 /* ------------------------------------------------------------------------ */
 /* Fixed conventions shared with the boot shim, the packer and the kernel   */
@@ -2290,6 +2291,14 @@ psci_call(uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3)
 	return status;
 }
 
+static int64_t
+lancelot_cpu_affinity(uint32_t mpidr)
+{
+	int64_t state = psci_call(PSCI_AFFINITY_INFO, mpidr, 0, 0);
+	print("lancelot-smp: MPIDR %x affinity=%d\n", (uint64_t)mpidr, (uint64_t)state);
+	return state;
+}
+
 /*
  * Run the kernel on the core with that MPIDR and wait until it is back. Returns 0 when it has
  * been and gone (the caller goes on as after loader_return_stub), a negative number if the
@@ -2938,6 +2947,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	uint64_t this_mpidr = READ_SYSREG(MPIDR_EL1) & 0xFFFFFF, kernel_mpidr = this_mpidr;
 	/* "cpus=N" or "cpumask=M" there too: the kernel may have more cores than the one it starts on */
 	int more_cores = 0, battery_requested = 0, ufs_requested = 0;
+	struct lancelot_smp_offer smp_offer = {0};
 	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (bsd/dev/redwood_torch.c) */
 	int torch_requested = 0;
 	/* "cam=5" there too: the phone's wide camera is iOS's (bsd/dev/redwood_camera.c) */
@@ -2973,8 +2983,18 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			print("lancelot: same-core mode refuses secondary CPU and firmware-storage mailbox arguments\n");
 			return 0;
 		}
-		/* cpus=1 is not a request to query/start every core. Keep the known boot CPU. */
-		more_cores = 0;
+		int wanted = lancelot_cpu_request(pi.cmdline);
+		if (wanted < 0) { print("lancelot-smp: ambiguous/unsupported CPU request\n"); return 0; }
+		more_cores = wanted == 8;
+		if (more_cores) {
+			int64_t version = psci_call(0x84000000u, 0, 0, 0);
+			int64_t feature = psci_call(0x8400000au, PSCI_CPU_ON, 0, 0);
+			print("lancelot-smp: PSCI version=%x CPU_ON feature=%d\n", (uint64_t)version, (uint64_t)feature);
+			if (version < 0x10000 || feature < 0 ||
+			    !lancelot_smp_plan((uint32_t)this_mpidr, lancelot_cpu_affinity, &smp_offer)) {
+				print("lancelot-smp: eight-core preflight refused; no CPU_ON performed\n"); return 0;
+			}
+		}
 	}
 	if (battery_requested) {
 		charger_start();
@@ -3150,6 +3170,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_prop_u32(&w, "#size-cells", 2);
 
 	dt_begin(&w, "chosen");
+	if (PLAT == &platform_lancelot && more_cores)
+		dt_prop(&w, "lancelot-smp", &smp_offer, sizeof(smp_offer));
 	if (PLAT == &platform_lancelot && mtk_usb_offer[0] && kernel_mpidr == this_mpidr)
 		dt_prop(&w, "lancelot-usb-log", mtk_usb_offer, sizeof(mtk_usb_offer));
 	if (PLAT == &platform_lancelot && mtk_storage_info.magic == LANCELOT_STORAGE_MAGIC)
@@ -3282,7 +3304,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	uint64_t cpu_mpidr[8] = { kernel_mpidr };
 	int cpu_count = 1, boot_core = (int)(kernel_mpidr >> plat->core_shift);
 
-	if (more_cores) {
+	if (PLAT == &platform_lancelot && more_cores) {
+		cpu_count = 8;
+		for (int i = 0; i < 8; i++) cpu_mpidr[i] = smp_offer.mpidr[i];
+		print("lancelot-smp: verified eight CPU nodes; same boot MPIDR %x\n", this_mpidr);
+	} else if (more_cores) {
 		for (int distance = 1; distance < plat->cores; distance++) {
 			for (int side = 0; side < 2; side++) {
 				int core = side == 0 ? boot_core + distance : boot_core - distance;
@@ -3521,6 +3547,23 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		}
 	}
 	write_logs(klog, klog_len);
+	/* A failed SMP handoff can leave firmware USB unavailable. Show the
+	 * actual retained panic text, not merely the post-return MMU walk.
+	 * Bounded console output only; no filesystem writes or new run. */
+	if (PLAT == &platform_lancelot && more_cores && klog && klog_len && klog_len <= (1u << 20)) {
+		uint64_t found = klog_len;
+		for (uint64_t i = 0; i + 6 <= klog_len; i++) {
+			if (!memcmp(klog + i, "panic(", 6)) { found = i; break; }
+		}
+		print("\nlancelot-smp: RETURNED, not an eight-core success; kernel log excerpt:\n");
+		uint64_t at = found < klog_len ? found : klog_len > 1200 ? klog_len - 1200 : 0;
+		uint64_t end = klog_len - at > 1200 ? at + 1200 : klog_len;
+		for (uint64_t i = at; i < end; i++) {
+			char c = klog[i];
+			if (c == '\n' || (c >= 0x20 && c < 0x7f)) put_char(c);
+		}
+		print("\nlancelot-smp: end of excerpt; reboot required before another run\n");
+	}
 	return 1;
 }
 
