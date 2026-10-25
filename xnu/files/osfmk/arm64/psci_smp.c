@@ -76,16 +76,20 @@ struct psci_smp_start_fault {
 } psci_smp_start_fault __attribute__((aligned(64)));
 _Static_assert(sizeof(struct psci_smp_start_fault) == 64, "one cache line");
 
-/* MTK first-instruction evidence, supplied as PSCI context_id (physical).
- * A separate cache line per CPU; no virtual pointers, stack or MMIO here. */
+/* MTK entry handoff, supplied as PSCI context_id (physical). Firmware CPU_ON
+ * enters EL2 on this device; XNU's reset vector expects EL1. No stack, virtual
+ * pointers or MMIO before transition. Two dedicated cache lines per CPU. */
 struct psci_smp_entry_note {
 	uint64_t entered, mpidr, el, sctlr, vector, reset_data, entries, cpu_data;
+	uint64_t final_el, hcr, cntvoff, sctlr_el2, fault_esr, fault_elr, fault_far, reserved;
 };
-static struct psci_smp_entry_note psci_smp_entry_notes[MAX_CPUS] __attribute__((aligned(64)));
-_Static_assert(sizeof(struct psci_smp_entry_note) == 64, "one physical evidence cache line");
+static struct psci_smp_entry_note psci_smp_entry_notes[MAX_CPUS] __attribute__((aligned(128)));
+_Static_assert(sizeof(struct psci_smp_entry_note) == 128, "two physical evidence cache lines");
 _Static_assert(__builtin_offsetof(struct psci_smp_entry_note, vector) == 32 &&
     __builtin_offsetof(struct psci_smp_entry_note, reset_data) == 40 &&
-    __builtin_offsetof(struct psci_smp_entry_note, entries) == 48, "entry assembly note offsets");
+    __builtin_offsetof(struct psci_smp_entry_note, entries) == 48 &&
+    __builtin_offsetof(struct psci_smp_entry_note, final_el) == 64 &&
+    __builtin_offsetof(struct psci_smp_entry_note, fault_esr) == 96, "entry assembly note offsets");
 static bool psci_smp_mtk;
 
 __attribute__((naked)) static void
@@ -93,6 +97,7 @@ psci_smp_mtk_entry(void)
 {
 	__asm__ volatile (
 	    "msr daifset, #0xf\n"
+	    "mov x18, x0\n" /* physical context retained across ERET */
 	    "mov x9, #1\n"
 	    "str x9, [x0]\n"
 	    "mrs x9, mpidr_el1\n"
@@ -106,10 +111,97 @@ psci_smp_mtk_entry(void)
 	    "ldr x9, [x0, #40]\n"
 	    "ldr x10, [x9, #8]\n" /* ResetHandlerData.cpu_data_entries */
 	    "str x10, [x0, #48]\n"
-	    "ldr x16, [x0, #32]\n"
-	    "dc cvac, x0\n"
+	    "mrs x9, CurrentEL\n"
+	    "cmp x9, #4\n"
+	    "b.eq 70f\n" /* firmware may already supply EL1 on other revisions */
+	    "cmp x9, #8\n"
+	    "b.ne 95f\n" /* only observed EL2 or explicit EL1 is supported */
+	    "adr x9, 80f\n"
+	    "msr vbar_el2, x9\n" /* actual EL2 exception evidence, before setup */
+	    "isb\n"
+	    "mrs x9, sctlr_el2\n"
+	    "str x9, [x18, #88]\n"
+	    "tbnz x9, #0, 95f\n" /* PSCI CPU_ON must arrive with MMU disabled */
+	    "movz x9, #0x0830\n"
+	    "movk x9, #0x30c5, lsl #16\n" /* SCTLR_EL2 RES1, little endian/MMU off */
+	    "msr sctlr_el2, x9\n"
+	    "mov x9, #0x80000000\n" /* HCR.RW: EL1 AArch64, no stage2/VM/traps */
+	    "msr hcr_el2, x9\n"
+	    "str x9, [x18, #72]\n"
+	    "isb\n"
+	    "mrs x9, cnthctl_el2\n"
+	    "orr x9, x9, #3\n" /* Linux el2_setup: EL1 physical timer/counter */
+	    "msr cnthctl_el2, x9\n"
+	    "msr cntvoff_el2, xzr\n" /* same physical timebase as boot EL1 */
+	    "mrs x9, cntvoff_el2\n"
+	    "str x9, [x18, #80]\n"
+	    "mrs x9, id_aa64pfr0_el1\n"
+	    "ubfx x9, x9, #24, #4\n"
+	    "cbz x9, 95f\n" /* Lancelot requires the real GICv3 system interface */
+	    "mrs x9, ICC_SRE_EL2\n"
+	    "orr x9, x9, #1\n"
+	    "orr x9, x9, #8\n" /* SRE + Enable lower-EL system register access */
+	    "msr ICC_SRE_EL2, x9\n"
+	    "isb\n"
+	    "mrs x9, ICC_SRE_EL2\n"
+	    "tbz x9, #0, 95f\n"
+	    "msr ICH_HCR_EL2, xzr\n"
+	    "mrs x9, midr_el1\n"
+	    "msr vpidr_el2, x9\n"
+	    "mrs x9, mpidr_el1\n"
+	    "msr vmpidr_el2, x9\n"
+	    "msr hstr_el2, xzr\n"
+	    "msr vttbr_el2, xzr\n"
+	    "mov x9, #0x33ff\n" /* CPTR_EL2 RES1; no FP/ASIMD/debug trap */
+	    "msr cptr_el2, x9\n"
+	    "mov x11, xzr\n"
+	    "mrs x9, id_aa64dfr0_el1\n"
+	    "sbfx x9, x9, #8, #4\n"
+	    "cmp x9, #1\n"
+	    "b.lt 60f\n"
+	    "mrs x9, pmcr_el0\n"
+	    "ubfx x11, x9, #11, #5\n" /* Linux MDCR.HPMN, no EL1 debug traps */
+	    "60: msr mdcr_el2, x11\n"
+	    "movz x9, #0x0800\n"
+	    "movk x9, #0x30d0, lsl #16\n" /* XNU's pre-MMU EL1 RES1 state */
+	    "msr sctlr_el1, x9\n"
+	    "msr sp_el1, xzr\n" /* original reset flow supplies stacks before use */
+	    "mov x9, #0x3c5\n" /* DAIF masked, AArch64 EL1h */
+	    "msr spsr_el2, x9\n"
+	    "adr x9, 70f\n"
+	    "msr elr_el2, x9\n"
+	    "isb\n"
+	    "eret\n"
+	    "70: mrs x9, CurrentEL\n"
+	    "str x9, [x18, #64]\n"
+	    "cmp x9, #4\n"
+	    "b.ne 95f\n"
+	    "mov x9, #2\n"
+	    "str x9, [x18]\n"
+	    "dc cvac, x18\n"
+	    "add x9, x18, #64\n"
+	    "dc cvac, x9\n"
 	    "dsb sy\n"
-	    "br x16\n"); /* unmodified reset_vector validates MPIDR and handler */
+	    "ldr x16, [x18, #32]\n"
+	    "br x16\n" /* original reset_vector still validates MPIDR and handler */
+	    ".balign 2048\n"
+	    "80:\n.rept 16\n b 90f\n.balign 128\n.endr\n"
+	    "90: mrs x9, esr_el2\n"
+	    "str x9, [x18, #96]\n"
+	    "mrs x9, elr_el2\n"
+	    "str x9, [x18, #104]\n"
+	    "mrs x9, far_el2\n"
+	    "str x9, [x18, #112]\n"
+	    "95: mov x9, #255\n"
+	    "str x9, [x18]\n"
+	    "dc cvac, x18\n"
+	    "add x9, x18, #64\n"
+	    "dc cvac, x9\n"
+	    "dsb sy\n"
+	    "mov x0, #2\n"
+	    "movk x0, #0x8400, lsl #16\n"
+	    "smc #0\n" /* transition rejected/faulted: stop only this CPU */
+	    "96: wfi\n b 96b\n");
 }
 
 static uint32_t psci_smp_cpu_stage[MAX_CPUS];   /* PSCI_SMP_CPU_*, by cpu number */
@@ -176,7 +268,8 @@ void
 psci_smp_cpu_running(void)
 {
 	psci_smp_cpu_reached(PSCI_SMP_CPU_RUNNING);
-	printf("psci: cpu %d (MPIDR 0x%x) joined scheduler\n", cpu_number(), cpu_datap(cpu_number())->cpu_phys_id);
+	/* initCPU runs on the secondary with interrupts disabled. Publish the
+	 * atomic stage only; the CPU_ON caller prints after it observes RUNNING. */
 }
 
 static void
@@ -253,6 +346,13 @@ psci_smp_start_cpu(int cpu)
 	do {
 		stage = os_atomic_load(&psci_smp_cpu_stage[cpu], acquire);
 		if (stage == PSCI_SMP_CPU_RUNNING) {
+			printf("psci: cpu %d (MPIDR 0x%x) joined scheduler\n", cpu, phys_id);
+			if (psci_smp_mtk) {
+				struct psci_smp_entry_note *note = &psci_smp_entry_notes[cpu];
+				FlushPoC_DcacheRegion((vm_offset_t)note, sizeof(*note));
+				printf("psci: cpu %d transition initial-EL=%llu final-EL=%llu stage=%llu HCR=%llx CNTVOFF=%llx\n",
+				    cpu, note->el >> 2, note->final_el >> 2, note->entered, note->hcr, note->cntvoff);
+			}
 			return KERN_SUCCESS;
 		}
 		/* memory, not this processor's copy of it */
@@ -260,14 +360,19 @@ psci_smp_start_cpu(int cpu)
 		if (psci_smp_start_fault.valid != 0) {
 			break;
 		}
+		if (psci_smp_mtk) {
+			FlushPoC_DcacheRegion((vm_offset_t)&psci_smp_entry_notes[cpu], sizeof(psci_smp_entry_notes[cpu]));
+			if (psci_smp_entry_notes[cpu].entered == 255) break;
+		}
 		delay_for_interval(1, NSEC_PER_MSEC);
 		now = mach_absolute_time();
 	} while (now < deadline);
 	if (psci_smp_mtk) {
 		struct psci_smp_entry_note *note = &psci_smp_entry_notes[cpu];
 		FlushPoC_DcacheRegion((vm_offset_t)note, sizeof(*note));
-		printf("psci: cpu %d first-entry=%llu actual-MPIDR=0x%llx EL=%llu SCTLR=0x%llx reset-entries=0x%llx\n",
-		    cpu, note->entered, note->mpidr, note->el >> 2, note->sctlr, note->entries);
+		printf("psci: cpu %d entry-stage=%llu actual-MPIDR=0x%llx initial-EL=%llu final-EL=%llu HCR=%llx CNTVOFF=%llx reset-entries=%llx fault=%llx/%llx/%llx\n",
+		    cpu, note->entered, note->mpidr, note->el >> 2, note->final_el >> 2, note->hcr, note->cntvoff,
+		    note->entries, note->fault_esr, note->fault_elr, note->fault_far);
 	}
 
 	if (psci_smp_start_fault.valid != 0) {

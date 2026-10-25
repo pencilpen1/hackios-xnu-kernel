@@ -104,6 +104,9 @@ print('Real platform expert publication precedes secondary startup waits; secure
 # Cross-compile the actual physical entry function: verify no implicit C stack
 # or helper call is introduced before the architectural reset vector.
 psci = (ROOT / 'xnu/files/osfmk/arm64/psci_smp.c').read_text()
+running = psci[psci.index('psci_smp_cpu_running(void)'):psci.index('static void\npsci_smp_clean_segment')]
+assert 'printf(' not in running and 'IOLog(' not in running, 'interrupt-off CPU startup must only publish state'
+print('Secondary initCPU notification is atomic-only; console output remains in the CPU_ON caller')
 begin = psci.index('__attribute__((naked)) static void\npsci_smp_mtk_entry(')
 end = psci.index('\nstatic uint32_t psci_smp_cpu_stage', begin)
 with tempfile.TemporaryDirectory(prefix='lancelot-entry-') as tmp:
@@ -116,6 +119,13 @@ with tempfile.TemporaryDirectory(prefix='lancelot-entry-') as tmp:
     dump = subprocess.check_output(['llvm-objdump', '-d', str(obj)], text=True)
     assert re.search(r'\bbr\s+x16\b', dump)
     assert not re.search(r'\b(?:bl|blr|sp)\b', dump), dump
+    assert re.search(r'\beret\b', dump), 'EL2 must use exception return, not branch to EL1 code'
+    for register in ['hcr_el2', 'cnthctl_el2', 'cntvoff_el2', 'spsr_el2', 'elr_el2', 'vbar_el2', 'cptr_el2', 'mdcr_el2']:
+        assert register in dump.lower(), register
+    assert 'b.eq 70f' in psci and '"cmp x9, #8\\n"' in psci, 'EL1 path must bypass EL2 register writes'
+    assert '"mov x9, #0x3c5\\n"' in psci, 'AArch64 EL1h with DAIF masked'
+    assert '"mov x9, #0x80000000\\n"' in psci, 'HCR RW, no stage2/interrupt routing'
+    assert '"cmp x9, #4\\n"' in psci, 'actual EL1 must be checked after ERET'
     assert 'PSCI_CPU_ON, phys_id, entry, context' in psci
     assert 'stage == PSCI_SMP_CPU_RUNNING' in psci
-    print('Actual AArch64 first-entry shim: stackless, no C calls, physical note then original reset vector; OFF is not RUNNING')
+    print('Actual AArch64 entry: stackless, guarded EL1/EL2, ERET to EL1h, timer/GIC/trap setup, original reset validation; OFF is not RUNNING')
