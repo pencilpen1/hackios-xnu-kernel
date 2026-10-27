@@ -109,6 +109,7 @@ static void wr(void*o,uint32_t r,uint32_t x) {
                 assert(((rt[1]>>8)&0xfu)==2u);   /* linear */
                 assert(rt[1]&1u);                /* write enable */
                 assert(rt[1]&(1u<<31));          /* clean pixel write */
+                assert(((rt[1]>>16)&0xfffu)==0x688u); /* identity RGBA swizzle */
                 assert(rt[10]==width*4u);
                 uint32_t color=rt[12];
                 assert(rt[13]==color&&rt[14]==color&&rt[15]==color);

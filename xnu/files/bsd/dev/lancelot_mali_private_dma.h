@@ -64,9 +64,11 @@ static inline void lm_v7_clear_prepare(uint32_t page[LM_PAGE_SIZE/4],
     /* D24 z internal format; no z/s write or clear. */
     fbd[12]=1u<<16;
     uint32_t *rt=page+32; /* Framebuffer aggregate is 128 bytes. */
-    /* RGBA8 internal format, linear writeback, dithering, clean tile write. */
+    /* RGBA8 internal format, linear writeback, dithering, clean tile write.
+     * The identity component swizzle is 0x688 (X, Y<<3, Z<<6, W<<9), not 0:
+     * zero maps every component to R and hardware writes 0xRRRRRRRR. */
     rt[0]=1u<<26;
-    rt[1]=1u|(19u<<3)|(2u<<8)|(1u<<15)|(1u<<31);
+    rt[1]=1u|(19u<<3)|(2u<<8)|(1u<<15)|(UINT32_C(0x688)<<16)|(1u<<31);
     rt[8]=(uint32_t)output_va;rt[9]=(uint32_t)(output_va>>32);
     rt[10]=LM_CLEAR_WIDTH*LM_CLEAR_BPP;
     rt[11]=0; /* surface stride is only set for layered MSAA */
