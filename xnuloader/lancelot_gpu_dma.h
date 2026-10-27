@@ -8,12 +8,14 @@
 #include "lancelot_gpu_prepare.h"
 #include "lancelot_gpu_shaders.h"
 #include "../xnu/files/bsd/dev/lancelot_mali_private_dma.h"
-#define LFD_PAGES 32u
-#define LFD_USABLE_LAST 30u
-#define LFD_GUARD_PAGE 31u
+#define LFD_PAGES 1054u
+#define LFD_USABLE_LAST 1052u
+#define LFD_GUARD_PAGE 1053u
+#define LFD_MASK_WORDS ((LFD_PAGES+63u)/64u)
 #define LFD_MIN_PA UINT64_C(0x40280000)
 #define LFD_MAX_PA UINT64_C(0x44000000)
 #define LFD_TRACE_MAX 512u
+#define LFD_METADATA_BYTES 65536u
 struct lfd_trace_event {uint32_t off,value;int error;bool read;};
 struct lfd_memory_ops {
     void *cookie;
@@ -32,8 +34,10 @@ struct lfd_context {
     uint8_t *arena;
     uint64_t pa;
     size_t metadata_used;
+    uint8_t metadata_pool[LFD_METADATA_BYTES];
     struct { void *pointer; size_t size; } metadata[24];
-    unsigned page_mask,peak_pages,metadata_active,gpu_reads,gpu_writes,cleans,invalidates;
+    uint64_t page_mask[LFD_MASK_WORDS];
+    unsigned peak_pages,metadata_active,gpu_reads,gpu_writes,cleans,invalidates;
     int io_error,release_error;
     int first_io_error;
     uint32_t first_io_reg,first_io_phase,phase;
@@ -42,6 +46,20 @@ struct lfd_context {
     struct lfd_trace_event trace[LFD_TRACE_MAX];
     unsigned trace_count,trace_dropped;
 };
+static bool lfd_page_used(const struct lfd_context *f,unsigned i) {
+    return i<LFD_PAGES && (f->page_mask[i>>6]&(UINT64_C(1)<<(i&63)));
+}
+static void lfd_page_set(struct lfd_context *f,unsigned i) {
+    if(i<LFD_PAGES)f->page_mask[i>>6]|=UINT64_C(1)<<(i&63);
+}
+static void lfd_page_clear(struct lfd_context *f,unsigned i) {
+    if(i<LFD_PAGES)f->page_mask[i>>6]&=~(UINT64_C(1)<<(i&63));
+}
+static unsigned lfd_page_count(const struct lfd_context *f) {
+    unsigned n=0;
+    for(unsigned i=0;i<LFD_MASK_WORDS;i++)n+=__builtin_popcountll(f->page_mask[i]);
+    return n;
+}
 /* Never print or call firmware while the bounded GPU lifecycle runs. Keep the
  * first events and the latest event on overflow; the receipt retains failures. */
 static void lfd_record_trace(struct lfd_context*f,bool read,uint32_t off,uint32_t value,int error) {
@@ -63,6 +81,7 @@ static int lfd_prepare(struct lfd_context *f,struct lpg_context *platform,
     if(!f || f->initialized || !platform || !mem || !mem->allocate || !mem->release ||
        !mem->check_page || !mem->cache || !mem->barrier)return LM_EINVAL;
     f->initialized=true;f->platform=platform;f->mem=*mem;
+    memset(f->metadata_pool,0,sizeof(f->metadata_pool));f->metadata_used=0;
     void *cpu=NULL;uint64_t pa=0;
     int error=mem->allocate(mem->cookie,&cpu,&pa,LFD_PAGES);
     if(error)return error;
@@ -82,9 +101,10 @@ static int lfd_prepare(struct lfd_context *f,struct lpg_context *platform,
 }
 static void *lfd_alloc(void *cookie,size_t n) {
     struct lfd_context*f=cookie;
-    if(!n || n>4096 || f->metadata_used>4096-((n+15u)&~15u))return NULL;
+    if(!n || n>LFD_METADATA_BYTES ||
+       f->metadata_used>LFD_METADATA_BYTES-((n+15u)&~15u))return NULL;
     for(unsigned i=0;i<24;i++)if(!f->metadata[i].pointer) {
-        void *p=f->arena+f->metadata_used;f->metadata_used+=(n+15u)&~15u;
+        void *p=f->metadata_pool+f->metadata_used;f->metadata_used+=(n+15u)&~15u;
         f->metadata[i].pointer=p;f->metadata[i].size=n;f->metadata_active++;
         memset(p,0,n);return p;
     }
@@ -101,14 +121,14 @@ static int lfd_page_index(struct lfd_context*f,void *p) {
     uintptr_t v=(uintptr_t)p,a=(uintptr_t)f->arena;
     if(v<a+4096u || v>=a+(LFD_USABLE_LAST+1u)*4096u || ((v-a)&4095u))return -1;
     unsigned i=(unsigned)((v-a)/4096u);
-    return (f->page_mask&(1u<<i))?(int)i:-1;
+    return lfd_page_used(f,i)?(int)i:-1;
 }
 static int lfd_page_alloc(void *cookie,struct lm_page *p) {
     struct lfd_context*f=cookie;
-    for(unsigned i=1;i<=LFD_USABLE_LAST;i++)if(!(f->page_mask&(1u<<i))) {
-        f->page_mask|=1u<<i;p->cpu=f->arena+i*4096u;p->pa=f->pa+i*4096u;
+    for(unsigned i=1;i<=LFD_USABLE_LAST;i++)if(!lfd_page_used(f,i)) {
+        lfd_page_set(f,i);p->cpu=f->arena+i*4096u;p->pa=f->pa+i*4096u;
         memset(p->cpu,0,4096u);
-        unsigned count=0;for(unsigned j=1;j<=LFD_USABLE_LAST;j++)if(f->page_mask&(1u<<j))count++;
+        unsigned count=lfd_page_count(f);
         if(count>f->peak_pages)f->peak_pages=count;
         return LM_OK;
     }
@@ -117,7 +137,7 @@ static int lfd_page_alloc(void *cookie,struct lm_page *p) {
 static void lfd_page_free(void *cookie,struct lm_page *p) {
     struct lfd_context*f=cookie;int i=lfd_page_index(f,p->cpu);
     if(i<0 || p->pa!=f->pa+(unsigned)i*4096u){f->io_error=LM_EIO;return;}
-    f->page_mask&=~(1u<<(unsigned)i);p->cpu=NULL;p->pa=0;
+    lfd_page_clear(f,(unsigned)i);p->cpu=NULL;p->pa=0;
 }
 static void lfd_cache(struct lfd_context*f,void *p,size_t n,bool after) {
     if(f->io_error)return;
@@ -186,7 +206,7 @@ static bool lfd_write_allowed(struct lfd_context*f,uint32_t off,uint32_t value) 
     case 0xf00:case 0xf04:case 0xf08:case 0xf0c:return true; // Shared core RMW + readback.
     case 0x2400:
         return value==0 || (value>=f->pa+4096u && value<f->pa+(LFD_USABLE_LAST+1u)*4096u &&
-            !(value&4095u) && (f->page_mask&(1u<<((value-f->pa)/4096u))));
+            !(value&4095u) && lfd_page_used(f,(unsigned)((value-f->pa)/4096u)));
     case 0x2404:case 0x240c:case 0x2414:case 0x2434:
         return value==(off==0x240c?0x4c8du:0u);
     case 0x2408:return value==0x888d8f88u;
@@ -263,7 +283,7 @@ static int lfd_run(void *cookie,struct lmp_state *state,const struct lpg_feature
     if(f->recovery_attempted || f->recovering || f->io_error || f->first_io_error)
         f->transaction.expected_fault=false;
     f->safe_to_teardown=f->transaction.cleaned && !f->transaction.cleanup_error && !f->io_error &&
-        !f->page_mask && !f->metadata_active;
+        !lfd_page_count(f) && !f->metadata_active;
     *safe=f->safe_to_teardown;
     if(!*safe)return e?e:LM_EBUSY;
     for(unsigned i=0;i<1024;i++)if(((uint32_t *)(f->arena+LFD_GUARD_PAGE*4096u))[i]!=(UINT32_C(0x61726e47)^i)) {

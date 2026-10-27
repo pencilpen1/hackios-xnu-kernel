@@ -21,7 +21,7 @@ struct fake {
     bool done_current_busy;
     bool zero_thread_priority,drop_next_config;
     uint64_t fault_va_xor;uint32_t fault_status;
-    struct lm_page owned[32];
+    struct lm_page owned[2048];
 };
 static void *ma(void *o,size_t n) {struct fake*f=o;void*p=calloc(1,n);if(p)f->allocs++;return p;}
 static void mf(void *o,void*p,size_t n) {(void)n;assert(p);((struct fake*)o)->allocs--;free(p);}
@@ -30,18 +30,18 @@ static int pa(void *o,struct lm_page *p) {
     if(f->fail_page_after && f->pages>=f->fail_page_after)return -1;
     if(posix_memalign(&p->cpu,4096,4096))return -1;
     memset(p->cpu,0,4096);f->pa+=0x3000;p->pa=f->pa;f->pages++;
-    for(unsigned i=0;i<32;i++)if(!f->owned[i].cpu){f->owned[i]=*p;return 0;}
+    for(unsigned i=0;i<2048;i++)if(!f->owned[i].cpu){f->owned[i]=*p;return 0;}
     /* Sparse stress can temporarily exceed this emulator's small tracking
      * array only with emulate_value off; that test does not walk GPU tables. */
     assert(!f->emulate_value);return 0;
 }
 static void pf(void *o,struct lm_page *p) {
     struct fake*f=o;assert(p->cpu);
-    for(unsigned i=0;i<32;i++)if(f->owned[i].cpu==p->cpu)f->owned[i]=(struct lm_page){0};
+    for(unsigned i=0;i<2048;i++)if(f->owned[i].cpu==p->cpu)f->owned[i]=(struct lm_page){0};
     free(p->cpu);f->pages--;p->cpu=NULL;
 }
 static void *physical(struct fake*f,uint64_t address) {
-    for(unsigned i=0;i<32;i++)if(f->owned[i].cpu&&address>=f->owned[i].pa&&address-f->owned[i].pa<4096)
+    for(unsigned i=0;i<2048;i++)if(f->owned[i].cpu&&address>=f->owned[i].pa&&address-f->owned[i].pa<4096)
         return (char*)f->owned[i].cpu+(address-f->owned[i].pa);
     return NULL;
 }

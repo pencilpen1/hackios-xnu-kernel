@@ -80,14 +80,14 @@ int main(int argc,char **argv) {
             else if(fault==1)m.gpu.fail_write=0x18e0;
             else m.fail_cache=1;
             assert(lfd_run(&f,&state,&props,&safe)!=0);
-            assert(!safe&&f.allocated&&!m.releases&&f.page_mask&&f.metadata_active);
+            assert(!safe&&f.allocated&&!m.releases&&lfd_page_count(&f)&&f.metadata_active);
         }
         puts("Firmware DMA reset/posted-launch/cache uncertainty retains actual private arena; RAM ONLY");return 0;
     }
     fw_init(&m,&c,&mem);f=(struct lfd_context){0};assert(!lfd_prepare(&f,&c,&mem));
     assert(!lfd_run(&f,&state,&props,&safe)&&safe&&!f.allocated&&m.releases==1);
     assert(f.peak_pages==6&&f.cleans==6&&f.invalidates==2&&f.transaction.guards_valid);
-    assert(f.transaction.observed_value==LM_PRIVATE_VALUE&&!f.page_mask&&!f.metadata_active);
+    assert(f.transaction.observed_value==LM_PRIVATE_VALUE&&!lfd_page_count(&f)&&!f.metadata_active);
     assert(!m.trace_calls&&!lpg_expired(&c)&&f.trace_count);
     lfd_flush_trace(&f);assert(m.trace_calls==f.trace_count&&lpg_expired(&c));
     /* Overflow must stay bounded and retain the final timeout, without output. */
@@ -101,7 +101,7 @@ int main(int argc,char **argv) {
     assert(!lfd_run(&f,&state,&props,&safe)&&safe&&!f.allocated&&m.releases==1);
     assert(f.transaction.clear_test&&f.transaction.guards_valid);
     assert(f.transaction.observed_value==LM_CLEAR_VALUE&&f.peak_pages==9);
-    assert(f.transaction.descriptor_status==0x00010013&&!f.page_mask&&!f.metadata_active);
+    assert(f.transaction.descriptor_status==0x00010013&&!lfd_page_count(&f)&&!f.metadata_active);
     fw_init(&m,&c,&mem);f=(struct lfd_context){0};assert(!lfd_prepare(&f,&c,&mem));
     f.clear_mode=true;m.gpu.emulate_clear=true;m.gpu.corrupt_pixel=true;
     assert(lfd_run(&f,&state,&props,&safe)==LM_EIO&&safe&&!f.allocated&&m.releases==1);
@@ -116,12 +116,17 @@ int main(int argc,char **argv) {
      * jobs, executable shader page, vertex/varying buffers and tiler heap. */
     fw_init(&m,&c,&mem);f=(struct lfd_context){0};assert(!lfd_prepare(&f,&c,&mem));
     f.triangle_mode=true;m.gpu.emulate_triangle=true;
-    assert(!lfd_run(&f,&state,&props,&safe)&&safe&&!f.allocated&&m.releases==1);
+    {int e=lfd_run(&f,&state,&props,&safe);
+     if(e||!safe||f.allocated||m.releases!=1)
+         fprintf(stderr,"TRI-DEBUG e=%d safe=%d alloc=%d rel=%u pages=%u peak=%u err=%d cl=%d\n",
+             e,safe,f.allocated,m.releases,lfd_page_count(&f),f.peak_pages,
+             f.transaction.error,f.transaction.cleanup_error);
+     assert(!e&&safe&&!f.allocated&&m.releases==1);}
     assert(f.transaction.triangle_test&&f.transaction.guards_valid);
-    assert(f.transaction.observed_value==LM_TRI_VALUE&&f.peak_pages==30);
+    assert(f.transaction.observed_value==LM_TRI_VALUE&&f.peak_pages==1052);
     assert(f.transaction.tri_tiler_result.sequence==1&&
         f.transaction.job_result.sequence==2);
-    assert(m.gpu.jobs_run==3&&!f.page_mask&&!f.metadata_active);
+    assert(m.gpu.jobs_run==3&&!lfd_page_count(&f)&&!f.metadata_active);
     fw_init(&m,&c,&mem);f=(struct lfd_context){0};assert(!lfd_prepare(&f,&c,&mem));
     f.triangle_mode=true;m.gpu.emulate_triangle=true;m.gpu.corrupt_pixel=true;
     assert(lfd_run(&f,&state,&props,&safe)==LM_EIO&&safe&&!f.allocated&&m.releases==1);

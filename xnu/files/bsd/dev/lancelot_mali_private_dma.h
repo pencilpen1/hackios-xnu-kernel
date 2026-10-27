@@ -47,15 +47,18 @@
 #define LM_TRI_BPP 4u
 #define LM_TRI_BYTES (LM_TRI_WIDTH*LM_TRI_HEIGHT*LM_TRI_BPP)
 #define LM_TRI_PAGES (LM_TRI_BYTES/LM_PAGE_SIZE)
-#define LM_TRI_HEAP_BYTES 49152u
+/* Bifrost tiler heaps are managed in 2 MiB chunks (Mesa's 128 MiB BO is
+ * 64 chunks). A smaller heap cannot satisfy the first chunk and raises
+ * JS_STATUS 0x60 (OOM). Use two chunks plus a 64 KiB polygon-list buffer. */
+#define LM_TRI_HEAP_BYTES 4194304u
 #define LM_TRI_HEAP_PAGES (LM_TRI_HEAP_BYTES/LM_PAGE_SIZE)
-#define LM_TRI_POLY_BYTES 32768u
+#define LM_TRI_POLY_BYTES 65536u
 #define LM_TRI_POLY_PAGES (LM_TRI_POLY_BYTES/LM_PAGE_SIZE)
 #define LM_TRI_VERTEX_COUNT 3u
 #define LM_TRI_VALUE LM_CLEAR_VALUE
 #define LM_TRI_SHADER_PAGE_VA (LM_PRIVATE_JOB_VA+UINT64_C(0x1000))
 #define LM_TRI_HEAP_VA (LM_PRIVATE_JOB_VA+UINT64_C(0x8000))
-#define LM_TRI_POLY_VA (LM_PRIVATE_JOB_VA+UINT64_C(0x14000))
+#define LM_TRI_POLY_VA (LM_PRIVATE_JOB_VA+UINT64_C(0x408000))
 #define LM_TRI_VERTEX_JOB 0x000u
 #define LM_TRI_TILER_JOB 0x100u
 #define LM_TRI_FRAG_JOB 0x200u
