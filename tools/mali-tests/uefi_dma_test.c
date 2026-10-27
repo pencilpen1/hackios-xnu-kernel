@@ -119,6 +119,8 @@ int main(int argc,char **argv) {
     assert(!lfd_run(&f,&state,&props,&safe)&&safe&&!f.allocated&&m.releases==1);
     assert(f.transaction.triangle_test&&f.transaction.guards_valid);
     assert(f.transaction.observed_value==LM_TRI_VALUE&&f.peak_pages==14);
+    assert(f.transaction.tri_tiler_result.sequence==1&&
+        f.transaction.job_result.sequence==2);
     assert(m.gpu.jobs_run==3&&!f.page_mask&&!f.metadata_active);
     fw_init(&m,&c,&mem);f=(struct lfd_context){0};assert(!lfd_prepare(&f,&c,&mem));
     f.triangle_mode=true;m.gpu.emulate_triangle=true;m.gpu.corrupt_pixel=true;

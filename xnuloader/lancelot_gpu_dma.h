@@ -158,7 +158,8 @@ static bool lfd_write_allowed(struct lfd_context*f,uint32_t off,uint32_t value) 
     if(off>=0x1800u && off<0x1980u) {
         switch(off&0x7fu) {
         case 0x40:return value==LM_PRIVATE_JOB_VA ||
-            value==LM_PRIVATE_JOB_VA+LM_CLEAR_DESC_OFFSET;
+            value==LM_PRIVATE_JOB_VA+LM_CLEAR_DESC_OFFSET ||
+            value==LM_PRIVATE_JOB_VA+LM_TRI_FRAG_JOB;
         case 0x44:return value==0;
         case 0x50:return value==3;
         case 0x54:return value==0;

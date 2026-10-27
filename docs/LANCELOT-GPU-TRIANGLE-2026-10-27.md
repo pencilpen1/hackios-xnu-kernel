@@ -2,6 +2,10 @@
 
 > 本文记录**host 验证与构建结果**。没有部署到手机，也没有实机渲染证据。
 > `gpu_complete=false`、`rendering_verified=false`、`desktop_verified=false` 不变。
+>
+> **2026-10-27 深夜更新**：attempt16 已实机部署并失败，`JS_STATUS=0x58`
+> （DATA_INVALID_FAULT）。根因分析与修正见第 8 节；当前候选 attempt17 改为
+> 两次 submit（JS1=VERTEX+TILER，JS0=FRAGMENT），并修正 varying/RT 描述符。
 
 ## 1. 结论
 
@@ -136,3 +140,74 @@ bootargs 新增 `lancelot_gpu_triangle=1`，与 `lancelot_gpu_clear*`/`fault` �
   CoreAnimation、Metal 和桌面仍未验证。
 - OS 用户态服务仍受 WACS2/PWRAP 所有权阻塞；在拿到真实 handoff 证据前不部署
   `lancelot_mali=4`。
+
+## 8. attempt16 实机失败与 attempt17 修正（2026-10-27 深夜）
+
+### 8.1 attempt16 实机结果
+
+- 候选已部署：attempt16 loader `6f9fdb69...`、XNUP `b21c246e...`、Mu `ac7b...`；
+  180 秒采集完成，XNU 只读恢复、SPM 四域 all-off、SpringBoard 运行。
+- GPU 结果：`error=fffffffffb (-EIO)`、`submitted=1`、`sequence=1`、
+  `guards=0`、`value=0`、`peak-pages=14`、`failed-stage=4`、
+  `job-irq=0x10000`、`job-status=0x58`、`mmu=0`、`gpu=0`、
+  `reset=1`、`quarantined=0`、`teardown-state=0x1b`。
+- 输出面首字为 0，position/PSIZ 未进入输出；cleanup/release/safe 均正常。
+- `0x58` 在主线 Linux panfrost 中对应
+  `DRM_PANFROST_EXCEPTION_DATA_INVALID_FAULT`
+  （`drivers/gpu/drm/panfrost/panfrost_device.h`）。
+- 结论：job chain 被 JM 接受并启动，但某个 job 的数据访问无效；不是 MMU fault、
+  不是 GPU IRQ fault、不是超时。
+
+### 8.2 根因与修正
+
+1. **JS slot 用错（主因）**：attempt16 把整条 VERTEX→TILER→FRAGMENT 链提交到
+   JS0。主线 panfrost 的 `panfrost_job_get_slot()` 明确：
+   **JS0 = fragment jobs，JS1 = vertex/tiler jobs**。
+   修正：两次 submit：
+   - JS1：head=`LM_PRIVATE_JOB_VA`，链为 VERTEX(index 1) → TILER(index 2)，
+     tiler 的 `next=0`；
+   - 等待完成；
+   - JS0：head=`LM_PRIVATE_JOB_VA+0x200`，单独 FRAGMENT(index 1)，
+     `dependency_1=0`、`next=0`。
+   `lfd_write_allowed` 的 head 白名单增加 `LM_PRIVATE_JOB_VA+LM_TRI_FRAG_JOB`。
+2. **varying ATTRIBUTE 的 offset_enable 错误**：attempt16 设为 1。Mesa 的
+   `pan_emit_vary()` 只在 `PAN_ARCH <= 5` 设置 offset_enable；v7 必须为 0。
+   修正后 POS/PSIZ 描述符分别为 `0x17800001`、`0x31c00002`。
+3. **RT 的 clean pixel write / dithering 错误**：attempt16 把 clear-only 的
+   `clean_pixel_write_enable=1` 用在普通 draw，并把 dithering 关闭。Mesa 的
+   `pan_prepare_rt()` 对普通 draw 设 `clean_pixel_write_enable=0`、
+   `dithering_enable=1`。修正后 RT word1=`0x06888299`。
+4. **输入 attribute buffer size 过小**：attempt16 设为 24 字节。Mesa 使用资源
+   （BO）大小；现改为从顶点数据到页尾的 `4096-0x540=2752` 字节。
+5. **fragment RSD 的 forward-kill 位**：补上
+   `allow_forward_pixel_to_kill=1`，word4 由 `0x41502200` 改为 `0x41582200`。
+
+### 8.3 重新校验
+
+- 修正后的生产 packer 与更新后的 Mesa 参考页再次**逐字节一致**
+  （page A `0x000..0x8ff`、page B `0x000..0x1ff`）。
+- `core_test`/`uefi_dma_test` 改为两次 submit：
+  - 第一次 fake 链必须是 VERTEX→TILER，tiler `next=0`；
+  - 第二次必须是单独 FRAGMENT，index=1；
+  - 断言 `tri_tiler_result.sequence=1`、`job_result.sequence=2`、
+    `jobs_run=3`、`peak_pages=14`。
+- analyzer 的 triangle 成功条件改为 `receipt.sequence==2`；fixture 同步为 2。
+- attempt17 正式构建 PASS：
+  - loader 130,560 B `b99130692955cadb741cbc8f8d806898686ad5addf674afba829d03d03805625`
+  - XNUP 15,288,408 B `b21c246e7aedf622c6daab800a007f73bb919b742989f3078228710425e41c48`
+    （kernel/cmdline 未变，与 attempt16 相同）
+  - XNU 15,287,960 B `90e93d9e...745412`
+- attempt17 已打包为唯一 `current/`，**未部署**；设备在 attempt16 采集后停在 XNU。
+
+### 8.4 下一次实机验收
+
+- 需要物理进入原生 FASTBOOT → 恢复 Android → `deploy-test.py --build-attempt 17`
+  → 采集 → `analyze-runtime.py --attempt 17`。
+- 成功应看到：`error=0 submitted=1 guards=1 peak-pages=14 value=ff3366cc
+  sequence=2`、`lancelot-gpu-triangle: jobs=3 ... bad-stage=0 actual=ff3366cc`。
+- 若仍失败，下一步先加诊断再改描述符：
+  - 读 `JS_HEAD_LO/HI`、`JS_TAIL_LO/HI`（0x1800/0x1804/0x1808/0x180c）和
+    `GPU_FAULT_STATUS`（0x3c）进入 receipt；
+  - 用 `JS_STATUS` 区分是 vertex/tiler 链还是 fragment 链；
+  - 再检查 shader 二进制/RSD、tiler heap 大小（当前 16 KiB）、shader 页 EXEC
+    和描述符对齐；不要直接放宽像素校验。

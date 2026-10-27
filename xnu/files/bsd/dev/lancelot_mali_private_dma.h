@@ -83,6 +83,7 @@ struct lm_private_dma {
     struct lm_page job_page,output_page;
     struct lm_page clear_pages[LM_CLEAR_MAX_PAGES];
     struct lm_job_result job_result;
+    struct lm_job_result tri_tiler_result;
     int error,cleanup_error;
     uint32_t bad_offset;
     uint32_t observed_value,descriptor_status;
@@ -205,8 +206,9 @@ static inline void lm_v7_tri_draw(uint32_t *d,uint64_t position,uint64_t state,
     d[22]=(uint32_t)varyings;d[23]=(uint32_t)(varyings>>32);
     d[24]=(uint32_t)viewport;d[25]=(uint32_t)(viewport>>32);
 }
-static inline void lm_v7_tri_attr(uint32_t *p,unsigned buffer,uint32_t format) {
-    p[0]=(format<<10)|(1u<<9)|buffer;p[1]=0;
+static inline void lm_v7_tri_attr(uint32_t *p,unsigned buffer,uint32_t format,
+    bool offset_enable) {
+    p[0]=(format<<10)|((offset_enable?1u:0u)<<9)|buffer;p[1]=0;
 }
 static inline void lm_v7_tri_attr_buffer(uint32_t *p,uint64_t pointer,
     uint32_t stride,uint32_t size) {
@@ -225,9 +227,10 @@ static inline void lm_v7_tri_vertex_rsd(uint32_t *r,uint64_t shader) {
 static inline void lm_v7_tri_fragment_rsd(uint32_t *r,uint64_t shader) {
     memset(r,0,64);
     r[0]=(uint32_t)shader;r[1]=(uint32_t)(shader>>32);
-    /* depth source fixed-function, 32 regs, forward-kill allowed, wait6.
-     * Weak-early kill/update, RGBA8 sample mask, depth Always, clip flags. */
-    r[4]=0x41502200u;
+    /* depth source fixed-function, 32 regs, forward kill and forward
+     * kill-ability, wait6; weak-early kill/update, RGBA8 sample mask,
+     * depth Always, clip flags. */
+    r[4]=0x41582200u;
     r[8]=0x37d8ffffu;
     r[9]=0x40000000u;
     r[12]=0x00000080u; /* coverage preload */
@@ -269,9 +272,10 @@ static inline void lm_v7_tri_fbd(uint32_t *f,uint64_t tiler) {
 static inline void lm_v7_tri_rt(uint32_t *rt,uint64_t output) {
     memset(rt,0,64);
     rt[0]=1u<<26; /* RGBA8 tilebuffer */
-    /* write enable, RGBA8 linear writeback, identity swizzle, clean write,
-     * dithering disabled so the shader's exact 0xcc/0x66/0x33/0xff lands. */
-    rt[1]=1u|(19u<<3)|(2u<<8)|(UINT32_C(0x688)<<16)|(1u<<31);
+    /* Normal draw: write enable, RGBA8 linear writeback, identity swizzle,
+     * dithering enabled (Mesa's pan_prepare_rt sets it unconditionally).
+     * Clean pixel write is a clear-only flag and must stay clear here. */
+    rt[1]=1u|(19u<<3)|(2u<<8)|(1u<<15)|(UINT32_C(0x688)<<16);
     rt[8]=(uint32_t)output;rt[9]=(uint32_t)(output>>32);
     rt[10]=LM_TRI_WIDTH*LM_TRI_BPP;
 }
@@ -290,9 +294,11 @@ static inline void lm_v7_tri_prepare(uint32_t *a,uint8_t *b,uint64_t a_va,
     vj[10]=5u<<26; /* job_task_split=5 */
     lm_v7_tri_draw(vj+16,0,a_va+LM_TRI_VERT_RSD,a_va+LM_TRI_VATTR_BUF,
         a_va+LM_TRI_VATTR,a_va+LM_TRI_VARY_BUF,a_va+LM_TRI_VARY_ATTR,0);
-    /* TILER job, depends on the vertex job. */
+    /* TILER job, depends on the vertex job. This chain goes to JS1; the
+     * fragment job is a separate chain on JS0 (JS0=fragment, JS1=vertex/tiler
+     * in panfrost). Submitting a VERTEX job on JS0 raised a job exception. */
     uint32_t *tj=a+LM_TRI_TILER_JOB/4;
-    lm_v7_tri_header(tj,7,2,1,0,a_va+LM_TRI_FRAG_JOB);
+    lm_v7_tri_header(tj,7,2,1,0,0);
     lm_v7_tri_invocation(tj+8,LM_TRI_VERTEX_COUNT);
     tj[10]=0x18030008u; /* Triangles, both depth culls, job_task_split=6 */
     tj[13]=LM_TRI_VERTEX_COUNT-1u;
@@ -303,9 +309,9 @@ static inline void lm_v7_tri_prepare(uint32_t *a,uint8_t *b,uint64_t a_va,
     /* Keep the fragment draw's position result buffer. */
     tj[32+4]=(uint32_t)(a_va+LM_TRI_POS_BUF);
     tj[32+5]=(uint32_t)((a_va+LM_TRI_POS_BUF)>>32);
-    /* FRAGMENT job, depends on tiling. */
+    /* FRAGMENT job: its own chain on JS0 after the tiler chain completes. */
     uint32_t *fj=a+LM_TRI_FRAG_JOB/4;
-    lm_v7_tri_header(fj,9,3,2,0,0);
+    lm_v7_tri_header(fj,9,1,0,0,0);
     fj[9]=((LM_TRI_WIDTH/16u)-1u)|((((LM_TRI_HEIGHT/16u)-1u))<<16);
     fj[10]=(uint32_t)(a_va+LM_TRI_FBD);
     fj[11]=(uint32_t)((a_va+LM_TRI_FBD)>>32);
@@ -316,11 +322,13 @@ static inline void lm_v7_tri_prepare(uint32_t *a,uint8_t *b,uint64_t a_va,
     lm_v7_tri_tiler_context(a+LM_TRI_TILER_CTX/4,heap_desc);
     lm_v7_tri_tiler_heap(a+LM_TRI_TILER_HEAP/4,heap);
     lm_v7_tri_viewport(a+LM_TRI_VIEWPORT/4);
-    lm_v7_tri_attr(a+LM_TRI_VATTR/4,0,16u|(UINT32_C(175)<<12)); /* RG32F */
-    lm_v7_tri_attr_buffer(a+LM_TRI_VATTR_BUF/4,a_va+LM_TRI_VERTEX_DATA,8,24);
+    lm_v7_tri_attr(a+LM_TRI_VATTR/4,0,16u|(UINT32_C(175)<<12),true); /* RG32F */
+    lm_v7_tri_attr_buffer(a+LM_TRI_VATTR_BUF/4,a_va+LM_TRI_VERTEX_DATA,8,
+        LM_PAGE_SIZE-LM_TRI_VERTEX_DATA);
     memset(a+LM_TRI_VATTR_BUF/4+4,0,16); /* Bifrost prefetch terminator */
-    lm_v7_tri_attr(a+LM_TRI_VARY_ATTR/4,1,UINT32_C(94)<<12);  /* position */
-    lm_v7_tri_attr(a+LM_TRI_VARY_ATTR/4+2,2,UINT32_C(199)<<12); /* psiz */
+    /* Mesa's pan_emit_vary sets offset_enable only for PAN_ARCH <= 5. */
+    lm_v7_tri_attr(a+LM_TRI_VARY_ATTR/4,1,UINT32_C(94)<<12,false);  /* position */
+    lm_v7_tri_attr(a+LM_TRI_VARY_ATTR/4+2,2,UINT32_C(199)<<12,false); /* psiz */
     memset(a+LM_TRI_VARY_BUF/4,0,64);
     lm_v7_tri_attr_buffer(a+LM_TRI_VARY_BUF/4+4,a_va+LM_TRI_POS_BUF,16,48);
     lm_v7_tri_attr_buffer(a+LM_TRI_VARY_BUF/4+8,a_va+LM_TRI_PSIZ_BUF,2,6);
@@ -505,10 +513,21 @@ static int lm_private_dma_run(struct lm_private_dma *s,const struct lm_ops *io) 
                    s->tri_heap[i].pa || flags!=LM_MAP_WRITE)s->error=LM_EFAULT;
         }
         if(s->error)goto cleanup;
-        s->error=lm_core_submit_wait(s->vm,LM_PRIVATE_JOB_VA,1,
-            UINT64_C(100000000),&s->job_result);
-        s->submitted=s->job_result.sequence!=0;
-        if(!s->job_result.quarantined) {
+        /* JS1 carries vertex+tiler; JS0 carries the fragment job. This is the
+         * panfrost slot split (JS0=fragment, JS1=vertex/tiler). */
+        s->error=lm_core_submit_wait(s->vm,LM_PRIVATE_JOB_VA,0,
+            UINT64_C(100000000),&s->tri_tiler_result);
+        s->submitted=s->tri_tiler_result.sequence!=0;
+        bool tiler_ok=!s->error&&!s->tri_tiler_result.quarantined;
+        if(!tiler_ok) {
+            s->job_result=s->tri_tiler_result;
+            if(!s->error)s->error=LM_EIO;
+        } else {
+            s->error=lm_core_submit_wait(s->vm,LM_PRIVATE_JOB_VA+LM_TRI_FRAG_JOB,
+                1,UINT64_C(100000000),&s->job_result);
+            s->submitted=s->job_result.sequence!=0;
+        }
+        if(tiler_ok&&!s->job_result.quarantined) {
             s->observed_value=((volatile uint32_t *)s->tri_output[0].cpu)[0];
             s->guards_valid=lm_v7_tri_validate(s->tri_output,LM_TRI_PAGES,
                 s->tri_pages[0].cpu,s->tri_pages[1].cpu,&s->tri_bad_word,

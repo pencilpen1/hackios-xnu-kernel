@@ -60,89 +60,90 @@ static uint64_t tri_abuf_ptr(const uint32_t*b) {
     uint64_t q=(uint64_t)(b[0]>>6)|((uint64_t)(b[1]&0xffffff)<<26);
     return q<<6;
 }
-/* Emulate the three-job Bifrost triangle chain. This is not a shader
- * interpreter: it proves the driver packed a vertex job, a dependent tiler
- * job and a dependent fragment job with the exact descriptors the Mesa
+/* Emulate the two Bifrost submissions the driver must emit: JS1 carries the
+ * VERTEX->TILER chain, JS0 carries the FRAGMENT job. This is not a shader
+ * interpreter: it proves the driver packed the exact descriptors the Mesa
  * reference produced, then models their observable writes. */
 static void fake_triangle(struct fake*f,uint64_t jc) {
-    uint32_t *job[3]={0};unsigned n=0;
-    for(uint64_t cur=jc;cur;){
-        uint32_t*j=gpu_address(f,cur);assert(j);
-        assert(j[4]&1u); /* 64-bit job header */
-        unsigned type=(j[4]>>1)&0x7fu;
-        assert(j[4]&1u);
-        if(type==5)job[0]=j;
-        else if(type==7)job[1]=j;
-        else if(type==9)job[2]=j;
-        else assert(!"unexpected job type");
-        n++;assert(n<=3);
-        cur=jq(j,6);
+    uint32_t *j0=gpu_address(f,jc);assert(j0);
+    assert(j0[4]&1u); /* 64-bit job header */
+    unsigned type0=(j0[4]>>1)&0x7fu;
+    if(type0==5) {
+        assert(f->jobs_run==0);
+        uint32_t *vj=j0;
+        uint64_t tiler_va=jq(vj,6);
+        uint32_t *tj=gpu_address(f,tiler_va);assert(tj);
+        assert(((tj[4]>>1)&0x7fu)==7u&&jq(tj,6)==0);
+        assert(((vj[4]>>16)&0xffffu)==1u&&(vj[5]&0xffffu)==0u);
+        assert(((tj[4]>>16)&0xffffu)==2u&&(tj[5]&0xffffu)==1u);
+        /* Vertex job draw: vertex RSD, input attributes and output varyings. */
+        uint32_t *vd=vj+16;
+        uint32_t *vrsd=gpu_address(f,jq(vd,14));assert(vrsd);
+        assert(jq(vrsd,0)==LM_TRI_SHADER_PAGE_VA);
+        assert(vrsd[3]==0x00020001u&&vrsd[4]==0x00002000u&&vrsd[12]==0x00006000u);
+        uint32_t *attr=gpu_address(f,jq(vd,18));assert(attr);
+        assert(((attr[0]>>10)&0x3fffffu)==(16u|(175u<<12)));
+        assert(attr[0]&(1u<<9)); /* input attribute offset is enabled */
+        assert((attr[0]&0x1ffu)==0u);
+        uint32_t *abuf=gpu_address(f,jq(vd,16));assert(abuf);
+        assert(tri_abuf_ptr(abuf)==LM_PRIVATE_JOB_VA+LM_TRI_VERTEX_DATA);
+        assert(abuf[2]==8u&&abuf[3]==LM_PAGE_SIZE-LM_TRI_VERTEX_DATA);
+        uint32_t *vin=gpu_address(f,tri_abuf_ptr(abuf));assert(vin);
+        static const uint32_t want_in[6]={0xbf800000u,0xbf800000u,0x40400000u,
+            0xbf800000u,0xbf800000u,0x40400000u};
+        for(unsigned i=0;i<6;i++)assert(vin[i]==want_in[i]);
+        uint32_t *vary=gpu_address(f,jq(vd,22));assert(vary);
+        assert((vary[0]&0x1ffu)==1u&&((vary[0]>>10)&0x3fffffu)==(94u<<12));
+        assert(!(vary[0]&(1u<<9))); /* v7 varying offset is disabled */
+        assert((vary[2]&0x1ffu)==2u&&((vary[2]>>10)&0x3fffffu)==(199u<<12));
+        assert(!(vary[2]&(1u<<9)));
+        uint32_t *vbuf=gpu_address(f,jq(vd,20));assert(vbuf);
+        assert(tri_abuf_ptr(vbuf+4)==LM_PRIVATE_JOB_VA+LM_TRI_POS_BUF);
+        assert(vbuf[6]==16u&&vbuf[7]==48u);
+        assert(tri_abuf_ptr(vbuf+8)==LM_PRIVATE_JOB_VA+LM_TRI_PSIZ_BUF);
+        assert(vbuf[10]==2u&&vbuf[11]==6u);
+        /* Tiler job: primitive, tiler context/heap and fragment draw. */
+        uint32_t *tp=tj+10;
+        assert((tp[0]&0xffu)==8u); /* Triangles */
+        assert(tp[3]==2u);         /* index_count - 1 */
+        assert(jq(tj,18)==LM_PRIVATE_JOB_VA+LM_TRI_TILER_CTX);
+        uint32_t *ctx=gpu_address(f,jq(tj,18));assert(ctx);
+        assert(ctx[2]==6u&&ctx[3]==0x003f003fu);
+        uint64_t heap_desc=jq(ctx,6);
+        uint32_t *hd=gpu_address(f,heap_desc);assert(hd);
+        assert(hd[1]==LM_TRI_HEAP_BYTES);
+        assert((jq(hd,2))==LM_TRI_HEAP_VA&&(jq(hd,6))==LM_TRI_HEAP_VA+LM_TRI_HEAP_BYTES);
+        assert(jq(tj,16)==LM_PRIVATE_JOB_VA+LM_TRI_PSIZ_BUF);
+        uint32_t *td=tj+32;
+        uint32_t *frsd=gpu_address(f,jq(td,14));assert(frsd);
+        assert(jq(frsd,0)==LM_TRI_SHADER_PAGE_VA+0x100u);
+        assert(frsd[4]==0x41582200u&&frsd[8]==0x37d8ffffu&&
+               frsd[9]==0x40000000u&&frsd[12]==0x00000080u);
+        uint32_t *blend=(uint32_t *)((uint8_t *)frsd+64);
+        assert(blend[0]==0x00000a00u&&blend[1]==0xf0122122u&&
+               blend[2]==0x00000019u&&blend[3]==0x010ed000u);
+        uint32_t *vp=gpu_address(f,jq(td,24));assert(vp);
+        assert(vp[2]==0x42800000u&&vp[7]==0x003f003fu);
+        assert(jq(td,4)==LM_PRIVATE_JOB_VA+LM_TRI_POS_BUF);
+        uint32_t *pos=gpu_address(f,jq(td,4));assert(pos);
+        static const uint32_t want_pos[12]={0xbf800000u,0xbf800000u,0u,0x3f800000u,
+            0x40400000u,0xbf800000u,0u,0x3f800000u,
+            0xbf800000u,0x40400000u,0u,0x3f800000u};
+        for(unsigned i=0;i<12;i++)pos[i]=want_pos[i];
+        uint16_t *psiz=gpu_address(f,jq(tj,16));assert(psiz);
+        for(unsigned i=0;i<3;i++)psiz[i]=0x3c00u;
+        f->jobs_run=2;
+        return;
     }
-    assert(n==3&&job[0]&&job[1]&&job[2]);
-    assert(((job[0][4]>>16)&0xffffu)==1u&&(job[0][5]&0xffffu)==0u);
-    assert(((job[1][4]>>16)&0xffffu)==2u&&(job[1][5]&0xffffu)==1u);
-    assert(((job[2][4]>>16)&0xffffu)==3u&&(job[2][5]&0xffffu)==2u);
-    /* Vertex job draw: vertex RSD, input attributes and output varyings. */
-    uint32_t *vd=job[0]+16;
-    uint32_t *vrsd=gpu_address(f,jq(vd,14));assert(vrsd);
-    assert(jq(vrsd,0)==LM_TRI_SHADER_PAGE_VA);
-    assert(vrsd[3]==0x00020001u&&vrsd[4]==0x00002000u&&vrsd[12]==0x00006000u);
-    uint32_t *attr=gpu_address(f,jq(vd,18));assert(attr);
-    assert(((attr[0]>>10)&0x3fffffu)==(16u|(175u<<12)));
-    assert(attr[0]&(1u<<9));
-    assert((attr[0]&0x1ffu)==0u);
-    uint32_t *abuf=gpu_address(f,jq(vd,16));assert(abuf);
-    assert(tri_abuf_ptr(abuf)==LM_PRIVATE_JOB_VA+LM_TRI_VERTEX_DATA);
-    assert(abuf[2]==8u&&abuf[3]==24u);
-    uint32_t *vin=gpu_address(f,tri_abuf_ptr(abuf));assert(vin);
-    static const uint32_t want_in[6]={0xbf800000u,0xbf800000u,0x40400000u,
-        0xbf800000u,0xbf800000u,0x40400000u};
-    for(unsigned i=0;i<6;i++)assert(vin[i]==want_in[i]);
-    uint32_t *vary=gpu_address(f,jq(vd,22));assert(vary);
-    assert((vary[0]&0x1ffu)==1u&&((vary[0]>>10)&0x3fffffu)==(94u<<12));
-    assert((vary[2]&0x1ffu)==2u&&((vary[2]>>10)&0x3fffffu)==(199u<<12));
-    uint32_t *vbuf=gpu_address(f,jq(vd,20));assert(vbuf);
-    assert(tri_abuf_ptr(vbuf+4)==LM_PRIVATE_JOB_VA+LM_TRI_POS_BUF);
-    assert(vbuf[6]==16u&&vbuf[7]==48u);
-    assert(tri_abuf_ptr(vbuf+8)==LM_PRIVATE_JOB_VA+LM_TRI_PSIZ_BUF);
-    assert(vbuf[10]==2u&&vbuf[11]==6u);
-    /* Tiler job: primitive, tiler context/heap and fragment draw. */
-    uint32_t *tp=job[1]+10;
-    assert((tp[0]&0xffu)==8u); /* Triangles */
-    assert(tp[3]==2u);         /* index_count - 1 */
-    assert(jq(job[1],18)==LM_PRIVATE_JOB_VA+LM_TRI_TILER_CTX);
-    uint32_t *ctx=gpu_address(f,jq(job[1],18));assert(ctx);
-    assert(ctx[2]==6u&&ctx[3]==0x003f003fu);
-    uint64_t heap_desc=jq(ctx,6);
-    uint32_t *hd=gpu_address(f,heap_desc);assert(hd);
-    assert(hd[1]==LM_TRI_HEAP_BYTES);
-    assert((jq(hd,2))==LM_TRI_HEAP_VA&&(jq(hd,6))==LM_TRI_HEAP_VA+LM_TRI_HEAP_BYTES);
-    assert(jq(job[1],16)==LM_PRIVATE_JOB_VA+LM_TRI_PSIZ_BUF);
-    uint32_t *td=job[1]+32;
-    uint32_t *frsd=gpu_address(f,jq(td,14));assert(frsd);
-    assert(jq(frsd,0)==LM_TRI_SHADER_PAGE_VA+0x100u);
-    assert(frsd[4]==0x41502200u&&frsd[8]==0x37d8ffffu&&
-           frsd[9]==0x40000000u&&frsd[12]==0x00000080u);
-    uint32_t *blend=(uint32_t *)((uint8_t *)frsd+64);
-    assert(blend[0]==0x00000a00u&&blend[1]==0xf0122122u&&
-           blend[2]==0x00000019u&&blend[3]==0x010ed000u);
-    uint32_t *vp=gpu_address(f,jq(td,24));assert(vp);
-    assert(vp[2]==0x42800000u&&vp[7]==0x003f003fu);
-    assert(jq(td,4)==LM_PRIVATE_JOB_VA+LM_TRI_POS_BUF);
-    uint32_t *pos=gpu_address(f,jq(td,4));assert(pos);
-    static const uint32_t want_pos[12]={0xbf800000u,0xbf800000u,0u,0x3f800000u,
-        0x40400000u,0xbf800000u,0u,0x3f800000u,
-        0xbf800000u,0x40400000u,0u,0x3f800000u};
-    for(unsigned i=0;i<12;i++)pos[i]=want_pos[i];
-    uint16_t *psiz=gpu_address(f,jq(job[1],16));assert(psiz);
-    for(unsigned i=0;i<3;i++)psiz[i]=0x3c00u;
-    /* Fragment job: FBD, tiler pointer and exact shader colour. */
-    uint32_t *fbd=gpu_address(f,jq(job[2],10));assert(fbd);
+    /* Fragment submission on JS0: one job, its own chain index 1. */
+    assert(type0==9u&&f->jobs_run==2);
+    assert(((j0[4]>>16)&0xffffu)==1u&&(j0[5]&0xffffu)==0u&&jq(j0,6)==0);
+    uint32_t *fbd=gpu_address(f,jq(j0,10));assert(fbd);
     assert(fbd[8]==0x003f003fu&&fbd[10]==0x003f003fu);
     assert(fbd[11]==0x01001080u&&fbd[12]==0x00010000u);
     assert(jq(fbd,14)==LM_PRIVATE_JOB_VA+LM_TRI_TILER_CTX);
     uint32_t *rt=fbd+32;
-    assert((rt[0]>>26)==1u&&rt[1]==0x86880299u);
+    assert((rt[0]>>26)==1u&&rt[1]==0x06888299u);
     assert(jq(rt,8)==LM_PRIVATE_OUTPUT_VA&&rt[10]==256u);
     uint64_t out_va=jq(rt,8);
     for(unsigned i=0;i<LM_TRI_WIDTH*LM_TRI_HEIGHT;i++) {
@@ -553,6 +554,8 @@ static void private_triangle(void) {
     assert(lm_private_dma_run(&s,&io)==LM_OK);
     assert(s.submitted&&s.guards_valid&&s.cleaned&&!s.backing_retained);
     assert(s.observed_value==LM_TRI_VALUE&&f.jobs_run==3);
+    assert(s.tri_tiler_result.sequence==1&&!s.tri_tiler_result.quarantined);
+    assert(s.job_result.sequence==2&&!s.job_result.quarantined);
     assert(!s.tri_bad_stage&&!s.bad_offset&&!f.pages&&!f.allocs&&!f.run);
     puts("Private triangle: dependent VERTEX->TILER->FRAGMENT jobs, real vertex/varying descriptors, RG32F input, D24 FBD, shader colour and release proved; RAM ONLY");
 }
