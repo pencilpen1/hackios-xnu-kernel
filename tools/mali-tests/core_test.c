@@ -101,6 +101,8 @@ static void wr(void*o,uint32_t r,uint32_t x) {
                 uint32_t *fbd=gpu_address(f,tag&~UINT64_C(0x3f));assert(fbd);
                 uint32_t width=(fbd[8]&0xffffu)+1u,height=(fbd[8]>>16)+1u;
                 assert((fbd[10]&0xffffu)==width-1u);
+                assert(((fbd[11]>>9)&0xfu)==8u); /* 16x16 tile area 256, log2 */
+                assert((fbd[11]>>24)==1u);       /* 1024-byte cbuf >> 10 */
                 uint32_t *rt=fbd+32;
                 assert(((rt[0]>>26)&0x3fu)==1u); /* R8G8B8A8 */
                 assert(((rt[1]>>3)&0x1fu)==19u); /* writeback R8G8B8A8 */

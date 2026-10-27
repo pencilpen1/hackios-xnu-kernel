@@ -57,9 +57,10 @@ static inline void lm_v7_clear_prepare(uint32_t page[LM_PAGE_SIZE/4],
     /* width/height are minus one; bounds are the full surface. */
     fbd[8]=(LM_CLEAR_WIDTH-1u)|((LM_CLEAR_HEIGHT-1u)<<16);
     fbd[10]=fbd[8];
-    /* sample_count=1 (log2 0), single pattern, tie-break 2, tile 16 (log2 4),
-     * one render target, color buffer allocation 0. */
-    fbd[11]=(2u<<6)|(4u<<9);
+    /* sample_count=1 (log2 0), single pattern, tie-break 2. The effective
+     * tile is 16x16 = 256 pixels, so its log2 is 8; the RGBA8 colour buffer
+     * allocation is ALIGN_POT(4*256,1024)=1024, stored divided by 1024. */
+    fbd[11]=(2u<<6)|(8u<<9)|(1u<<24);
     /* D24 z internal format; no z/s write or clear. */
     fbd[12]=1u<<16;
     uint32_t *rt=page+32; /* Framebuffer aggregate is 128 bytes. */
