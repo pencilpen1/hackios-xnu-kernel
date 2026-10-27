@@ -12,6 +12,7 @@
 #include "efi.h"
 #include "identity.h"         /* who iOS shall think we are: from the iPhone's own device tree (mkidentity.py) */
 #include "../xnu/files/bsd/dev/lancelot_smp.h"
+#include "../xnu/files/bsd/dev/lancelot_mali_boot_receipt.h"
 
 /* ------------------------------------------------------------------------ */
 /* Fixed conventions shared with the boot shim, the packer and the kernel   */
@@ -89,6 +90,8 @@ static efi_handle IMAGE;
 #include "../xnu/files/bsd/dev/lancelot_storage.h"
 static struct lancelot_storage mtk_storage_info;
 static uint64_t mtk_usb_offer[3]; /* magic, initialized MAC, firmware boot id */
+static struct lmbr_receipt mtk_gpu_receipt;
+static bool mtk_gpu_receipt_ready;
 static void lancelot_usb_resume(void);
 static efi_file *esp_root;
 static void (*platform_log_char)(char);
@@ -3176,6 +3179,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		dt_prop(&w, "lancelot-usb-log", mtk_usb_offer, sizeof(mtk_usb_offer));
 	if (PLAT == &platform_lancelot && mtk_storage_info.magic == LANCELOT_STORAGE_MAGIC)
 		dt_prop(&w, "lancelot-emmc", &mtk_storage_info, sizeof(mtk_storage_info));
+	if (PLAT == &platform_lancelot && mtk_gpu_receipt_ready)
+		dt_prop(&w, "lancelot-gpu-receipt", &mtk_gpu_receipt, sizeof(mtk_gpu_receipt));
 	dt_prop(&w, "random-seed", seed, sizeof(seed));
 	dt_prop_u64(&w, "dram-base", phys_base);
 	dt_prop_u64(&w, "dram-size", win_size);

@@ -264,6 +264,226 @@ lancelot_load_payload(void)
 }
 
 #include "lancelot_ubuntu.h"
+#include "lancelot_pmic.h"
+#include "lancelot_gpu_prepare.h"
+#include "lancelot_gpu_dma_native.h"
+
+static void lancelot_gpu_save_receipt(const struct lpg_result*r,int pool_error,bool dma) {
+	struct lmbr_receipt*p=&mtk_gpu_receipt;struct lfd_context*f=&lancelot_dma_context;
+	struct lm_private_dma*s=&f->transaction;memset(p,0,sizeof(*p));
+	p->pool_pa=f->pa;p->sequence=s->job_result.sequence;p->fault_pa=s->job_result.fault_address;
+	uint32_t*w=p->word;
+	w[LMBR_ERROR]=(uint32_t)r->error;w[LMBR_TEARDOWN]=(uint32_t)r->teardown_error;
+	w[LMBR_GPU_ID]=r->gpu_id;w[LMBR_GPU_STATUS]=r->gpu_status;w[LMBR_HZ]=r->source_hz;
+	w[LMBR_PWR_WRITES]=0;w[LMBR_STARTED]=r->started;w[LMBR_OFF]=r->domains_restored;
+	w[LMBR_FEATURE_VALID]=r->features_valid;w[LMBR_DMA_REQUEST]=dma;
+	w[LMBR_DMA_ATTEMPT]=r->dma_attempted;w[LMBR_DMA_SAFE]=r->dma_safe_to_teardown;
+	w[LMBR_DMA_HALT]=dma&&r->dma_halt_required;w[LMBR_POOL_ERROR]=(uint32_t)pool_error;
+	w[LMBR_RETAINED]=f->allocated;w[LMBR_PEAK]=f->peak_pages;w[LMBR_CLEANS]=f->cleans;
+	w[LMBR_INVALIDATES]=f->invalidates;w[LMBR_GPU_READS]=f->gpu_reads;w[LMBR_GPU_WRITES]=f->gpu_writes;
+	w[LMBR_IO_ERROR]=(uint32_t)f->io_error;w[LMBR_RELEASE_ERROR]=(uint32_t)f->release_error;
+	w[LMBR_SUBMITTED]=s->submitted;w[LMBR_GUARDS]=s->guards_valid;w[LMBR_BAD_OFFSET]=s->bad_offset;
+	w[LMBR_BAD_JOB]=s->bad_job;w[LMBR_CLEANUP]=(uint32_t)s->cleanup_error;w[LMBR_VALUE]=s->observed_value;
+	w[LMBR_JOB_IRQ]=s->job_result.job_irq;w[LMBR_JOB_STATUS]=s->job_result.job_status;
+	w[LMBR_MMU]=s->job_result.mmu_fault;w[LMBR_GPU_FAULT]=s->job_result.gpu_fault;
+	w[LMBR_JOB_STAGE]=s->job_result.failed_stage;w[LMBR_MISMATCH_REG]=s->job_result.mismatch_reg;
+	w[LMBR_EXPECTED_LO]=(uint32_t)s->job_result.expected;w[LMBR_EXPECTED_HI]=(uint32_t)(s->job_result.expected>>32);
+	w[LMBR_OBSERVED_LO]=(uint32_t)s->job_result.observed;w[LMBR_OBSERVED_HI]=(uint32_t)(s->job_result.observed>>32);
+	w[LMBR_RESET_COMPLETED]=s->job_result.reset_completed;w[LMBR_QUARANTINED]=s->job_result.quarantined;
+	w[LMBR_TEARDOWN_STATE]=r->teardown_state;
+	w[LMBR_FIRST_IO_ERROR]=(uint32_t)f->first_io_error;w[LMBR_FIRST_IO_REG]=f->first_io_reg;
+	w[LMBR_FIRST_IO_PHASE]=f->first_io_phase;w[LMBR_RECOVERY_ATTEMPT]=f->recovery_attempted;
+	w[LMBR_RECOVERY_ACTIVE]=f->recovering;w[LMBR_LAST_PHASE]=f->phase;
+	w[LMBR_TRANSPORT_ERROR]=(uint32_t)(f->platform?f->platform->transport_error:0);
+	w[LMBR_TRANSPORT_ADDRESS]=f->platform?f->platform->transport_address:0;
+	w[LMBR_JOB_STATE]=s->job_result.job_state;
+	w[LMBR_MMU_FAULT_TEST]=s->mmu_fault_test;w[LMBR_EXPECTED_FAULT]=s->expected_fault;
+	w[LMBR_EXPECTED_VA_LO]=(uint32_t)s->expected_fault_va;
+	w[LMBR_EXPECTED_VA_HI]=(uint32_t)(s->expected_fault_va>>32);
+	if(r->features_valid)memcpy(w+LMBR_FEATURE_FIRST,r->features.word,sizeof(r->features.word));
+	lmbr_seal(p,mtk_usb_offer[2]);mtk_gpu_receipt_ready=true;
+}
+static void lancelot_gpu_print_receipt(void) {
+	const struct lmbr_receipt*r=&mtk_gpu_receipt;
+	if(!lmbr_valid(r,sizeof(*r),r->boot_id)) {
+		print("lancelot-gpu-receipt: invalid local CRC/boot; no evidence published\n");return;
+	}
+	print("lancelot-gpu-receipt: source=UEFI boot=%x pool=%x sequence=%d fault=%x size=%d crc=%x verified=1 version=%d\n",
+	    r->boot_id,r->pool_pa,r->sequence,r->fault_pa,(uint64_t)r->size,(uint64_t)r->crc,(uint64_t)r->version);
+	int quiet=screen_quiet;screen_quiet=1;
+	for(unsigned i=0;i<96;i++)print("lancelot-gpu-receipt: word=%d value=%x\n",(uint64_t)i,(uint64_t)r->word[i]);
+	screen_quiet=quiet; /* Full CRC record stays in both RAM logs, not 96 screen scrolls. */
+}
+
+static uint64_t lancelot_gpu_now(void *cookie) {
+	(void)cookie;
+	uint64_t ticks=READ_SYSREG(CNTVCT_EL0),frequency=READ_SYSREG(CNTFRQ_EL0);
+	return (ticks/frequency)*1000000000u+(ticks%frequency)*1000000000u/frequency;
+}
+static void lancelot_gpu_delay(void *cookie,uint32_t us) {(void)cookie;BS->stall(us);}
+static int lancelot_gpu_read(void *cookie,uint64_t pa,uint32_t *value) {
+	(void)cookie;
+	__asm__ volatile("dsb sy" ::: "memory");
+	*value=*(const volatile uint32_t *)(uintptr_t)pa;
+	__asm__ volatile("dsb sy" ::: "memory");return 0;
+}
+static int lancelot_gpu_write(void *cookie,uint64_t pa,uint32_t value) {
+	(void)cookie;
+	*(volatile uint32_t *)(uintptr_t)pa=value;
+	__asm__ volatile("dsb sy" ::: "memory");
+	/* GPU accesses are recorded once by lfd_read/write. Platform writes join
+	 * that bounded RAM trace; no framebuffer/USB printing inside the deadline. */
+	if(!(pa>=lpg_base[3] && pa<lpg_base[3]+0x4000u)) {
+		if(lancelot_dma_context.initialized)
+			lfd_record_trace(&lancelot_dma_context,false,(uint32_t)pa,value,0);
+		else print("lancelot-gpu-power: write addr=%x value=%x\n",pa,(uint64_t)value);
+	}
+	return 0;
+}
+static bool lancelot_gpu_power_probe(const char *cmdline) {
+	int requested=lpm_requested_named(cmdline,"lancelot_gpu_power=");
+	int features=lpm_requested_named(cmdline,"lancelot_gpu_features=");
+	int dma=lpm_requested_named(cmdline,"lancelot_gpu_dma=");
+	int fault=lpm_requested_named(cmdline,"lancelot_gpu_fault=");
+	int clear=lpm_requested_named(cmdline,"lancelot_gpu_clear=");
+	if(features<0 || dma<0 || fault<0 || clear<0 || (features && requested!=1) || (dma && features!=1) ||
+	   (fault && dma!=1) || (clear && dma!=1) || (clear && fault)) {
+		print("lancelot-gpu-features: invalid/duplicate/dependency mode rejected; no MMIO\n");return true;
+	}
+	if(!requested)return true;
+	if(requested!=1){print("lancelot-gpu-power: invalid/duplicate mode rejected; no MMIO\n");return true;}
+	efi_mtk_gpu_map *map=NULL;efi_mtk_pwrap_checked *pmic=NULL;
+	const efi_guid map_guid=EFI_MTK_GPU_MAP_GUID,pmic_guid=EFI_MTK_PWRAP_CHECKED_GUID;
+	if(EFI_ERROR(BS->locate_protocol(&map_guid,NULL,(void**)&map)) || !lpg_map_valid(map) ||
+	   EFI_ERROR(BS->locate_protocol(&pmic_guid,NULL,(void**)&pmic)) || !pmic || !pmic->read ||
+	   !BS->raise_tpl || !BS->restore_tpl || READ_SYSREG(CNTFRQ_EL0)<1000000 || READ_SYSREG(CNTFRQ_EL0)>1000000000) {
+		print("lancelot-gpu-power: checked mapping/provider contract absent; no MMIO\n");return !dma;
+	}
+	struct lpg_context context={.map=map,.pmic=pmic,.read=lancelot_gpu_read,.write=lancelot_gpu_write,
+	    .now_ns=lancelot_gpu_now,.delay_us=lancelot_gpu_delay,.features_requested=features==1,
+	    .dma_requested=dma==1,.dma_cookie=&lancelot_dma_context,.dma_run=lfd_run};
+	if(dma) {
+		lancelot_dma_context.transaction.mmu_fault_test=fault==1;
+		lancelot_dma_context.clear_mode=clear==1;
+		int error=lfd_prepare(&lancelot_dma_context,&context,&lancelot_dma_memory);
+		print("lancelot-gpu-dma: pool error=%x base=%x pages=%d clear=%d; no GPU writes unless normal-WB CPU/PA checks pass\n",
+		    (uint64_t)(uint32_t)error,lancelot_dma_context.pa,(uint64_t)LFD_PAGES,(uint64_t)(clear==1));
+		if(error) {
+			struct lpg_result failed={.error=error,.dma_halt_required=true};lancelot_gpu_save_receipt(&failed,error,true);
+			lancelot_gpu_print_receipt();
+			return false;
+		}
+	}
+	uint64_t previous_tpl=BS->raise_tpl(16);
+	struct lpg_result result=lpg_run(&context);
+	uint64_t lifecycle_ns=lancelot_gpu_now(NULL)-context.start;
+	BS->restore_tpl(previous_tpl);
+	if(dma)lpg_dma_finish_handoff(&result,!lancelot_dma_context.allocated &&
+	    !lancelot_dma_context.release_error && !lancelot_dma_context.io_error);
+	lancelot_gpu_save_receipt(&result,0,dma==1);
+	mtk_gpu_receipt.word[LMBR_PWR_WRITES]=context.writes;
+	lmbr_seal(&mtk_gpu_receipt,mtk_usb_offer[2]);
+	if(dma) {
+		print("lancelot-gpu-dma: lifecycle elapsed=%dms; test-budget=2000ms stop-only-budget=1000ms\n",
+		    lifecycle_ns/1000000u);
+		struct lfd_context*f=&lancelot_dma_context;
+		struct lm_private_dma*s=&f->transaction;
+		print("lancelot-gpu-dma: mmu-fault-test=%d expected-fault=%d expected-va=%x; original error preserved\n",
+		    (uint64_t)s->mmu_fault_test,(uint64_t)s->expected_fault,s->expected_fault_va);
+		print("lancelot-gpu-dma: first-io=%x reg=%x phase=%d recovery=%d active=%d last-phase=%d\n",
+		    (uint64_t)(uint32_t)f->first_io_error,(uint64_t)f->first_io_reg,(uint64_t)f->first_io_phase,
+		    (uint64_t)f->recovery_attempted,(uint64_t)f->recovering,(uint64_t)f->phase);
+		print("lancelot-gpu-dma: transport-error=%x address=%x; never cleared by deadline recovery\n",
+		    (uint64_t)(uint32_t)context.transport_error,(uint64_t)context.transport_address);
+		print("lancelot-gpu-dma: job-state-snapshot=%x; CURRENT and NEXT must both be idle\n",(uint64_t)s->job_result.job_state);
+		print("lancelot-gpu-dma: failed-stage=%d reg=%x expected=%x observed=%x reset=%d quarantined=%d teardown-state=%x\n",
+		    (uint64_t)s->job_result.failed_stage,(uint64_t)s->job_result.mismatch_reg,s->job_result.expected,
+		    s->job_result.observed,(uint64_t)s->job_result.reset_completed,(uint64_t)s->job_result.quarantined,
+		    (uint64_t)result.teardown_state);
+		print("lancelot-gpu-dma: error=%x attempted=%d submitted=%d sequence=%d job-irq=%x job-status=%x mmu=%x gpu=%x fault-pa=%x\n",
+		    (uint64_t)(uint32_t)result.error,(uint64_t)result.dma_attempted,(uint64_t)s->submitted,
+		    s->job_result.sequence,(uint64_t)s->job_result.job_irq,(uint64_t)s->job_result.job_status,
+		    (uint64_t)s->job_result.mmu_fault,(uint64_t)s->job_result.gpu_fault,s->job_result.fault_address);
+		print("lancelot-gpu-dma: value=%x guards=%d bad-offset=%d bad-job=%d cleanup=%x safe=%d retained=%d halt=%d\n",
+		    (uint64_t)s->observed_value,(uint64_t)s->guards_valid,(uint64_t)s->bad_offset,(uint64_t)s->bad_job,
+		    (uint64_t)(uint32_t)s->cleanup_error,(uint64_t)result.dma_safe_to_teardown,
+		    (uint64_t)f->allocated,(uint64_t)result.dma_halt_required);
+		if(clear)
+			print("lancelot-gpu-clear: fragment-job=%d color=%x guards=%d bad-offset=%x actual=%x; GPU writes RGBA8 64x64 pixels, not WRITE_VALUE\n",
+			    (uint64_t)(s->descriptor_status==UINT32_C(0x00010013)),(uint64_t)s->clear_value,
+			    (uint64_t)s->guards_valid,(uint64_t)s->bad_offset,(uint64_t)s->clear_actual);
+		print("lancelot-gpu-dma: peak-pages=%d cache-clean=%d cache-invalidate=%d reads=%d writes=%d io-error=%x release=%x; %s\n",
+		    (uint64_t)f->peak_pages,(uint64_t)f->cleans,(uint64_t)f->invalidates,(uint64_t)f->gpu_reads,
+		    (uint64_t)f->gpu_writes,(uint64_t)(uint32_t)f->io_error,(uint64_t)(uint32_t)f->release_error,
+		    clear?"fragment clear writes pixels; a full renderer is not proved yet":"WRITE_VALUE is not rendering");
+	}
+	if(features) {
+		if(result.features_valid) {
+			int quiet=screen_quiet;screen_quiet=1;
+			for(unsigned i=0;i<LPG_FEATURE_WORDS;i++)
+				print("lancelot-gpu-features: reg=%x value=%x\n",
+				    (uint64_t)lpg_feature_offsets[i],(uint64_t)result.features.word[i]);
+			screen_quiet=quiet;
+		}
+		print("lancelot-gpu-features: valid=%d stable-passes=%d words=%d private-dma-candidate=%d; %s\n",
+		    (uint64_t)result.features_valid,(uint64_t)(result.features_valid?2:0),
+		    (uint64_t)(result.features_valid?LPG_FEATURE_WORDS:0),(uint64_t)result.private_dma_candidate,
+		    dma?"read-only feature sample; DMA reported separately":"no job/DMA");
+	}
+	print("lancelot-gpu-power: before-power SWCID=%x VGPU EN/DA/SEL/DASEL=%x/%x/%x/%x VSRAM=%x/%x/%x/%x; inherited rails are not changed\n",
+	    (uint64_t)result.pmic.raw[0],(uint64_t)result.pmic.raw[1],(uint64_t)result.pmic.raw[2],
+	    (uint64_t)result.pmic.raw[3],(uint64_t)result.pmic.raw[4],(uint64_t)result.pmic.raw[5],
+	    (uint64_t)result.pmic.raw[6],(uint64_t)result.pmic.raw[7],(uint64_t)result.pmic.raw[8]);
+	print("lancelot-gpu-power: error=%x GPU_ID=%x STATUS=%x source=%dHz started=%d off-restored=%d teardown=%x writes=%d; %s\n",
+	    (uint64_t)(uint32_t)result.error,(uint64_t)result.gpu_id,(uint64_t)result.gpu_status,(uint64_t)result.source_hz,
+	    (uint64_t)result.started,(uint64_t)result.domains_restored,(uint64_t)(uint32_t)result.teardown_error,(uint64_t)context.writes,
+	    dma?"private GPU command/DMA results reported separately":"no GPU command/DMA");
+	print("lancelot-gpu-power: firmware-only diagnostic; no XNU WACS2 owner or render service published\n");
+	if(dma && !lpg_dma_handoff_safe(&result) && lpg_dma_readonly_resume_safe(&result))
+		print("lancelot-gpu-dma: full stage FAILED; DMA/VM resources released, resume XNU read-only only; no GPU service\n");
+	lancelot_gpu_print_receipt();
+	if(dma) {
+		print("lancelot-gpu-dma: deferred trace events=%d dropped=%d; outside lifecycle deadline\n",
+		    (uint64_t)lancelot_dma_context.trace_count,(uint64_t)lancelot_dma_context.trace_dropped);
+		int quiet=screen_quiet;screen_quiet=1;
+		lfd_flush_trace(&lancelot_dma_context);
+		screen_quiet=quiet;
+	}
+	if(features) {
+		/* Feature evidence is produced after the initial capture window. Give
+		 * the real firmware USB reader time to drain it before XNU changes
+		 * protocol/cursor domains. TPL is already restored; no extra GPU access. */
+		print("lancelot-gpu-features: post-probe LLOG1 capture window 15 s; no further GPU access\n");
+		BS->stall(15000000);
+	}
+	return !dma || lpg_dma_handoff_safe(&result) || lpg_dma_readonly_resume_safe(&result);
+}
+
+static void
+lancelot_observe_pmic(const char *cmdline)
+{
+	int mode = lpm_requested(cmdline);
+	if (!mode) return;
+	if (mode != 1) { print("lancelot-pmic: invalid/duplicate probe mode; no protocol/MMIO access\n"); return; }
+	const efi_guid guid = EFI_MTK_PWRAP_CHECKED_GUID;
+	efi_mtk_pwrap_checked *io = NULL;
+	efi_status status = BS->locate_protocol(&guid, NULL, (void **)&io);
+	if (EFI_ERROR(status) || !io || !io->read) {
+		print("lancelot-pmic: bounded Mu PWRAP contract absent; no PMIC access\n");
+		return;
+	}
+	struct lpm_snapshot s;
+	status = lpm_capture(io, &s);
+	if (status) {
+		print("lancelot-pmic: UEFI snapshot failed=%x; no partial result, no retry or GPU power\n", status);
+		return;
+	}
+	print("lancelot-pmic: UEFI real SWCID=%x confirmed before/after 8 rail reads; no PMIC write\n", (uint64_t)s.raw[0]);
+	for (unsigned i = 1; i < 9; i++)
+		print("lancelot-pmic: rail raw addr=%x value=%x; status/selector, NOT measured voltage\n",
+		    (uint64_t)lpm_read_addresses[i], (uint64_t)s.raw[i]);
+	print("lancelot-pmic: before-handoff observation only; XNU/secure-world ownership still unproven, no GPU power/DMA\n");
+}
 
 static efi_status
 lancelot_boot(void)
@@ -300,6 +520,11 @@ lancelot_boot(void)
 	BS->stall(30000000);
 	struct payload_info pi;
 	int valid = parse_payload(&pi, 0);
+	if (valid) lancelot_observe_pmic(pi.cmdline);
+	if (valid && !lancelot_gpu_power_probe(pi.cmdline)) {
+		print("lancelot-gpu-dma: unsafe or unprepared DMA state; keeping backing and firmware, kernel handoff refused\n");
+		for (;;) BS->stall(100000);
+	}
 	if (valid && pi.checkpoint == 998) {
 		/* A sequence ends at the first failed return, never masks a failed step. */
 		static const uint64_t checkpoints[] = { 1, 2, 3, 4, 5, 10 };

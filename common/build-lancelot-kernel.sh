@@ -35,6 +35,14 @@ for file in bsd/dev/lancelot_usb.c bsd/dev/lancelot_musb.h bsd/dev/lancelot_emmc
              bsd/dev/lancelot_nt36672_hw.c bsd/dev/lancelot_nt36672_hw.h \
              bsd/dev/lancelot_smp.h \
              bsd/dev/lancelot_cache.h \
+             bsd/dev/lancelot_mali_observe.c bsd/dev/lancelot_mali_observe.h bsd/dev/lancelot_pwrap.c bsd/dev/lancelot_pwrap.h \
+             bsd/dev/lancelot_mali.c bsd/dev/lancelot_mali_core.c bsd/dev/lancelot_mali_core.h \
+             bsd/dev/lancelot_mali_platform.c bsd/dev/lancelot_mali_platform.h \
+              bsd/dev/lancelot_mali_pmic.c bsd/dev/lancelot_mali_pmic.h bsd/dev/lancelot_mali_smoke.h \
+              bsd/dev/lancelot_sspm_pmic.c bsd/dev/lancelot_sspm_pmic.h \
+              bsd/dev/lancelot_sspm_boot.c bsd/dev/lancelot_sspm_selftest.h \
+             iokit/Kernel/LancelotMali.cpp iokit/Kernel/LancelotMaliExport.h \
+             iokit/Kernel/lancelot_mali_uapi.h iokit/Kernel/lancelot_mali_client_logic.h \
             bsd/dev/lancelot_ext4.h bsd/dev/lancelot_sha256.h bsd/dev/redwood_input.c bsd/sys/redwood_input.h \
             bsd/miscfs/apfs/apfs_vfsops.c; do
   if ! cmp -s "xnu/files/$file" "xnu-src/xnu-8796.121.2/$file"; then
@@ -49,6 +57,11 @@ python3 tools/test-lancelot-touch-queue.py
 python3 tools/test-lancelot-touch-hardware.py
 python3 tools/test-lancelot-smp.py
 python3 tools/test-lancelot-cache.py
+python3 tools/test-lancelot-pwrap.py
+python3 tools/test-lancelot-mali-observe.py
+python3 tools/test-lancelot-mali.py
+python3 tools/test-lancelot-sspm-pmic.py
+python3 tools/test-lancelot-sspm-boot.py
 KERNEL=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
 # XNU's build target performs setup/header export/compile/link. The all/config
 # target additionally checks unavailable DriverKit RPC exports and builds kext

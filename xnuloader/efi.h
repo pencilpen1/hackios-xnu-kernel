@@ -44,7 +44,8 @@ typedef struct {
 
 typedef struct {
 	efi_table_header hdr;
-	void *raise_tpl, *restore_tpl;
+	uint64_t (EFIAPI *raise_tpl)(uint64_t tpl);
+	void (EFIAPI *restore_tpl)(uint64_t tpl);
 	efi_status (EFIAPI *allocate_pages)(int type, int mem_type, uint64_t pages, uint64_t *addr);
 	efi_status (EFIAPI *free_pages)(uint64_t addr, uint64_t pages);
 	efi_status (EFIAPI *get_memory_map)(uint64_t *size, void *map, uint64_t *key, uint64_t *desc_size, uint32_t *desc_ver);
@@ -209,6 +210,19 @@ typedef struct {
 	efi_status (EFIAPI *get_frequency)(uint32_t id, uint64_t *hz);
 } efi_mtk_clock;
 #define EFI_MTK_CLOCK_GUID { 0x79c0d079, 0x75c1, 0xa84a, { 0x80, 0x14, 0x42, 0x60, 0xcb, 0x97, 0x35, 0x33 } }
+
+/* Bounded EFI_STATUS PWRAP contract. Never invoke the old void API by guessing
+ * its return value. The checked GUID exists only in the amended Mu driver. */
+typedef struct {
+	efi_status (EFIAPI *read)(uint16_t address, uint16_t *value);
+	void *write, *update_bits; /* deliberately not callable by this read-only probe */
+} efi_mtk_pwrap_checked;
+#define EFI_MTK_PWRAP_CHECKED_GUID { 0x9d0d6b42, 0x7d76, 0x4c3f, { 0xb1, 0x9e, 0x91, 0xc8, 0x8e, 0x63, 0x32, 0x02 } }
+typedef struct {
+	uint32_t revision, size;
+	struct { uint64_t base, size; } window[6];
+} efi_mtk_gpu_map;
+#define EFI_MTK_GPU_MAP_GUID { 0x52ac17b1, 0xb103, 0x4e02, { 0x92, 0x3f, 0x61, 0x8b, 0x37, 0xa7, 0x68, 0x01 } }
 
 /* Block I/O 2: the same reads, asynchronous -- a token's event is signalled when one is done */
 typedef struct {

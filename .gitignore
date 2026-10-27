@@ -4,6 +4,7 @@
 /*
 !/.gitignore
 !/README.md
+!/CLAUDE.md
 !/LICENSE
 !/common/
 !/docs/
@@ -48,6 +49,11 @@ __pycache__/
 !/xnuloader/mkpayload.py
 !/xnuloader/lancelot.h
 !/xnuloader/lancelot_ubuntu.h
+!/xnuloader/lancelot_pmic.h
+!/xnuloader/lancelot_gpu_prepare.h
+!/xnuloader/lancelot_gpu_features.h
+!/xnuloader/lancelot_gpu_dma.h
+!/xnuloader/lancelot_gpu_dma_native.h
 !/xnuloader/ext4_read.h
 !/xnuloader/sha256.h
 
