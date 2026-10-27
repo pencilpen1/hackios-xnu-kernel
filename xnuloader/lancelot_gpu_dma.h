@@ -6,6 +6,7 @@
 #ifndef XNULOADER_LANCELOT_GPU_DMA_H
 #define XNULOADER_LANCELOT_GPU_DMA_H
 #include "lancelot_gpu_prepare.h"
+#include "lancelot_gpu_shaders.h"
 #include "../xnu/files/bsd/dev/lancelot_mali_private_dma.h"
 #define LFD_PAGES 16u
 #define LFD_USABLE_LAST 14u
@@ -37,7 +38,7 @@ struct lfd_context {
     int first_io_error;
     uint32_t first_io_reg,first_io_phase,phase;
     bool initialized,allocated,safe_to_teardown;
-    bool recovery_attempted,recovering,clear_mode,clear_chain;
+    bool recovery_attempted,recovering,clear_mode,clear_chain,triangle_mode;
     struct lfd_trace_event trace[LFD_TRACE_MAX];
     unsigned trace_count,trace_dropped;
 };
@@ -244,8 +245,13 @@ static int lfd_run(void *cookie,struct lmp_state *state,const struct lpg_feature
     *safe=false;f->state=state;
     f->transaction.clear_test=f->clear_mode;
     f->transaction.clear_chain=f->clear_chain;
+    f->transaction.triangle_test=f->triangle_mode;
     f->transaction.clear_value=LM_CLEAR_VALUE;
     f->transaction.clear_value2=LM_CLEAR_VALUE2;
+    f->transaction.tri_vertex_shader=lmg_tri_vertex_shader;
+    f->transaction.tri_vertex_shader_bytes=LMG_TRI_VERTEX_SHADER_BYTES;
+    f->transaction.tri_fragment_shader=lmg_tri_fragment_shader;
+    f->transaction.tri_fragment_shader_bytes=LMG_TRI_FRAGMENT_SHADER_BYTES;
     struct lm_ops io={.cookie=f,.read32=lfd_read,.write32=lfd_write,.now_ns=lfd_now,.delay_us=lfd_delay,
         .alloc=lfd_alloc,.free=lfd_free,.page_alloc=lfd_page_alloc,.page_free=lfd_page_free,
         .for_device=lfd_for_device,.for_cpu=lfd_for_cpu,.barrier=lfd_barrier,.io_error=lfd_error,

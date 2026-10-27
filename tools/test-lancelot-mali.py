@@ -28,6 +28,7 @@ with tempfile.TemporaryDirectory(prefix='lancelot-mali-') as directory:
         ('platform-build', cc + [str(test / 'platform_test.c'), '-o', str(out / 'platform')]),
         ('platform', [str(out / 'platform')]),
         ('core-build', cc + ['-DLM_HOST_TEST', '-I' + str(ROOT / 'xnu/files/bsd/dev'),
+                            '-I' + str(ROOT / 'xnuloader'),
                             str(test / 'core_test.c'), str(ROOT / 'xnu/files/bsd/dev/lancelot_mali_core.c'), '-o', str(out / 'core')]),
         ('core', [str(out / 'core')]),
         ('core-quarantine', [str(out / 'core'), 'quarantine']),

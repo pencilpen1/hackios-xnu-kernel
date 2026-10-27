@@ -347,8 +347,10 @@ static bool lancelot_gpu_power_probe(const char *cmdline) {
 	int fault=lpm_requested_named(cmdline,"lancelot_gpu_fault=");
 	int clear=lpm_requested_named(cmdline,"lancelot_gpu_clear=");
 	int chain=lpm_requested_named(cmdline,"lancelot_gpu_clear_chain=");
-	if(features<0 || dma<0 || fault<0 || clear<0 || chain<0 || (features && requested!=1) || (dma && features!=1) ||
-	   (fault && dma!=1) || (clear && dma!=1) || (clear && fault) || (chain && clear!=1)) {
+	int triangle=lpm_requested_named(cmdline,"lancelot_gpu_triangle=");
+	if(features<0 || dma<0 || fault<0 || clear<0 || chain<0 || triangle<0 || (features && requested!=1) || (dma && features!=1) ||
+	   (fault && dma!=1) || (clear && dma!=1) || (clear && fault) || (chain && clear!=1) ||
+	   (triangle && dma!=1) || (triangle && (fault || clear || chain))) {
 		print("lancelot-gpu-features: invalid/duplicate/dependency mode rejected; no MMIO\n");return true;
 	}
 	if(!requested)return true;
@@ -367,10 +369,11 @@ static bool lancelot_gpu_power_probe(const char *cmdline) {
 		lancelot_dma_context.transaction.mmu_fault_test=fault==1;
 		lancelot_dma_context.clear_mode=clear==1;
 		lancelot_dma_context.clear_chain=chain==1;
+		lancelot_dma_context.triangle_mode=triangle==1;
 		int error=lfd_prepare(&lancelot_dma_context,&context,&lancelot_dma_memory);
-		print("lancelot-gpu-dma: pool error=%x base=%x pages=%d clear=%d chain=%d; no GPU writes unless normal-WB CPU/PA checks pass\n",
+		print("lancelot-gpu-dma: pool error=%x base=%x pages=%d clear=%d chain=%d triangle=%d; no GPU writes unless normal-WB CPU/PA checks pass\n",
 		    (uint64_t)(uint32_t)error,lancelot_dma_context.pa,(uint64_t)LFD_PAGES,
-		    (uint64_t)(clear==1),(uint64_t)(chain==1));
+		    (uint64_t)(clear==1),(uint64_t)(chain==1),(uint64_t)(triangle==1));
 		if(error) {
 			struct lpg_result failed={.error=error,.dma_halt_required=true};lancelot_gpu_save_receipt(&failed,error,true);
 			lancelot_gpu_print_receipt();
@@ -415,9 +418,14 @@ static bool lancelot_gpu_power_probe(const char *cmdline) {
 			print("lancelot-gpu-clear: fragment-jobs=%d colors=%x/%x guards=%d bad-offset=%x actual=%x; GPU writes RGBA8 64x64 pixels, not WRITE_VALUE\n",
 			    (uint64_t)(s->clear_chain?2:1),(uint64_t)s->clear_value,(uint64_t)(s->clear_chain?s->clear_value2:s->clear_value),
 			    (uint64_t)s->guards_valid,(uint64_t)s->bad_offset,(uint64_t)s->clear_actual);
+		if(triangle)
+			print("lancelot-gpu-triangle: jobs=3 vertex+tiler+fragment color=%x guards=%d bad-stage=%d bad-offset=%x actual=%x; real vertex shader, tiler and fragment shader, not a clear\n",
+			    (uint64_t)LM_TRI_VALUE,(uint64_t)s->guards_valid,(uint64_t)s->tri_bad_stage,
+			    (uint64_t)s->tri_bad_word,(uint64_t)s->tri_actual);
 		print("lancelot-gpu-dma: peak-pages=%d cache-clean=%d cache-invalidate=%d reads=%d writes=%d io-error=%x release=%x; %s\n",
 		    (uint64_t)f->peak_pages,(uint64_t)f->cleans,(uint64_t)f->invalidates,(uint64_t)f->gpu_reads,
 		    (uint64_t)f->gpu_writes,(uint64_t)(uint32_t)f->io_error,(uint64_t)(uint32_t)f->release_error,
+		    triangle?"shader triangle writes pixels; a full renderer/desktop is not proved yet":
 		    clear?"fragment clear writes pixels; a full renderer is not proved yet":"WRITE_VALUE is not rendering");
 	}
 	if(features) {

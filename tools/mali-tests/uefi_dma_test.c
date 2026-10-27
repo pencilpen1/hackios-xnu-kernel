@@ -112,6 +112,19 @@ int main(int argc,char **argv) {
     assert(!lfd_run(&f,&state,&props,&safe)&&safe&&!f.allocated&&m.releases==1);
     assert(f.transaction.guards_valid&&f.transaction.clear_chain&&f.peak_pages==13);
     assert(f.transaction.observed_value==LM_CLEAR_VALUE&&m.gpu.jobs_run==2);
+    /* Shader triangle through the real firmware adapter: three dependent
+     * jobs, executable shader page, vertex/varying buffers and tiler heap. */
+    fw_init(&m,&c,&mem);f=(struct lfd_context){0};assert(!lfd_prepare(&f,&c,&mem));
+    f.triangle_mode=true;m.gpu.emulate_triangle=true;
+    assert(!lfd_run(&f,&state,&props,&safe)&&safe&&!f.allocated&&m.releases==1);
+    assert(f.transaction.triangle_test&&f.transaction.guards_valid);
+    assert(f.transaction.observed_value==LM_TRI_VALUE&&f.peak_pages==14);
+    assert(m.gpu.jobs_run==3&&!f.page_mask&&!f.metadata_active);
+    fw_init(&m,&c,&mem);f=(struct lfd_context){0};assert(!lfd_prepare(&f,&c,&mem));
+    f.triangle_mode=true;m.gpu.emulate_triangle=true;m.gpu.corrupt_pixel=true;
+    assert(lfd_run(&f,&state,&props,&safe)==LM_EIO&&safe&&!f.allocated&&m.releases==1);
+    assert(!f.transaction.guards_valid&&f.transaction.tri_bad_stage==0&&
+        f.transaction.tri_bad_word==4u&&f.transaction.tri_actual==(LM_TRI_VALUE^1u));
     const uint32_t bind_regs[]={0x2400,0x2404,0x2408,0x240c,0x2430,0x2434};
     for(unsigned i=0;i<sizeof(bind_regs)/sizeof(bind_regs[0]);i++) {
         fw_init(&m,&c,&mem);f=(struct lfd_context){0};assert(!lfd_prepare(&f,&c,&mem));
@@ -143,6 +156,6 @@ int main(int argc,char **argv) {
     assert(LM_JOB_NEXT_CONFIG==0x3300&&!lfd_write_allowed(&f,0x18d8,0x83300));
     m.bus_blocked=true;assert(lfd_read(&f,0x14)==0&&f.io_error&&!m.gpu.reads);
     assert(!fw_release(&m,m.arena,f.pa,LFD_PAGES));
-    puts("Actual firmware DMA/clear adapter: private walk/offset128, real fragment clear writes 64x64 RGBA8 pixels, lease/WB/cache/domain/PA/AS/write whitelist guards PASS; RAM ONLY");
+    puts("Actual firmware DMA/clear/triangle adapter: private walk/offset128, fragment clear and dependent VERTEX->TILER->FRAGMENT shader triangle write 64x64 RGBA8, lease/WB/cache/domain/PA/AS/write whitelist guards PASS; RAM ONLY");
     return 0;
 }

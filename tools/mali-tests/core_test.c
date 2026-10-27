@@ -6,6 +6,7 @@
 #include <string.h>
 #include "lancelot_mali_core.h"
 #include "lancelot_mali_private_dma.h"
+#include "lancelot_gpu_shaders.h"
 struct fake {
     uint32_t reg[4096]; uint64_t time, pa;
     unsigned allocs,pages,clean,invalidate,reads,writes;
@@ -13,7 +14,7 @@ struct fake {
     uint32_t fail_read,fail_write; bool fail_after_done,submitted;
     bool drop_bind_root,drop_detach_config,drop_next_head,stale_done,done_busy;
     bool emulate_value,corrupt_guard,reset_fail_after_submit;
-    bool emulate_clear,corrupt_pixel,corrupt_pixel2;
+    bool emulate_clear,emulate_triangle,corrupt_pixel,corrupt_pixel2;
     unsigned jobs_run;
     uint32_t corrupt_bind_reg;
     unsigned active_slot;
@@ -53,6 +54,103 @@ static void *gpu_address(struct fake*f,uint64_t va) {
         if(level==3)return physical(f,root+(va&4095));
     }
     return NULL;
+}
+static uint64_t jq(const uint32_t*j,unsigned w){return (uint64_t)j[w]|(uint64_t)j[w+1]<<32;}
+static uint64_t tri_abuf_ptr(const uint32_t*b) {
+    uint64_t q=(uint64_t)(b[0]>>6)|((uint64_t)(b[1]&0xffffff)<<26);
+    return q<<6;
+}
+/* Emulate the three-job Bifrost triangle chain. This is not a shader
+ * interpreter: it proves the driver packed a vertex job, a dependent tiler
+ * job and a dependent fragment job with the exact descriptors the Mesa
+ * reference produced, then models their observable writes. */
+static void fake_triangle(struct fake*f,uint64_t jc) {
+    uint32_t *job[3]={0};unsigned n=0;
+    for(uint64_t cur=jc;cur;){
+        uint32_t*j=gpu_address(f,cur);assert(j);
+        assert(j[4]&1u); /* 64-bit job header */
+        unsigned type=(j[4]>>1)&0x7fu;
+        assert(j[4]&1u);
+        if(type==5)job[0]=j;
+        else if(type==7)job[1]=j;
+        else if(type==9)job[2]=j;
+        else assert(!"unexpected job type");
+        n++;assert(n<=3);
+        cur=jq(j,6);
+    }
+    assert(n==3&&job[0]&&job[1]&&job[2]);
+    assert(((job[0][4]>>16)&0xffffu)==1u&&(job[0][5]&0xffffu)==0u);
+    assert(((job[1][4]>>16)&0xffffu)==2u&&(job[1][5]&0xffffu)==1u);
+    assert(((job[2][4]>>16)&0xffffu)==3u&&(job[2][5]&0xffffu)==2u);
+    /* Vertex job draw: vertex RSD, input attributes and output varyings. */
+    uint32_t *vd=job[0]+16;
+    uint32_t *vrsd=gpu_address(f,jq(vd,14));assert(vrsd);
+    assert(jq(vrsd,0)==LM_TRI_SHADER_PAGE_VA);
+    assert(vrsd[3]==0x00020001u&&vrsd[4]==0x00002000u&&vrsd[12]==0x00006000u);
+    uint32_t *attr=gpu_address(f,jq(vd,18));assert(attr);
+    assert(((attr[0]>>10)&0x3fffffu)==(16u|(175u<<12)));
+    assert(attr[0]&(1u<<9));
+    assert((attr[0]&0x1ffu)==0u);
+    uint32_t *abuf=gpu_address(f,jq(vd,16));assert(abuf);
+    assert(tri_abuf_ptr(abuf)==LM_PRIVATE_JOB_VA+LM_TRI_VERTEX_DATA);
+    assert(abuf[2]==8u&&abuf[3]==24u);
+    uint32_t *vin=gpu_address(f,tri_abuf_ptr(abuf));assert(vin);
+    static const uint32_t want_in[6]={0xbf800000u,0xbf800000u,0x40400000u,
+        0xbf800000u,0xbf800000u,0x40400000u};
+    for(unsigned i=0;i<6;i++)assert(vin[i]==want_in[i]);
+    uint32_t *vary=gpu_address(f,jq(vd,22));assert(vary);
+    assert((vary[0]&0x1ffu)==1u&&((vary[0]>>10)&0x3fffffu)==(94u<<12));
+    assert((vary[2]&0x1ffu)==2u&&((vary[2]>>10)&0x3fffffu)==(199u<<12));
+    uint32_t *vbuf=gpu_address(f,jq(vd,20));assert(vbuf);
+    assert(tri_abuf_ptr(vbuf+4)==LM_PRIVATE_JOB_VA+LM_TRI_POS_BUF);
+    assert(vbuf[6]==16u&&vbuf[7]==48u);
+    assert(tri_abuf_ptr(vbuf+8)==LM_PRIVATE_JOB_VA+LM_TRI_PSIZ_BUF);
+    assert(vbuf[10]==2u&&vbuf[11]==6u);
+    /* Tiler job: primitive, tiler context/heap and fragment draw. */
+    uint32_t *tp=job[1]+10;
+    assert((tp[0]&0xffu)==8u); /* Triangles */
+    assert(tp[3]==2u);         /* index_count - 1 */
+    assert(jq(job[1],18)==LM_PRIVATE_JOB_VA+LM_TRI_TILER_CTX);
+    uint32_t *ctx=gpu_address(f,jq(job[1],18));assert(ctx);
+    assert(ctx[2]==6u&&ctx[3]==0x003f003fu);
+    uint64_t heap_desc=jq(ctx,6);
+    uint32_t *hd=gpu_address(f,heap_desc);assert(hd);
+    assert(hd[1]==LM_TRI_HEAP_BYTES);
+    assert((jq(hd,2))==LM_TRI_HEAP_VA&&(jq(hd,6))==LM_TRI_HEAP_VA+LM_TRI_HEAP_BYTES);
+    assert(jq(job[1],16)==LM_PRIVATE_JOB_VA+LM_TRI_PSIZ_BUF);
+    uint32_t *td=job[1]+32;
+    uint32_t *frsd=gpu_address(f,jq(td,14));assert(frsd);
+    assert(jq(frsd,0)==LM_TRI_SHADER_PAGE_VA+0x100u);
+    assert(frsd[4]==0x41502200u&&frsd[8]==0x37d8ffffu&&
+           frsd[9]==0x40000000u&&frsd[12]==0x00000080u);
+    uint32_t *blend=(uint32_t *)((uint8_t *)frsd+64);
+    assert(blend[0]==0x00000a00u&&blend[1]==0xf0122122u&&
+           blend[2]==0x00000019u&&blend[3]==0x010ed000u);
+    uint32_t *vp=gpu_address(f,jq(td,24));assert(vp);
+    assert(vp[2]==0x42800000u&&vp[7]==0x003f003fu);
+    assert(jq(td,4)==LM_PRIVATE_JOB_VA+LM_TRI_POS_BUF);
+    uint32_t *pos=gpu_address(f,jq(td,4));assert(pos);
+    static const uint32_t want_pos[12]={0xbf800000u,0xbf800000u,0u,0x3f800000u,
+        0x40400000u,0xbf800000u,0u,0x3f800000u,
+        0xbf800000u,0x40400000u,0u,0x3f800000u};
+    for(unsigned i=0;i<12;i++)pos[i]=want_pos[i];
+    uint16_t *psiz=gpu_address(f,jq(job[1],16));assert(psiz);
+    for(unsigned i=0;i<3;i++)psiz[i]=0x3c00u;
+    /* Fragment job: FBD, tiler pointer and exact shader colour. */
+    uint32_t *fbd=gpu_address(f,jq(job[2],10));assert(fbd);
+    assert(fbd[8]==0x003f003fu&&fbd[10]==0x003f003fu);
+    assert(fbd[11]==0x01001080u&&fbd[12]==0x00010000u);
+    assert(jq(fbd,14)==LM_PRIVATE_JOB_VA+LM_TRI_TILER_CTX);
+    uint32_t *rt=fbd+32;
+    assert((rt[0]>>26)==1u&&rt[1]==0x86880299u);
+    assert(jq(rt,8)==LM_PRIVATE_OUTPUT_VA&&rt[10]==256u);
+    uint64_t out_va=jq(rt,8);
+    for(unsigned i=0;i<LM_TRI_WIDTH*LM_TRI_HEIGHT;i++) {
+        uint32_t *p=gpu_address(f,out_va+4u*i);assert(p);
+        *p=LM_TRI_VALUE;
+        if(f->corrupt_pixel&&i==1)*p^=1u;
+    }
+    f->jobs_run=3;
 }
 static void clean(void*o,void*p,size_t n) {assert(p&&n==4096);((struct fake*)o)->clean++;}
 static void inval(void*o,void*p,size_t n) {assert(p&&n==4096);((struct fake*)o)->invalidate++;}
@@ -127,6 +225,10 @@ static void wr(void*o,uint32_t r,uint32_t x) {
                     f->jobs_run++;
                     jc=(uint64_t)job[6]|(uint64_t)job[7]<<32;
                 }
+                if(f->fail_write&&r==f->fail_write&&(!f->fail_after_done||f->submitted))f->ioerr=1;
+            } else if(f->emulate_triangle) {
+                uint64_t jc=(uint64_t)f->reg[(r-0x20)/4]|(uint64_t)f->reg[(r-0x1c)/4]<<32;
+                fake_triangle(f,jc);
                 if(f->fail_write&&r==f->fail_write&&(!f->fail_after_done||f->submitted))f->ioerr=1;
             } else if(f->emulate_value) {
                 uint64_t jc=(uint64_t)f->reg[(r-0x20)/4]|(uint64_t)f->reg[(r-0x1c)/4]<<32;
@@ -437,10 +539,46 @@ static void private_clear_chain_mismatch(void) {
     assert(s.cleaned&&!s.backing_retained&&!f.pages&&!f.allocs);
     puts("Private chained clear negative: a wrong pixel in the second surface is rejected with its exact offset/value; RAM ONLY");
 }
+static void private_triangle(void) {
+    struct fake f;struct lm_core*unused=bare_device(&f);assert(!lm_core_destroy(unused));
+    f.reg[0]=0x74021000;f.reg[0x100/4]=3;f.emulate_triangle=true;
+    struct lm_ops io={.cookie=&f,.read32=rr,.write32=wr,.now_ns=now,.delay_us=delay,
+        .alloc=ma,.free=mf,.page_alloc=pa,.page_free=pf,.for_device=clean,.for_cpu=inval,
+        .barrier=barrier,.io_error=ioerr};
+    struct lm_private_dma s={.triangle_test=true,
+        .tri_vertex_shader=lmg_tri_vertex_shader,
+        .tri_vertex_shader_bytes=LMG_TRI_VERTEX_SHADER_BYTES,
+        .tri_fragment_shader=lmg_tri_fragment_shader,
+        .tri_fragment_shader_bytes=LMG_TRI_FRAGMENT_SHADER_BYTES};
+    assert(lm_private_dma_run(&s,&io)==LM_OK);
+    assert(s.submitted&&s.guards_valid&&s.cleaned&&!s.backing_retained);
+    assert(s.observed_value==LM_TRI_VALUE&&f.jobs_run==3);
+    assert(!s.tri_bad_stage&&!s.bad_offset&&!f.pages&&!f.allocs&&!f.run);
+    puts("Private triangle: dependent VERTEX->TILER->FRAGMENT jobs, real vertex/varying descriptors, RG32F input, D24 FBD, shader colour and release proved; RAM ONLY");
+}
+static void private_triangle_mismatch(void) {
+    struct fake f;struct lm_core*unused=bare_device(&f);assert(!lm_core_destroy(unused));
+    f.reg[0]=0x74021000;f.reg[0x100/4]=3;f.emulate_triangle=true;f.corrupt_pixel=true;
+    struct lm_ops io={.cookie=&f,.read32=rr,.write32=wr,.now_ns=now,.delay_us=delay,
+        .alloc=ma,.free=mf,.page_alloc=pa,.page_free=pf,.for_device=clean,.for_cpu=inval,
+        .barrier=barrier,.io_error=ioerr};
+    struct lm_private_dma s={.triangle_test=true,
+        .tri_vertex_shader=lmg_tri_vertex_shader,
+        .tri_vertex_shader_bytes=LMG_TRI_VERTEX_SHADER_BYTES,
+        .tri_fragment_shader=lmg_tri_fragment_shader,
+        .tri_fragment_shader_bytes=LMG_TRI_FRAGMENT_SHADER_BYTES};
+    assert(lm_private_dma_run(&s,&io)==LM_EIO);
+    assert(!s.guards_valid&&s.tri_bad_stage==0&&s.tri_bad_word==4u);
+    assert(s.tri_actual==(LM_TRI_VALUE^1u));
+    assert(s.job_result.mismatch_reg==4u&&s.job_result.expected==LM_TRI_VALUE);
+    assert(s.cleaned&&!s.backing_retained&&!f.pages&&!f.allocs);
+    puts("Private triangle negative: one wrong shader pixel is rejected with its exact offset/value while cleanup still succeeds; RAM ONLY");
+}
 int main(int argc,char**argv) {
     if(argc>1 && !strcmp(argv[1],"quarantine")){quarantine();return 0;}
     if(argc>1 && !strcmp(argv[1],"mmio")){io_failure();return 0;}
     if(argc>1 && !strcmp(argv[1],"private-quarantine")){private_dma_quarantine();return 0;}
     if(argc>1 && !strcmp(argv[1],"private-clear")){private_clear();private_clear_mismatch();private_clear_chain();private_clear_chain_mismatch();return 0;}
-    identity();mapping();isolation();oom();reclaim();failures();posted_write_proofs();private_dma_transaction();private_mmu_fault();private_clear();private_clear_mismatch();private_clear_chain();private_clear_chain_mismatch();return 0;
+    if(argc>1 && !strcmp(argv[1],"private-triangle")){private_triangle();private_triangle_mismatch();return 0;}
+    identity();mapping();isolation();oom();reclaim();failures();posted_write_proofs();private_dma_transaction();private_mmu_fault();private_clear();private_clear_mismatch();private_clear_chain();private_clear_chain_mismatch();private_triangle();private_triangle_mismatch();return 0;
 }
