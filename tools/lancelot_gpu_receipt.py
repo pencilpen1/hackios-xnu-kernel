@@ -5,9 +5,23 @@ import zlib
 
 HEADER=re.compile(r'lancelot-gpu-receipt: source=(UEFI|XNU) boot=((?:0x)?[a-f0-9]+) pool=((?:0x)?[a-f0-9]+) sequence=(\d+) fault=((?:0x)?[a-f0-9]+) size=(\d+) crc=((?:0x)?[a-f0-9]+) verified=1(?: version=(\d+))?')
 WORD=re.compile(r'lancelot-gpu-receipt: word=(\d+) value=((?:0x)?[a-f0-9]+)')
+def receipt_lines(text):
+    """The capture reader may inject a [capture] note in the middle of a line.
+    Drop those notes and rejoin a split receipt line; CRC still gates the frame."""
+    lines=[line for line in text.splitlines() if not line.lstrip().startswith('[capture]')]
+    merged=[]
+    suffixes=('word=','value=','source=','boot=','pool=','sequence=','fault=','size=','crc=','verified=','0x')
+    for line in lines:
+        if merged and merged[-1].startswith('lancelot-gpu-receipt:') and \
+           not HEADER.search(merged[-1]) and not WORD.search(merged[-1]) and \
+           line.startswith(suffixes):
+            merged[-1]+=line
+        else:
+            merged.append(line)
+    return merged
 def decode(text,expected_boot):
     frames=[];current=None;incomplete=0
-    for line in text.splitlines():
+    for line in receipt_lines(text):
         header=HEADER.search(line)
         if header:
             if current and len(current['words'])<96:incomplete+=1

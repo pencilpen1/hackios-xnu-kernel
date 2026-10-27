@@ -52,6 +52,14 @@ payload=struct.pack('<4I4Q96I',0x5244474c,4,432,0,0x12345678,0x42000000,1,0x2003
 header4=f'lancelot-gpu-receipt: source=XNU boot=0x12345678 pool=0x42000000 sequence=1 fault=2003080 size=432 crc={zlib.crc32(payload):x} verified=1 version=4\n'
 text4=header4+''.join(f'lancelot-gpu-receipt: word={i} value={v:x}\n' for i,v in enumerate(words))
 assert decode(text4,0x12345678)['word']==words
+# The capture reader may inject a progress note between a receipt prefix and
+# its remaining fields. The decoder must rejoin the line without weakening CRC.
+split_word=text4.replace('lancelot-gpu-receipt: word=82 value=',
+    'lancelot-gpu-receipt: \n[capture] XNU runtime KLOG2 connected\nword=82 value=',1)
+assert decode(split_word,0x12345678)['word']==words
+split_header=text4.replace('lancelot-gpu-receipt: source=',
+    'lancelot-gpu-receipt: \n[capture] XNU runtime KLOG2 connected\nsource=',1)
+assert decode(split_header,0x12345678)['word']==words
 reject(text4.replace('version=4','version=3'))
 reject(text4.replace('value=2003080','value=2003081'))
 
