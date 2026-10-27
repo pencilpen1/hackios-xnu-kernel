@@ -113,7 +113,7 @@ static void fake_triangle(struct fake*f,uint64_t jc) {
         assert(tp[3]==2u);         /* index_count - 1 */
         assert(jq(tj,18)==LM_PRIVATE_JOB_VA+LM_TRI_TILER_CTX);
         uint32_t *ctx=gpu_address(f,jq(tj,18));assert(ctx);
-        assert(jq(ctx,0)==LM_TRI_POLY_VA);
+        assert(jq(ctx,0)==0); /* Bifrost polygon list is heap-resident */
         assert(ctx[2]==6u&&ctx[3]==0x003f003fu);
         uint64_t heap_desc=jq(ctx,6);
         uint32_t *hd=gpu_address(f,heap_desc);assert(hd);

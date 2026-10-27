@@ -47,18 +47,22 @@
 #define LM_TRI_BPP 4u
 #define LM_TRI_BYTES (LM_TRI_WIDTH*LM_TRI_HEIGHT*LM_TRI_BPP)
 #define LM_TRI_PAGES (LM_TRI_BYTES/LM_PAGE_SIZE)
-/* Bifrost tiler heaps are managed in 2 MiB chunks (Mesa's 128 MiB BO is
- * 64 chunks). A smaller heap cannot satisfy the first chunk and raises
- * JS_STATUS 0x60 (OOM). Use two chunks plus a 64 KiB polygon-list buffer. */
-#define LM_TRI_HEAP_BYTES 4194304u
+/* Bifrost tiler heaps are managed in 2 MiB chunks. The vendor DDK's
+ * BASE_MEM_TILER_ALIGN_TOP extent is at most 512 pages, and the panfrost MMU
+ * grow path maps exactly one 2 MiB chunk per fault. Use one 2 MiB chunk at a
+ * 2 MiB-aligned base with a 2 MiB-aligned top; Mesa's Bifrost descriptor is
+ * base/bottom=heap, top=heap+size, size=aligned region size. The 64 KiB
+ * polygon list was a guess: Mesa's Bifrost TILER_CONTEXT leaves Polygon List
+ * at zero, so this test keeps only one mapped page as a safe DRAW dummy. */
+#define LM_TRI_HEAP_BYTES 2097152u
 #define LM_TRI_HEAP_PAGES (LM_TRI_HEAP_BYTES/LM_PAGE_SIZE)
-#define LM_TRI_POLY_BYTES 65536u
+#define LM_TRI_POLY_BYTES 4096u
 #define LM_TRI_POLY_PAGES (LM_TRI_POLY_BYTES/LM_PAGE_SIZE)
 #define LM_TRI_VERTEX_COUNT 3u
 #define LM_TRI_VALUE LM_CLEAR_VALUE
 #define LM_TRI_SHADER_PAGE_VA (LM_PRIVATE_JOB_VA+UINT64_C(0x1000))
-#define LM_TRI_HEAP_VA (LM_PRIVATE_JOB_VA+UINT64_C(0x8000))
-#define LM_TRI_POLY_VA (LM_PRIVATE_JOB_VA+UINT64_C(0x408000))
+#define LM_TRI_HEAP_VA (LM_PRIVATE_JOB_VA+UINT64_C(0x400000))
+#define LM_TRI_POLY_VA (LM_PRIVATE_JOB_VA+UINT64_C(0x600000))
 #define LM_TRI_VERTEX_JOB 0x000u
 #define LM_TRI_TILER_JOB 0x100u
 #define LM_TRI_FRAG_JOB 0x200u
@@ -108,6 +112,10 @@ struct lm_private_dma {
     struct lm_page tri_poly[LM_TRI_POLY_PAGES];
     uint32_t tri_bad_word,tri_actual;
     unsigned tri_bad_stage;
+    /* Failure-only tiler evidence: the two descriptors as the GPU saw them,
+     * plus the first words of the heap at 0 and at +0x8000 (the offset this
+     * round's fault address pointed into before its bit-32 tag). */
+    uint32_t tri_ctx[8],tri_heap_desc[8],tri_heap0[8],tri_heap8k[8];
 };
 
 /* Write one FBD (128 bytes) and its RENDER_TARGET (64 bytes) at a 64-byte
@@ -257,9 +265,11 @@ static inline void lm_v7_tri_blend(uint32_t *b) {
     b[2]=0x00000019u; /* opaque, 4 components */
     b[3]=0x010ed000u; /* RGBA8 tilebuffer conversion, F32 register file */
 }
-static inline void lm_v7_tri_tiler_context(uint32_t *c,uint64_t heap,uint64_t poly) {
+static inline void lm_v7_tri_tiler_context(uint32_t *c,uint64_t heap) {
     memset(c,0,192);
-    c[0]=(uint32_t)poly;c[1]=(uint32_t)(poly>>32);
+    /* Bifrost takes its polygon list from the tiler heap; Mesa leaves the
+     * Midgard Polygon List field zero. A non-zero value was attempt19-22's
+     * untested addition and is removed here. */
     c[2]=6u; /* hierarchy_mask for 64x64, max_levels=2; single-sampled */
     c[3]=((LM_TRI_WIDTH-1u)&0xffffu)|(((LM_TRI_HEIGHT-1u)&0xffffu)<<16);
     c[6]=(uint32_t)heap;c[7]=(uint32_t)(heap>>32);
@@ -340,7 +350,7 @@ static inline void lm_v7_tri_prepare(uint32_t *a,uint8_t *b,uint64_t a_va,
     lm_v7_tri_vertex_rsd(a+LM_TRI_VERT_RSD/4,vshader);
     lm_v7_tri_fragment_rsd(a+LM_TRI_FRAG_RSD/4,fshader);
     lm_v7_tri_blend(a+LM_TRI_FRAG_BLEND/4);
-    lm_v7_tri_tiler_context(a+LM_TRI_TILER_CTX/4,heap_desc,poly);
+    lm_v7_tri_tiler_context(a+LM_TRI_TILER_CTX/4,heap_desc);
     lm_v7_tri_tiler_heap(a+LM_TRI_TILER_HEAP/4,heap);
     lm_v7_tri_viewport(a+LM_TRI_VIEWPORT/4);
     lm_v7_tri_attr(a+LM_TRI_VATTR/4,0,16u|(UINT32_C(175)<<12),true); /* RG32F */
@@ -563,6 +573,11 @@ static int lm_private_dma_run(struct lm_private_dma *s,const struct lm_ops *io) 
         bool tiler_ok=!s->error&&!s->tri_tiler_result.quarantined;
         if(!tiler_ok) {
             s->job_result=s->tri_tiler_result;
+            memcpy(s->tri_ctx,(uint8_t*)s->tri_pages[0].cpu+LM_TRI_TILER_CTX,32);
+            memcpy(s->tri_heap_desc,(uint8_t*)s->tri_pages[0].cpu+LM_TRI_TILER_HEAP,32);
+            if(s->tri_heap[0].cpu)memcpy(s->tri_heap0,s->tri_heap[0].cpu,32);
+            if(LM_TRI_HEAP_PAGES>8&&s->tri_heap[8].cpu)
+                memcpy(s->tri_heap8k,s->tri_heap[8].cpu,32);
             if(!s->error)s->error=LM_EIO;
         } else {
             s->error=lm_core_submit_wait(s->vm,LM_PRIVATE_JOB_VA+LM_TRI_FRAG_JOB,

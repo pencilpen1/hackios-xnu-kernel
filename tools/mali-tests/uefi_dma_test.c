@@ -123,7 +123,7 @@ int main(int argc,char **argv) {
              f.transaction.error,f.transaction.cleanup_error);
      assert(!e&&safe&&!f.allocated&&m.releases==1);}
     assert(f.transaction.triangle_test&&f.transaction.guards_valid);
-    assert(f.transaction.observed_value==LM_TRI_VALUE&&f.peak_pages==1052);
+    assert(f.transaction.observed_value==LM_TRI_VALUE&&f.peak_pages==525);
     assert(f.transaction.tri_tiler_result.sequence==1&&
         f.transaction.job_result.sequence==2);
     assert(m.gpu.jobs_run==3&&!lfd_page_count(&f)&&!f.metadata_active);

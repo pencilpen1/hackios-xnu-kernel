@@ -1,14 +1,14 @@
 # Lancelot GPU：loader 三作业 shader triangle（2026-10-27）
 
-> 本文记录**host 验证与构建结果**。没有部署到手机，也没有实机渲染证据。
+> 本文记录 host 验证、构建结果与 2026-10-27 的实机 attempt 证据。
 > `gpu_complete=false`、`rendering_verified=false`、`desktop_verified=false` 不变。
 >
-> **2026-10-27 深夜更新**：attempt16–22 已逐轮实机收敛。attempt16 把整链放在
-> JS0（`JS_STATUS=0x58` DATA_INVALID_FAULT）；attempt17/18 改为 JS1/JS0 两次
-> submit 后，先出现 tiler VA0 MMU fault，随后出现 `0x60` OOM；attempt22 用
-> 4 MiB heap（2 个 2 MiB chunk）消除 OOM，当前故障变为
-> `AS_FAULTSTATUS=0x670003c1`（level1 WRITE）at `0x102010000`。
-> 完整日志与下一步见第 10 节；当前候选 attempt22 **未通过**。
+> **2026-10-27 收尾更新**：attempt16–22 的 tiler OOM / `0x102010000` 已收敛；
+> attempt23（2 MiB 对齐 heap + `polygon_list=0`）让 VERTEX+TILER+FRAGMENT
+> 全部完成（`sequence=2`、`peak-pages=525`、首像素 `0xff3366cc` 正确），
+> 但只覆盖 **1/4096** 像素。loader 不启动的根因是 UEFI 对
+> `SizeOfImage`/`.reloc RVA` 布局敏感，8 KiB BSS pad 可启动。
+> 详见第 11 节；当前候选 **未通过**。
 
 ## 1. 结论
 
@@ -339,3 +339,57 @@ fault-extra=0/0 gpu-fault-status=0
 - attempt22 已打包为唯一 `current/`，未通过，`gpu_complete=false`。
 - loader `c677c01f...`、XNUP `b21c246e...`、XNU `90e93d9e...`、Mu `ac7b...`。
 - 设备在 attempt22 采集后停在 XNU/KLOG2；下一次实机需物理进入原生 FASTBOOT。
+
+## 11. attempt23（2026-10-27 收尾）：loader 布局、2 MiB 对齐 heap 与 1 像素覆盖
+
+### 11.1 loader 不启动：UEFI 镜像布局敏感
+
+- attempt23 loader（`fd2c429b…`，132,096 B）在 ESP/FAT/hash 全部正确的情况下，
+  UEFI 只输出 239 B USB 前导，没有 `== XNULOADER v3 ==`，屏幕停在 logo。
+- 把 attempt22 loader（`c677c01f…`，132,608 B）写回 ESP、保留新 XNUP，
+  loader 立即启动并加载 XNUP，证明 UEFI/ESP/FAT/XNUP 正常。
+- PE 对比：节结构/96 个 DIR64 重定位完全一致；只有 `.data` BSS 因 2 MiB heap
+  少 8 KiB，`SizeOfImage 0x7B9000→0x7B7000`、`.reloc RVA 0x7B8000→0x7B6000`。
+- 在 loader 加 8 KiB `used` BSS pad（Variant P，文件仍 132,096 B，hash
+  `b8cffb3d…`）后 `SizeOfImage/.reloc` 回到 `0x7B9000/0x7B8000`，**立即启动**。
+  说明不是 FAT/文件大小，而是 UEFI 镜像加载器对布局的敏感点。
+- 生产源码 `xnuloader/lancelot.h` 已加该 pad（loader 侧 workaround；UEFI 源/
+  镜像未改）。exact 约束仍未明，后续用 0/4/8/12 KiB pad 找阈值。
+
+### 11.2 2 MiB 对齐 heap + polygon_list=0
+
+- `LM_TRI_HEAP_BYTES=0x200000`、`LM_TRI_HEAP_VA=0x02400000`（2 MiB 对齐）、
+  top `0x02600000`；`LM_TRI_POLY_BYTES=4096`（仅 mapped dummy）；
+  TILER_CONTEXT 的 `polygon_list=0`（Mesa Bifrost 值）。
+- 结果：attempt19–22 的 `JS_STATUS=0x60` OOM 和 `0x102010000` bit32 WRITE
+  fault 都消失；`error=-5` 但 `submitted=1 sequence=2 job-irq=1 job-status=0
+  mmu=0 gpu=0 failed-stage=0`。
+- receipt：`sequence=2`、`peak-pages=525`、`value=0xff3366cc`（首像素正确）、
+  `guards=0`、`bad-offset=4`、`expected=0xff3366cc`、`observed=0`。
+  输出 4096 像素只有 1 个匹配，其余 0。
+
+### 11.3 tiler 侧证据（scan/posprobe）
+
+- 顶点 position buffer 正确：`(-1,-1,0,1) (3,-1,0,1) (-1,3,0,1)`。
+- tiler context 被 GPU 更新：`polygon_list=0x02408000`、mask 6、fb 63/63、
+  heap 描述符 `0x020003c0`。
+- heap 描述符被 GPU 更新：`size=0x200000`、`base=0x02400000`、
+  `bottom=0x02408100`、`top=0x02600000`。
+- 整个 2 MiB heap 只有 4 个非零字：
+  `0x8000=0x84`、`0x8004=0x80`、`0x8080=0x9c080006`、`0x8084=0x0400bf7f`。
+- viewport max 64→32、scissor 31（`e6cf3e81…`）输出/heap 完全不变；
+  Mesa-exact tiler DRAW 输入置 0（`25526d34…`）回归为
+  `mmu=4002c2`（level2 READ at VA0），证明 tiler 会预取这些指针，mapped
+  dummy 必需。
+- 结论：tiler 仍未正确 binning 全屏三角形；待查 position 读取侧/viewport/
+  hierarchy/polygon body 格式/vertex→tiler 缓存可见性。详见
+  `D:\AI_rom\iOSforLava\LANCELOT-GPU-AI-HANDOFF-2026-10-27-EOD.md` 第 13 节。
+
+### 11.4 当前候选/设备
+
+- ESP loader：`25526d34…`（mesadraw，已否决）；XNUP
+  `1f1384d8…`（kernel `254ac100…`）；Mu `ac7b0f8f…`。
+- 下一轮先部署 `loader-variantP.efi`（`b8cffb3d…`）或 `loader-scan.efi`
+  （`243bd783…`）做基线；证据在
+  `local/lancelot-gpu-20261026/private-dma/attempt23/loader-compare/`。
+- `gpu_complete=false`、`rendering_verified=false`、`desktop_verified=false`。

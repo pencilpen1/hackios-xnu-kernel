@@ -13,6 +13,16 @@ struct mtk_boot_log {
 _Static_assert(sizeof(struct mtk_boot_log) == MTK_LOG_SIZE, "MTK boot log ABI");
 static volatile struct mtk_boot_log *mtk_log;
 
+/* Image-layout pad, 2026-10-27. The 2 MiB tiler heap shrinks this loader's
+ * .data BSS by 8 KiB versus the known-good attempt22 loader: SizeOfImage
+ * 0x7B9000 -> 0x7B7000 and .reloc RVA 0x7B8000 -> 0x7B6000. The pinned test
+ * Mu's UEFI image loader then does not start the image at all (LLOG1 stops
+ * after the UEFI USB preamble). Padding the BSS back to the attempt22 layout
+ * makes the same code boot (variant P, loader build b8cffb3d). This is a
+ * loader-side workaround only; the UEFI source/image is unchanged. Keep it
+ * until the exact UEFI image-layout constraint is understood. */
+__attribute__((used)) static volatile uint8_t lancelot_image_layout_pad[8192];
+
 /* Bounded, read-only walk of this kernel's 4 KiB bootstrap tables at checkpoint 4. */
 static void
 lancelot_walk_4k(uint64_t va, int upper)
@@ -428,6 +438,17 @@ static bool lancelot_gpu_power_probe(const char *cmdline) {
 			print("lancelot-gpu-triangle: jobs=3 vertex+tiler+fragment color=%x guards=%d bad-stage=%d bad-offset=%x actual=%x; real vertex shader, tiler and fragment shader, not a clear\n",
 			    (uint64_t)LM_TRI_VALUE,(uint64_t)s->guards_valid,(uint64_t)s->tri_bad_stage,
 			    (uint64_t)s->tri_bad_word,(uint64_t)s->tri_actual);
+		if(triangle && !s->guards_valid) {
+			print("lancelot-gpu-triangle: tri-diag ctx=%x,%x,%x,%x,%x,%x,%x,%x heap-desc=%x,%x,%x,%x,%x,%x,%x,%x heap0=%x,%x,%x,%x,%x,%x,%x,%x heap8k=%x,%x,%x,%x,%x,%x,%x,%x\n",
+			    (uint64_t)s->tri_ctx[0],(uint64_t)s->tri_ctx[1],(uint64_t)s->tri_ctx[2],(uint64_t)s->tri_ctx[3],
+			    (uint64_t)s->tri_ctx[4],(uint64_t)s->tri_ctx[5],(uint64_t)s->tri_ctx[6],(uint64_t)s->tri_ctx[7],
+			    (uint64_t)s->tri_heap_desc[0],(uint64_t)s->tri_heap_desc[1],(uint64_t)s->tri_heap_desc[2],(uint64_t)s->tri_heap_desc[3],
+			    (uint64_t)s->tri_heap_desc[4],(uint64_t)s->tri_heap_desc[5],(uint64_t)s->tri_heap_desc[6],(uint64_t)s->tri_heap_desc[7],
+			    (uint64_t)s->tri_heap0[0],(uint64_t)s->tri_heap0[1],(uint64_t)s->tri_heap0[2],(uint64_t)s->tri_heap0[3],
+			    (uint64_t)s->tri_heap0[4],(uint64_t)s->tri_heap0[5],(uint64_t)s->tri_heap0[6],(uint64_t)s->tri_heap0[7],
+			    (uint64_t)s->tri_heap8k[0],(uint64_t)s->tri_heap8k[1],(uint64_t)s->tri_heap8k[2],(uint64_t)s->tri_heap8k[3],
+			    (uint64_t)s->tri_heap8k[4],(uint64_t)s->tri_heap8k[5],(uint64_t)s->tri_heap8k[6],(uint64_t)s->tri_heap8k[7]);
+		}
 		print("lancelot-gpu-dma: peak-pages=%d cache-clean=%d cache-invalidate=%d reads=%d writes=%d io-error=%x release=%x; %s\n",
 		    (uint64_t)f->peak_pages,(uint64_t)f->cleans,(uint64_t)f->invalidates,(uint64_t)f->gpu_reads,
 		    (uint64_t)f->gpu_writes,(uint64_t)(uint32_t)f->io_error,(uint64_t)(uint32_t)f->release_error,
