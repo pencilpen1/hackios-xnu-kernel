@@ -3,9 +3,12 @@
 > 本文记录**host 验证与构建结果**。没有部署到手机，也没有实机渲染证据。
 > `gpu_complete=false`、`rendering_verified=false`、`desktop_verified=false` 不变。
 >
-> **2026-10-27 深夜更新**：attempt16 已实机部署并失败，`JS_STATUS=0x58`
-> （DATA_INVALID_FAULT）。根因分析与修正见第 8 节；当前候选 attempt17 改为
-> 两次 submit（JS1=VERTEX+TILER，JS0=FRAGMENT），并修正 varying/RT 描述符。
+> **2026-10-27 深夜更新**：attempt16–22 已逐轮实机收敛。attempt16 把整链放在
+> JS0（`JS_STATUS=0x58` DATA_INVALID_FAULT）；attempt17/18 改为 JS1/JS0 两次
+> submit 后，先出现 tiler VA0 MMU fault，随后出现 `0x60` OOM；attempt22 用
+> 4 MiB heap（2 个 2 MiB chunk）消除 OOM，当前故障变为
+> `AS_FAULTSTATUS=0x670003c1`（level1 WRITE）at `0x102010000`。
+> 完整日志与下一步见第 10 节；当前候选 attempt22 **未通过**。
 
 ## 1. 结论
 
@@ -256,3 +259,83 @@ bootargs 新增 `lancelot_gpu_triangle=1`，与 `lancelot_gpu_clear*`/`fault` �
   第 30 个可用页，再大需要改成 64-bit mask。
 - 成功条件仍为：`sequence=2`、`peak-pages=27`、`value=ff3366cc`、
   `bad-stage=0`，head/tail 越过 tiler，XNU 只读恢复/SPM all-off/SpringBoard 运行。
+
+## 10. attempt20–22：2 MiB chunk、位图 arena 与新的写故障
+
+### 10.1 attempt20：64 KiB heap 仍 OOM
+
+- `LM_TRI_HEAP_BYTES=65536`、polygon list 4 KiB、arena 32 页、peak 27。
+- 结果仍是 `job-status=0x60`（OOM），tiler 阶段（head=tail=0x2000100），
+  `peak-pages=27`，XNU 只读恢复正常。
+- 说明 64 KiB 仍低于 tiler 的分配粒度。
+
+### 10.2 attempt21：48 KiB heap + 32 KiB polygon list 仍 OOM
+
+- 为了在 30 个可用页内同时放大 heap 和 polygon list：
+  heap 12 页（48 KiB）、polygon list 8 页（32 KiB），peak 30。
+- 仍是 `0x60` OOM，tiler 阶段；说明不是简单的 polygon list 4 KiB 太小。
+
+### 10.3 2 MiB chunk 线索
+
+Mesa `driinfo_panfrost.h` 明确注释：
+
+```text
+/* 64 x 2M = 128M, which matches the tiler_heap BO allocated in
+ * panfrost_open_device() for pre-v10 HW. */
+```
+
+Bifrost（pre-v10）的 tiler heap 以 **2 MiB chunk** 为单位；小于 2 MiB 的
+heap 无法满足第一次 chunk 分配，表现为 `JS_STATUS=0x60` OOM。这解释了
+16/48/64 KiB 全部 OOM。
+
+### 10.4 attempt22：4 MiB heap（2 chunks）+ 64 KiB polygon list
+
+- `LM_TRI_HEAP_BYTES=4194304`（1024 页，2 个 2 MiB chunk）；
+  `LM_TRI_POLY_BYTES=65536`（16 页）；
+  `LM_TRI_POLY_VA=VA_BASE+0x408000`（heap 之后）。
+- loader arena 改为 **位图 page_mask**（1054 页：1 元数据 + 1052 可用 + 1 guard），
+  `LFD_PAGES=1054`、`LFD_USABLE_LAST=1052`；metadata 用独立 64 KiB 池，
+  因为 core 的 `lm_core_vm_map` 会复制 1024 个 `lm_page`（16 KiB），
+  原来的 4 KiB metadata 池会在 heap 映射时 ENOMEM。
+- peak 1052 页：1 描述符 + 1 着色器 + 4 输出 + 1024 heap + 16 polygon list
+  + 6 页表（heap 跨 3 个 2 MiB VA 区域；root/level1/level2 + 3 个 level3）。
+- 生产 packer 与 Mesa 参考页仍逐字节一致；host 测试 peak 1052。
+- 实机结果：OOM **消失**，但出现新的失败：
+
+```text
+error=fffffffb submitted=1 sequence=1 guards=0 value=0 peak-pages=1052
+failed-stage=4 job-irq=0 job-status=8
+mmu=670003c1 gpu=0 fault-pa=102010000
+js-head=2000100 js-tail=2000100
+fault-extra=0/0 gpu-fault-status=0
+```
+
+- `JS_STATUS=8` = ACTIVE（slot1），head=tail=tiler，说明 tiler 仍在运行/写数据。
+- `AS_FAULTSTATUS=0x670003c1` 解码：
+  - exception type `0xC1` = translation fault level 1；
+  - access type `0x3` = **WRITE**；
+  - source id `0x6700`；
+  - `AS_FAULTADDRESS=0x102010000`（4 GiB + 0x02010000，超出本测试映射的
+    0x02000000–0x0241xxxx 范围）。
+- 这不是 OOM，也不是读 NULL；tiler 在向一个 **高位为 1 的地址**写入。
+  最可能的方向：
+  1. 某个 64-bit 地址字段的高 32 位/标志位被写错（heap top/bottom、
+     polygon_list、tiler context 或 DRAW 指针）；
+  2. 4 MiB heap 跨 2 MiB/4 GiB 边界时，tiler 的地址算术或我们的高位打包
+     出现 carry/bit32；
+  3. polygon list 专用页与 heap 的 top 相邻（0x2408000），硬件可能把
+     top/polygon 地址组合成 0x102010000。
+- 下一步建议（按顺序）：
+  1. 在失败日志中直接打印 tiler context 的 word0..7、heap descriptor 的
+     word0..7、polygon_list/heap/top/bottom 的 64-bit 值，确认运行时值；
+  2. 试 **4 MiB heap + polygon_list=0**（Mesa 原值），看故障是否移动；
+     Mesa 的 Bifrost 路径不设 polygon_list，heap 足够大时可能不需要它；
+  3. 若仍写高位地址，检查 `lm_v7_tri_prepare` 所有 `(uint32_t)(addr>>32)`
+     写入点，以及 4 MiB heap 是否让某个 32-bit 字段溢出；
+  4. 可试 2 MiB 整 chunk（heap=2 MiB）加 poly=0，排除 4 MiB/边界因素。
+
+### 10.5 当前候选
+
+- attempt22 已打包为唯一 `current/`，未通过，`gpu_complete=false`。
+- loader `c677c01f...`、XNUP `b21c246e...`、XNU `90e93d9e...`、Mu `ac7b...`。
+- 设备在 attempt22 采集后停在 XNU/KLOG2；下一次实机需物理进入原生 FASTBOOT。
