@@ -8,9 +8,9 @@
 #include "lancelot_gpu_prepare.h"
 #include "lancelot_gpu_shaders.h"
 #include "../xnu/files/bsd/dev/lancelot_mali_private_dma.h"
-#define LFD_PAGES 16u
-#define LFD_USABLE_LAST 14u
-#define LFD_GUARD_PAGE 15u
+#define LFD_PAGES 32u
+#define LFD_USABLE_LAST 30u
+#define LFD_GUARD_PAGE 31u
 #define LFD_MIN_PA UINT64_C(0x40280000)
 #define LFD_MAX_PA UINT64_C(0x44000000)
 #define LFD_TRACE_MAX 512u
@@ -137,11 +137,13 @@ static bool lfd_read_allowed(uint32_t off) {
     if(off==0x140 || off==0x144 || off==0x150 || off==0x154 || off==0x160 || off==0x164)return true;
     for(unsigned i=0;i<3;i++) {
         uint32_t base=0x1800u+0x80u*i;
-        if(off==base+0x24 || off==base+0x40 || off==base+0x44 ||
+        if(off==base+0x00 || off==base+0x04 || off==base+0x08 || off==base+0x0c ||
+           off==base+0x24 || off==base+0x40 || off==base+0x44 ||
            off==base+0x50 || off==base+0x54 || off==base+0x58 || off==base+0x60)return true;
     }
     return off==0x2400 || off==0x2404 || off==0x2408 || off==0x240c ||
-        off==0x241c || off==0x2420 || off==0x2424 || off==0x2428 || off==0x2430 || off==0x2434;
+        off==0x241c || off==0x2420 || off==0x2424 || off==0x2428 || off==0x2430 ||
+        off==0x2434 || off==0x2438 || off==0x243c;
 }
 static bool lfd_write_allowed(struct lfd_context*f,uint32_t off,uint32_t value) {
     if(f->recovering) {

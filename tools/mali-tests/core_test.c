@@ -81,6 +81,9 @@ static void fake_triangle(struct fake*f,uint64_t jc) {
         uint32_t *vrsd=gpu_address(f,jq(vd,14));assert(vrsd);
         assert(jq(vrsd,0)==LM_TRI_SHADER_PAGE_VA);
         assert(vrsd[3]==0x00020001u&&vrsd[4]==0x00002000u&&vrsd[12]==0x00006000u);
+        assert(jq(vd,4)==LM_PRIVATE_JOB_VA+LM_TRI_POS_BUF);
+        assert(jq(vd,24)==LM_PRIVATE_JOB_VA+LM_TRI_VIEWPORT);
+        assert(jq(vd,6)==LM_TRI_POLY_VA&&jq(vd,28)==LM_TRI_POLY_VA);
         uint32_t *attr=gpu_address(f,jq(vd,18));assert(attr);
         assert(((attr[0]>>10)&0x3fffffu)==(16u|(175u<<12)));
         assert(attr[0]&(1u<<9)); /* input attribute offset is enabled */
@@ -88,6 +91,7 @@ static void fake_triangle(struct fake*f,uint64_t jc) {
         uint32_t *abuf=gpu_address(f,jq(vd,16));assert(abuf);
         assert(tri_abuf_ptr(abuf)==LM_PRIVATE_JOB_VA+LM_TRI_VERTEX_DATA);
         assert(abuf[2]==8u&&abuf[3]==LM_PAGE_SIZE-LM_TRI_VERTEX_DATA);
+        assert(abuf[4]==1u&&abuf[5]==0u&&abuf[6]==0u&&abuf[7]==0u);
         uint32_t *vin=gpu_address(f,tri_abuf_ptr(abuf));assert(vin);
         static const uint32_t want_in[6]={0xbf800000u,0xbf800000u,0x40400000u,
             0xbf800000u,0xbf800000u,0x40400000u};
@@ -98,6 +102,7 @@ static void fake_triangle(struct fake*f,uint64_t jc) {
         assert((vary[2]&0x1ffu)==2u&&((vary[2]>>10)&0x3fffffu)==(199u<<12));
         assert(!(vary[2]&(1u<<9)));
         uint32_t *vbuf=gpu_address(f,jq(vd,20));assert(vbuf);
+        assert(vbuf[0]==0u&&vbuf[1]==0u&&vbuf[2]==0u&&vbuf[3]==0u);
         assert(tri_abuf_ptr(vbuf+4)==LM_PRIVATE_JOB_VA+LM_TRI_POS_BUF);
         assert(vbuf[6]==16u&&vbuf[7]==48u);
         assert(tri_abuf_ptr(vbuf+8)==LM_PRIVATE_JOB_VA+LM_TRI_PSIZ_BUF);
@@ -108,6 +113,7 @@ static void fake_triangle(struct fake*f,uint64_t jc) {
         assert(tp[3]==2u);         /* index_count - 1 */
         assert(jq(tj,18)==LM_PRIVATE_JOB_VA+LM_TRI_TILER_CTX);
         uint32_t *ctx=gpu_address(f,jq(tj,18));assert(ctx);
+        assert(jq(ctx,0)==LM_TRI_POLY_VA);
         assert(ctx[2]==6u&&ctx[3]==0x003f003fu);
         uint64_t heap_desc=jq(ctx,6);
         uint32_t *hd=gpu_address(f,heap_desc);assert(hd);
@@ -115,6 +121,11 @@ static void fake_triangle(struct fake*f,uint64_t jc) {
         assert((jq(hd,2))==LM_TRI_HEAP_VA&&(jq(hd,6))==LM_TRI_HEAP_VA+LM_TRI_HEAP_BYTES);
         assert(jq(tj,16)==LM_PRIVATE_JOB_VA+LM_TRI_PSIZ_BUF);
         uint32_t *td=tj+32;
+        assert(jq(td,16)==LM_PRIVATE_JOB_VA+LM_TRI_VATTR_BUF);
+        assert(jq(td,18)==LM_PRIVATE_JOB_VA+LM_TRI_VATTR);
+        assert(jq(td,20)==LM_PRIVATE_JOB_VA+LM_TRI_VARY_BUF);
+        assert(jq(td,22)==LM_PRIVATE_JOB_VA+LM_TRI_VARY_ATTR);
+        assert(jq(td,6)==LM_TRI_POLY_VA&&jq(td,28)==LM_TRI_POLY_VA);
         uint32_t *frsd=gpu_address(f,jq(td,14));assert(frsd);
         assert(jq(frsd,0)==LM_TRI_SHADER_PAGE_VA+0x100u);
         assert(frsd[4]==0x41582200u&&frsd[8]==0x37d8ffffu&&

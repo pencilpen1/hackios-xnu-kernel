@@ -46,6 +46,11 @@ enum lm_core_phase {
 struct lm_job_result {
     uint64_t sequence, elapsed_ns, fault_address;
     uint32_t gpu_fault, mmu_fault, job_status, job_irq, job_state;
+    /* Failure diagnostics: the faulting slot's current head/tail, the AS
+     * secondary fault address, and the GPU exception status/address. */
+    uint32_t js_head_lo,js_head_hi,js_tail_lo,js_tail_hi;
+    uint32_t fault_extra_lo,fault_extra_hi;
+    uint32_t gpu_fault_status,gpu_fault_lo,gpu_fault_hi;
     /* First failed readback, before recovery overwrites the registers. */
     uint32_t failed_stage, mismatch_reg;
     uint64_t expected, observed;

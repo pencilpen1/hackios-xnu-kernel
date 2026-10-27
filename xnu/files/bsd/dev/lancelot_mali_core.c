@@ -480,6 +480,11 @@ int lm_core_submit_wait(struct lm_vm *v,uint64_t jc,uint32_t requirements,uint64
         if(runtime_fault(d)||!job_idle(d,r))e=LM_EIO;
     }
     if(e) {
+        r->js_head_lo=rr(d,JS_BASE(slot)+0x00);r->js_head_hi=rr(d,JS_BASE(slot)+0x04);
+        r->js_tail_lo=rr(d,JS_BASE(slot)+0x08);r->js_tail_hi=rr(d,JS_BASE(slot)+0x0c);
+        r->fault_extra_lo=rr(d,AS_BASE+0x38);r->fault_extra_hi=rr(d,AS_BASE+0x3c);
+        r->gpu_fault_status=rr(d,GPU_FAULT);
+        r->gpu_fault_lo=rr(d,GPU_FAULT_LO);r->gpu_fault_hi=rr(d,GPU_FAULT_LO+4);
         r->mmu_fault=rr(d,MMU_RAW)&0x10001u;r->gpu_fault=rr(d,GPU_IRQ_RAW)&0x81u;
         if(r->mmu_fault) {r->fault_address=rr64(d,AS_BASE+0x20);r->mmu_fault=rr(d,AS_BASE+0x1c);}
         else if(r->gpu_fault) {r->fault_address=rr64(d,GPU_FAULT_LO);r->gpu_fault=rr(d,GPU_FAULT);}

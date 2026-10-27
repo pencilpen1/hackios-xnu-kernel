@@ -406,6 +406,12 @@ static bool lancelot_gpu_power_probe(const char *cmdline) {
 		    (uint64_t)s->job_result.failed_stage,(uint64_t)s->job_result.mismatch_reg,s->job_result.expected,
 		    s->job_result.observed,(uint64_t)s->job_result.reset_completed,(uint64_t)s->job_result.quarantined,
 		    (uint64_t)result.teardown_state);
+		print("lancelot-gpu-dma: fault-extra=%x/%x js-head=%x/%x js-tail=%x/%x gpu-fault-status=%x gpu-fault=%x/%x\n",
+		    (uint64_t)s->job_result.fault_extra_lo,(uint64_t)s->job_result.fault_extra_hi,
+		    (uint64_t)s->job_result.js_head_lo,(uint64_t)s->job_result.js_head_hi,
+		    (uint64_t)s->job_result.js_tail_lo,(uint64_t)s->job_result.js_tail_hi,
+		    (uint64_t)s->job_result.gpu_fault_status,(uint64_t)s->job_result.gpu_fault_lo,
+		    (uint64_t)s->job_result.gpu_fault_hi);
 		print("lancelot-gpu-dma: error=%x attempted=%d submitted=%d sequence=%d job-irq=%x job-status=%x mmu=%x gpu=%x fault-pa=%x\n",
 		    (uint64_t)(uint32_t)result.error,(uint64_t)result.dma_attempted,(uint64_t)s->submitted,
 		    s->job_result.sequence,(uint64_t)s->job_result.job_irq,(uint64_t)s->job_result.job_status,

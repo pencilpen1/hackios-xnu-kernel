@@ -211,3 +211,48 @@ bootargs 新增 `lancelot_gpu_triangle=1`，与 `lancelot_gpu_clear*`/`fault` �
   - 用 `JS_STATUS` 区分是 vertex/tiler 链还是 fragment 链；
   - 再检查 shader 二进制/RSD、tiler heap 大小（当前 16 KiB）、shader 页 EXEC
     和描述符对齐；不要直接放宽像素校验。
+
+## 9. attempt18/19 继续收敛：从 MMU fault 到 tiler OOM
+
+### 9.1 attempt17：tiler/vertex 的 MMU read fault
+
+- attempt17（JS1=VERTEX+TILER，JS0=FRAGMENT）首链提交后失败：
+  `error=-5 submitted=1 sequence=1 guards=0 value=0 peak-pages=14
+  failed-stage=4 job-irq=0 job-status=8 mmu=4002c2 gpu=0 fault-pa=0`。
+- `AS_FAULTSTATUS=0x4002c2`：exception type `0xC2` =
+  translation fault level 2，access type READ，source id 0x40；
+  `AS_FAULTADDRESS=0`。即某个 master 在 VA 0 上做了读。
+- attempt17 没有 head/tail 诊断；从 MMU 类型判断是 vertex/tiler 阶段的空指针读。
+
+### 9.2 attempt18：输入 attribute buffer 终止项修正后仍在 tiler 阶段
+
+- 新增诊断：`fault-extra=0/0 js-head=2000100/0 js-tail=2000000/0
+  gpu-fault-status=0 gpu-fault=0/0`。
+- head 已到 tiler（0x2000100），tail 是 vertex（0x2000000）；vertex job 已执行，
+  **tiler 阶段**在 VA0 读失败。错误仍是 `mmu=4002c2`。
+- 修正：Mesa 的输入 ATTRIBUTE_BUFFER 终止项是 **type=1D、pointer/stride/size=0
+  的空 buffer**，不是全零（type0）描述符；全零 type 会让属性预取解引用 NULL。
+- 同时把所有未使用的 DRAW 指针（uniform/texture/sampler/push/occlusion/
+  thread_storage、vertex 的 position/viewport）填成映射地址，避免硬件读取未用字段
+  时解引用 0。
+
+### 9.3 attempt19：tiler 已执行但 OOM
+
+- attempt18 修正后仍是 tiler 阶段失败，但 attempt19 进一步：
+  `job-irq=0x20000 job-status=0x60 mmu=0 gpu=0
+  js-head=2000100 js-tail=2000100 peak-pages=15`。
+- `0x60` = `DRM_PANFROST_EXCEPTION_OOM`。tiler 已经运行，但 tiler heap 16 KiB
+  不足（64×64、hierarchy_mask=6 的层级节点/多边形列表超出）。
+- 这是实质进展：VA0 MMU fault 消失，问题变成 tiler 内存大小。
+
+### 9.4 attempt20：64 KiB tiler heap
+
+- `LM_TRI_HEAP_BYTES=65536`（16 页）；polygon list 专用页移到
+  `LM_TRI_POLY_VA=VA_BASE+0x18000`（heap 之后）。
+- loader arena 扩为 32 页（1 元数据 + 30 可用 + 1 guard），triangle 峰值 27 页：
+  1 描述符 + 1 着色器 + 4 输出 + 16 heap + 1 polygon list + 4 页表。
+- 生产 packer 与更新后的 Mesa 参考页仍逐字节一致；host 测试 peak 27。
+- 若仍 OOM，优先继续增大 heap/polygon list；当前 `unsigned page_mask` 支持到
+  第 30 个可用页，再大需要改成 64-bit mask。
+- 成功条件仍为：`sequence=2`、`peak-pages=27`、`value=ff3366cc`、
+  `bad-stage=0`，head/tail 越过 tiler，XNU 只读恢复/SPM all-off/SpringBoard 运行。

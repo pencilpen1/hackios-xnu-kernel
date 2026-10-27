@@ -47,12 +47,15 @@
 #define LM_TRI_BPP 4u
 #define LM_TRI_BYTES (LM_TRI_WIDTH*LM_TRI_HEIGHT*LM_TRI_BPP)
 #define LM_TRI_PAGES (LM_TRI_BYTES/LM_PAGE_SIZE)
-#define LM_TRI_HEAP_BYTES 16384u
+#define LM_TRI_HEAP_BYTES 49152u
 #define LM_TRI_HEAP_PAGES (LM_TRI_HEAP_BYTES/LM_PAGE_SIZE)
+#define LM_TRI_POLY_BYTES 32768u
+#define LM_TRI_POLY_PAGES (LM_TRI_POLY_BYTES/LM_PAGE_SIZE)
 #define LM_TRI_VERTEX_COUNT 3u
 #define LM_TRI_VALUE LM_CLEAR_VALUE
 #define LM_TRI_SHADER_PAGE_VA (LM_PRIVATE_JOB_VA+UINT64_C(0x1000))
 #define LM_TRI_HEAP_VA (LM_PRIVATE_JOB_VA+UINT64_C(0x8000))
+#define LM_TRI_POLY_VA (LM_PRIVATE_JOB_VA+UINT64_C(0x14000))
 #define LM_TRI_VERTEX_JOB 0x000u
 #define LM_TRI_TILER_JOB 0x100u
 #define LM_TRI_FRAG_JOB 0x200u
@@ -99,6 +102,7 @@ struct lm_private_dma {
     struct lm_page tri_pages[2];
     struct lm_page tri_output[LM_TRI_PAGES];
     struct lm_page tri_heap[LM_TRI_HEAP_PAGES];
+    struct lm_page tri_poly[LM_TRI_POLY_PAGES];
     uint32_t tri_bad_word,tri_actual;
     unsigned tri_bad_stage;
 };
@@ -206,6 +210,15 @@ static inline void lm_v7_tri_draw(uint32_t *d,uint64_t position,uint64_t state,
     d[22]=(uint32_t)varyings;d[23]=(uint32_t)(varyings>>32);
     d[24]=(uint32_t)viewport;d[25]=(uint32_t)(viewport>>32);
 }
+static inline void lm_v7_tri_draw_dummies(uint32_t *d,uint64_t p) {
+    /* Unused arrays/pointers still get a mapped address, never NULL. */
+    d[6]=(uint32_t)p;d[7]=(uint32_t)(p>>32);
+    d[8]=(uint32_t)p;d[9]=(uint32_t)(p>>32);
+    d[10]=(uint32_t)p;d[11]=(uint32_t)(p>>32);
+    d[12]=(uint32_t)p;d[13]=(uint32_t)(p>>32);
+    d[26]=(uint32_t)p;d[27]=(uint32_t)(p>>32);
+    d[28]=(uint32_t)p;d[29]=(uint32_t)(p>>32);
+}
 static inline void lm_v7_tri_attr(uint32_t *p,unsigned buffer,uint32_t format,
     bool offset_enable) {
     p[0]=(format<<10)|((offset_enable?1u:0u)<<9)|buffer;p[1]=0;
@@ -241,8 +254,9 @@ static inline void lm_v7_tri_blend(uint32_t *b) {
     b[2]=0x00000019u; /* opaque, 4 components */
     b[3]=0x010ed000u; /* RGBA8 tilebuffer conversion, F32 register file */
 }
-static inline void lm_v7_tri_tiler_context(uint32_t *c,uint64_t heap) {
+static inline void lm_v7_tri_tiler_context(uint32_t *c,uint64_t heap,uint64_t poly) {
     memset(c,0,192);
+    c[0]=(uint32_t)poly;c[1]=(uint32_t)(poly>>32);
     c[2]=6u; /* hierarchy_mask for 64x64, max_levels=2; single-sampled */
     c[3]=((LM_TRI_WIDTH-1u)&0xffffu)|(((LM_TRI_HEIGHT-1u)&0xffffu)<<16);
     c[6]=(uint32_t)heap;c[7]=(uint32_t)(heap>>32);
@@ -280,8 +294,8 @@ static inline void lm_v7_tri_rt(uint32_t *rt,uint64_t output) {
     rt[10]=LM_TRI_WIDTH*LM_TRI_BPP;
 }
 static inline void lm_v7_tri_prepare(uint32_t *a,uint8_t *b,uint64_t a_va,
-    uint64_t b_va,uint64_t output,uint64_t heap,const void *vs,unsigned vn,
-    const void *fs,unsigned fn) {
+    uint64_t b_va,uint64_t output,uint64_t heap,uint64_t poly,const void *vs,
+    unsigned vn,const void *fs,unsigned fn) {
     memset(a,0,LM_PAGE_SIZE);memset(b,0,LM_PAGE_SIZE);
     memcpy(b+0x000,vs,vn);memcpy(b+0x100,fs,fn);
     uint64_t ctx=a_va+LM_TRI_TILER_CTX;
@@ -292,8 +306,12 @@ static inline void lm_v7_tri_prepare(uint32_t *a,uint8_t *b,uint64_t a_va,
     lm_v7_tri_header(vj,5,1,0,0,a_va+LM_TRI_TILER_JOB);
     lm_v7_tri_invocation(vj+8,LM_TRI_VERTEX_COUNT);
     vj[10]=5u<<26; /* job_task_split=5 */
-    lm_v7_tri_draw(vj+16,0,a_va+LM_TRI_VERT_RSD,a_va+LM_TRI_VATTR_BUF,
-        a_va+LM_TRI_VATTR,a_va+LM_TRI_VARY_BUF,a_va+LM_TRI_VARY_ATTR,0);
+    /* Fill even unused pointers with mapped addresses: a zero field is a
+     * translation fault at VA 0 if this hardware dereferences it. */
+    lm_v7_tri_draw(vj+16,a_va+LM_TRI_POS_BUF,a_va+LM_TRI_VERT_RSD,
+        a_va+LM_TRI_VATTR_BUF,a_va+LM_TRI_VATTR,a_va+LM_TRI_VARY_BUF,
+        a_va+LM_TRI_VARY_ATTR,a_va+LM_TRI_VIEWPORT);
+    lm_v7_tri_draw_dummies(vj+16,poly);
     /* TILER job, depends on the vertex job. This chain goes to JS1; the
      * fragment job is a separate chain on JS0 (JS0=fragment, JS1=vertex/tiler
      * in panfrost). Submitting a VERTEX job on JS0 raised a job exception. */
@@ -305,10 +323,10 @@ static inline void lm_v7_tri_prepare(uint32_t *a,uint8_t *b,uint64_t a_va,
     tj[16]=(uint32_t)(a_va+LM_TRI_PSIZ_BUF);
     tj[17]=(uint32_t)((a_va+LM_TRI_PSIZ_BUF)>>32);
     tj[18]=(uint32_t)ctx;tj[19]=(uint32_t)(ctx>>32);
-    lm_v7_tri_draw(tj+32,0,a_va+LM_TRI_FRAG_RSD,0,0,0,0,a_va+LM_TRI_VIEWPORT);
-    /* Keep the fragment draw's position result buffer. */
-    tj[32+4]=(uint32_t)(a_va+LM_TRI_POS_BUF);
-    tj[32+5]=(uint32_t)((a_va+LM_TRI_POS_BUF)>>32);
+    lm_v7_tri_draw(tj+32,a_va+LM_TRI_POS_BUF,a_va+LM_TRI_FRAG_RSD,
+        a_va+LM_TRI_VATTR_BUF,a_va+LM_TRI_VATTR,a_va+LM_TRI_VARY_BUF,
+        a_va+LM_TRI_VARY_ATTR,a_va+LM_TRI_VIEWPORT);
+    lm_v7_tri_draw_dummies(tj+32,poly);
     /* FRAGMENT job: its own chain on JS0 after the tiler chain completes. */
     uint32_t *fj=a+LM_TRI_FRAG_JOB/4;
     lm_v7_tri_header(fj,9,1,0,0,0);
@@ -319,13 +337,16 @@ static inline void lm_v7_tri_prepare(uint32_t *a,uint8_t *b,uint64_t a_va,
     lm_v7_tri_vertex_rsd(a+LM_TRI_VERT_RSD/4,vshader);
     lm_v7_tri_fragment_rsd(a+LM_TRI_FRAG_RSD/4,fshader);
     lm_v7_tri_blend(a+LM_TRI_FRAG_BLEND/4);
-    lm_v7_tri_tiler_context(a+LM_TRI_TILER_CTX/4,heap_desc);
+    lm_v7_tri_tiler_context(a+LM_TRI_TILER_CTX/4,heap_desc,poly);
     lm_v7_tri_tiler_heap(a+LM_TRI_TILER_HEAP/4,heap);
     lm_v7_tri_viewport(a+LM_TRI_VIEWPORT/4);
     lm_v7_tri_attr(a+LM_TRI_VATTR/4,0,16u|(UINT32_C(175)<<12),true); /* RG32F */
     lm_v7_tri_attr_buffer(a+LM_TRI_VATTR_BUF/4,a_va+LM_TRI_VERTEX_DATA,8,
         LM_PAGE_SIZE-LM_TRI_VERTEX_DATA);
-    memset(a+LM_TRI_VATTR_BUF/4+4,0,16); /* Bifrost prefetch terminator */
+    /* Mesa's input prefetch terminator is a *empty 1D buffer* (type=1,
+     * pointer/stride/size=0), not an all-zero descriptor. Type 0 is invalid
+     * and makes the attribute fetch read through a NULL pointer. */
+    lm_v7_tri_attr_buffer(a+LM_TRI_VATTR_BUF/4+4,0,0,0);
     /* Mesa's pan_emit_vary sets offset_enable only for PAN_ARCH <= 5. */
     lm_v7_tri_attr(a+LM_TRI_VARY_ATTR/4,1,UINT32_C(94)<<12,false);  /* position */
     lm_v7_tri_attr(a+LM_TRI_VARY_ATTR/4+2,2,UINT32_C(199)<<12,false); /* psiz */
@@ -400,6 +421,8 @@ static int lm_private_dma_cleanup(struct lm_private_dma *s) {
         if(s->tri_output[i].cpu)s->io.page_free(s->io.cookie,&s->tri_output[i]);
     for(unsigned i=0;i<LM_TRI_HEAP_PAGES;i++)
         if(s->tri_heap[i].cpu)s->io.page_free(s->io.cookie,&s->tri_heap[i]);
+    for(unsigned i=0;i<LM_TRI_POLY_PAGES;i++)
+        if(s->tri_poly[i].cpu)s->io.page_free(s->io.cookie,&s->tri_poly[i]);
     if(s->job_page.cpu)s->io.page_free(s->io.cookie,&s->job_page);
     s->cleaned=true;return LM_OK;
 }
@@ -471,6 +494,9 @@ static int lm_private_dma_run(struct lm_private_dma *s,const struct lm_ops *io) 
         for(unsigned i=0;i<LM_TRI_HEAP_PAGES;i++) {
             s->error=io->page_alloc(io->cookie,&s->tri_heap[i]);if(s->error)goto cleanup;
         }
+        for(unsigned i=0;i<LM_TRI_POLY_PAGES;i++) {
+            s->error=io->page_alloc(io->cookie,&s->tri_poly[i]);if(s->error)goto cleanup;
+        }
         /* All backing must be distinct; a duplicate PA would alias a
          * descriptor, shader, output or heap page and invalidate the test. */
         for(unsigned i=0;i<2;i++)for(unsigned j=0;j<i;j++)
@@ -485,9 +511,17 @@ static int lm_private_dma_run(struct lm_private_dma *s,const struct lm_ops *io) 
             if(s->tri_output[i].pa==s->tri_heap[j].pa){s->error=LM_EINVAL;goto cleanup;}
         for(unsigned i=0;i<LM_TRI_HEAP_PAGES;i++)for(unsigned j=0;j<i;j++)
             if(s->tri_heap[i].pa==s->tri_heap[j].pa){s->error=LM_EINVAL;goto cleanup;}
+        for(unsigned p=0;p<LM_TRI_POLY_PAGES;p++)for(unsigned j=0;j<p;j++)
+            if(s->tri_poly[p].pa==s->tri_poly[j].pa){s->error=LM_EINVAL;goto cleanup;}
+        for(unsigned p=0;p<LM_TRI_POLY_PAGES;p++)for(unsigned i=0;i<2;i++)
+            if(s->tri_poly[p].pa==s->tri_pages[i].pa){s->error=LM_EINVAL;goto cleanup;}
+        for(unsigned p=0;p<LM_TRI_POLY_PAGES;p++)for(unsigned i=0;i<LM_TRI_PAGES;i++)
+            if(s->tri_poly[p].pa==s->tri_output[i].pa){s->error=LM_EINVAL;goto cleanup;}
+        for(unsigned p=0;p<LM_TRI_POLY_PAGES;p++)for(unsigned i=0;i<LM_TRI_HEAP_PAGES;i++)
+            if(s->tri_poly[p].pa==s->tri_heap[i].pa){s->error=LM_EINVAL;goto cleanup;}
         lm_v7_tri_prepare(s->tri_pages[0].cpu,s->tri_pages[1].cpu,LM_PRIVATE_JOB_VA,
             LM_TRI_SHADER_PAGE_VA,LM_PRIVATE_OUTPUT_VA,LM_TRI_HEAP_VA,
-            s->tri_vertex_shader,s->tri_vertex_shader_bytes,
+            LM_TRI_POLY_VA,s->tri_vertex_shader,s->tri_vertex_shader_bytes,
             s->tri_fragment_shader,s->tri_fragment_shader_bytes);
         s->error=lm_core_vm_map(s->vm,LM_PRIVATE_JOB_VA,&s->tri_pages[0],1,LM_MAP_WRITE);
         if(!s->error)s->error=lm_core_vm_map(s->vm,LM_TRI_SHADER_PAGE_VA,&s->tri_pages[1],1,
@@ -496,6 +530,8 @@ static int lm_private_dma_run(struct lm_private_dma *s,const struct lm_ops *io) 
             LM_TRI_PAGES,LM_MAP_WRITE);
         if(!s->error)s->error=lm_core_vm_map(s->vm,LM_TRI_HEAP_VA,s->tri_heap,
             LM_TRI_HEAP_PAGES,LM_MAP_WRITE);
+        if(!s->error)s->error=lm_core_vm_map(s->vm,LM_TRI_POLY_VA,s->tri_poly,
+            LM_TRI_POLY_PAGES,LM_MAP_WRITE);
         if(!s->error) {
             uint32_t flags=0;
             if(lm_core_vm_lookup(s->vm,LM_PRIVATE_JOB_VA,&flags)!=s->tri_pages[0].pa ||
@@ -503,7 +539,7 @@ static int lm_private_dma_run(struct lm_private_dma *s,const struct lm_ops *io) 
                lm_core_vm_lookup(s->vm,LM_TRI_SHADER_PAGE_VA,&flags)!=s->tri_pages[1].pa ||
                flags!=(LM_MAP_WRITE|LM_MAP_EXEC) ||
                lm_core_vm_lookup(s->vm,LM_PRIVATE_JOB_VA-4096,NULL) ||
-               lm_core_vm_lookup(s->vm,LM_TRI_HEAP_VA+LM_TRI_HEAP_PAGES*LM_PAGE_SIZE,NULL))
+               lm_core_vm_lookup(s->vm,LM_TRI_POLY_VA+LM_TRI_POLY_BYTES,NULL))
                 s->error=LM_EFAULT;
             for(unsigned i=0;!s->error && i<LM_TRI_PAGES;i++)
                 if(lm_core_vm_lookup(s->vm,LM_PRIVATE_OUTPUT_VA+i*LM_PAGE_SIZE,&flags)!=
@@ -511,6 +547,9 @@ static int lm_private_dma_run(struct lm_private_dma *s,const struct lm_ops *io) 
             for(unsigned i=0;!s->error && i<LM_TRI_HEAP_PAGES;i++)
                 if(lm_core_vm_lookup(s->vm,LM_TRI_HEAP_VA+i*LM_PAGE_SIZE,&flags)!=
                    s->tri_heap[i].pa || flags!=LM_MAP_WRITE)s->error=LM_EFAULT;
+            for(unsigned i=0;!s->error && i<LM_TRI_POLY_PAGES;i++)
+                if(lm_core_vm_lookup(s->vm,LM_TRI_POLY_VA+i*LM_PAGE_SIZE,&flags)!=
+                   s->tri_poly[i].pa || flags!=LM_MAP_WRITE)s->error=LM_EFAULT;
         }
         if(s->error)goto cleanup;
         /* JS1 carries vertex+tiler; JS0 carries the fragment job. This is the
