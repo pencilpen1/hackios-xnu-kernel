@@ -346,8 +346,9 @@ static bool lancelot_gpu_power_probe(const char *cmdline) {
 	int dma=lpm_requested_named(cmdline,"lancelot_gpu_dma=");
 	int fault=lpm_requested_named(cmdline,"lancelot_gpu_fault=");
 	int clear=lpm_requested_named(cmdline,"lancelot_gpu_clear=");
-	if(features<0 || dma<0 || fault<0 || clear<0 || (features && requested!=1) || (dma && features!=1) ||
-	   (fault && dma!=1) || (clear && dma!=1) || (clear && fault)) {
+	int chain=lpm_requested_named(cmdline,"lancelot_gpu_clear_chain=");
+	if(features<0 || dma<0 || fault<0 || clear<0 || chain<0 || (features && requested!=1) || (dma && features!=1) ||
+	   (fault && dma!=1) || (clear && dma!=1) || (clear && fault) || (chain && clear!=1)) {
 		print("lancelot-gpu-features: invalid/duplicate/dependency mode rejected; no MMIO\n");return true;
 	}
 	if(!requested)return true;
@@ -365,9 +366,11 @@ static bool lancelot_gpu_power_probe(const char *cmdline) {
 	if(dma) {
 		lancelot_dma_context.transaction.mmu_fault_test=fault==1;
 		lancelot_dma_context.clear_mode=clear==1;
+		lancelot_dma_context.clear_chain=chain==1;
 		int error=lfd_prepare(&lancelot_dma_context,&context,&lancelot_dma_memory);
-		print("lancelot-gpu-dma: pool error=%x base=%x pages=%d clear=%d; no GPU writes unless normal-WB CPU/PA checks pass\n",
-		    (uint64_t)(uint32_t)error,lancelot_dma_context.pa,(uint64_t)LFD_PAGES,(uint64_t)(clear==1));
+		print("lancelot-gpu-dma: pool error=%x base=%x pages=%d clear=%d chain=%d; no GPU writes unless normal-WB CPU/PA checks pass\n",
+		    (uint64_t)(uint32_t)error,lancelot_dma_context.pa,(uint64_t)LFD_PAGES,
+		    (uint64_t)(clear==1),(uint64_t)(chain==1));
 		if(error) {
 			struct lpg_result failed={.error=error,.dma_halt_required=true};lancelot_gpu_save_receipt(&failed,error,true);
 			lancelot_gpu_print_receipt();
@@ -409,8 +412,8 @@ static bool lancelot_gpu_power_probe(const char *cmdline) {
 		    (uint64_t)(uint32_t)s->cleanup_error,(uint64_t)result.dma_safe_to_teardown,
 		    (uint64_t)f->allocated,(uint64_t)result.dma_halt_required);
 		if(clear)
-			print("lancelot-gpu-clear: fragment-job=%d color=%x guards=%d bad-offset=%x actual=%x; GPU writes RGBA8 64x64 pixels, not WRITE_VALUE\n",
-			    (uint64_t)(s->descriptor_status==UINT32_C(0x00010013)),(uint64_t)s->clear_value,
+			print("lancelot-gpu-clear: fragment-jobs=%d colors=%x/%x guards=%d bad-offset=%x actual=%x; GPU writes RGBA8 64x64 pixels, not WRITE_VALUE\n",
+			    (uint64_t)(s->clear_chain?2:1),(uint64_t)s->clear_value,(uint64_t)(s->clear_chain?s->clear_value2:s->clear_value),
 			    (uint64_t)s->guards_valid,(uint64_t)s->bad_offset,(uint64_t)s->clear_actual);
 		print("lancelot-gpu-dma: peak-pages=%d cache-clean=%d cache-invalidate=%d reads=%d writes=%d io-error=%x release=%x; %s\n",
 		    (uint64_t)f->peak_pages,(uint64_t)f->cleans,(uint64_t)f->invalidates,(uint64_t)f->gpu_reads,

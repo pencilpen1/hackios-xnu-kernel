@@ -107,6 +107,11 @@ int main(int argc,char **argv) {
     assert(lfd_run(&f,&state,&props,&safe)==LM_EIO&&safe&&!f.allocated&&m.releases==1);
     assert(!f.transaction.guards_valid&&f.transaction.bad_offset==4u&&
         f.transaction.clear_actual==(LM_CLEAR_VALUE^1u));
+    fw_init(&m,&c,&mem);f=(struct lfd_context){0};assert(!lfd_prepare(&f,&c,&mem));
+    f.clear_mode=f.clear_chain=true;m.gpu.emulate_clear=true;
+    assert(!lfd_run(&f,&state,&props,&safe)&&safe&&!f.allocated&&m.releases==1);
+    assert(f.transaction.guards_valid&&f.transaction.clear_chain&&f.peak_pages==13);
+    assert(f.transaction.observed_value==LM_CLEAR_VALUE&&m.gpu.jobs_run==2);
     const uint32_t bind_regs[]={0x2400,0x2404,0x2408,0x240c,0x2430,0x2434};
     for(unsigned i=0;i<sizeof(bind_regs)/sizeof(bind_regs[0]);i++) {
         fw_init(&m,&c,&mem);f=(struct lfd_context){0};assert(!lfd_prepare(&f,&c,&mem));

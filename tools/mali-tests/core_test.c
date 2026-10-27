@@ -13,7 +13,8 @@ struct fake {
     uint32_t fail_read,fail_write; bool fail_after_done,submitted;
     bool drop_bind_root,drop_detach_config,drop_next_head,stale_done,done_busy;
     bool emulate_value,corrupt_guard,reset_fail_after_submit;
-    bool emulate_clear,corrupt_pixel;
+    bool emulate_clear,corrupt_pixel,corrupt_pixel2;
+    unsigned jobs_run;
     uint32_t corrupt_bind_reg;
     unsigned active_slot;
     bool done_current_busy;
@@ -94,32 +95,38 @@ static void wr(void*o,uint32_t r,uint32_t x) {
         else {
             if(f->emulate_clear) {
                 uint64_t jc=(uint64_t)f->reg[(r-0x20)/4]|(uint64_t)f->reg[(r-0x1c)/4]<<32;
-                uint32_t *job=gpu_address(f,jc);assert(job);
-                assert((job[4]&UINT32_C(0xfe))==UINT32_C(9u<<1)); /* Fragment */
-                assert(job[4]&1u); /* is_64b */
-                uint64_t tag=(uint64_t)job[10]|(uint64_t)job[11]<<32;
-                uint32_t *fbd=gpu_address(f,tag&~UINT64_C(0x3f));assert(fbd);
-                uint32_t width=(fbd[8]&0xffffu)+1u,height=(fbd[8]>>16)+1u;
-                assert((fbd[10]&0xffffu)==width-1u);
-                assert(((fbd[11]>>9)&0xfu)==8u); /* 16x16 tile area 256, log2 */
-                assert((fbd[11]>>24)==1u);       /* 1024-byte cbuf >> 10 */
-                uint32_t *rt=fbd+32;
-                assert(((rt[0]>>26)&0x3fu)==1u); /* R8G8B8A8 */
-                assert(((rt[1]>>3)&0x1fu)==19u); /* writeback R8G8B8A8 */
-                assert(((rt[1]>>8)&0xfu)==2u);   /* linear */
-                assert(rt[1]&1u);                /* write enable */
-                assert(rt[1]&(1u<<31));          /* clean pixel write */
-                assert(((rt[1]>>16)&0xfffu)==0x688u); /* identity RGBA swizzle */
-                assert(rt[10]==width*4u);
-                uint32_t color=rt[12];
-                assert(rt[13]==color&&rt[14]==color&&rt[15]==color);
-                uint64_t base=(uint64_t)rt[8]|(uint64_t)rt[9]<<32;
-                for(unsigned py=0;py<height;py++)
-                    for(unsigned px=0;px<width;px++) {
-                        uint32_t *p=gpu_address(f,base+4u*(py*width+px));assert(p);
-                        *p=color;
-                        if(f->corrupt_pixel&&py==0&&px==1)*p^=1u;
-                    }
+                for(unsigned depth=0;jc;depth++) {
+                    assert(depth<4); /* bounded job chain */
+                    uint32_t *job=gpu_address(f,jc);assert(job);
+                    assert((job[4]&UINT32_C(0xfe))==UINT32_C(9u<<1)); /* Fragment */
+                    assert(job[4]&1u); /* is_64b */
+                    uint64_t tag=(uint64_t)job[10]|(uint64_t)job[11]<<32;
+                    uint32_t *fbd=gpu_address(f,tag&~UINT64_C(0x3f));assert(fbd);
+                    uint32_t width=(fbd[8]&0xffffu)+1u,height=(fbd[8]>>16)+1u;
+                    assert((fbd[10]&0xffffu)==width-1u);
+                    assert(((fbd[11]>>9)&0xfu)==8u); /* 16x16 tile area 256, log2 */
+                    assert((fbd[11]>>24)==1u);       /* 1024-byte cbuf >> 10 */
+                    uint32_t *rt=fbd+32;
+                    assert(((rt[0]>>26)&0x3fu)==1u); /* R8G8B8A8 */
+                    assert(((rt[1]>>3)&0x1fu)==19u); /* writeback R8G8B8A8 */
+                    assert(((rt[1]>>8)&0xfu)==2u);   /* linear */
+                    assert(rt[1]&1u);                /* write enable */
+                    assert(rt[1]&(1u<<31));          /* clean pixel write */
+                    assert(((rt[1]>>16)&0xfffu)==0x688u); /* identity RGBA swizzle */
+                    assert(rt[10]==width*4u);
+                    uint32_t color=rt[12];
+                    assert(rt[13]==color&&rt[14]==color&&rt[15]==color);
+                    uint64_t base=(uint64_t)rt[8]|(uint64_t)rt[9]<<32;
+                    for(unsigned py=0;py<height;py++)
+                        for(unsigned px=0;px<width;px++) {
+                            uint32_t *p=gpu_address(f,base+4u*(py*width+px));assert(p);
+                            *p=color;
+                            if(f->corrupt_pixel&&depth==0&&py==0&&px==1)*p^=1u;
+                            if(f->corrupt_pixel2&&depth==1&&py==0&&px==1)*p^=1u;
+                        }
+                    f->jobs_run++;
+                    jc=(uint64_t)job[6]|(uint64_t)job[7]<<32;
+                }
                 if(f->fail_write&&r==f->fail_write&&(!f->fail_after_done||f->submitted))f->ioerr=1;
             } else if(f->emulate_value) {
                 uint64_t jc=(uint64_t)f->reg[(r-0x20)/4]|(uint64_t)f->reg[(r-0x1c)/4]<<32;
@@ -400,10 +407,40 @@ static void private_clear_mismatch(void) {
     assert(s.cleaned&&!s.backing_retained&&!f.pages&&!f.allocs);
     puts("Private clear negative: one wrong pixel is rejected with its exact offset/value while cleanup still succeeds; RAM ONLY");
 }
+static void private_clear_chain(void) {
+    struct fake f;struct lm_core*unused=bare_device(&f);assert(!lm_core_destroy(unused));
+    f.reg[0]=0x74021000;f.reg[0x100/4]=3;f.emulate_clear=true;
+    struct lm_ops io={.cookie=&f,.read32=rr,.write32=wr,.now_ns=now,.delay_us=delay,
+        .alloc=ma,.free=mf,.page_alloc=pa,.page_free=pf,.for_device=clean,.for_cpu=inval,
+        .barrier=barrier,.io_error=ioerr};
+    struct lm_private_dma s={.clear_test=true,.clear_chain=true,
+        .clear_value=LM_CLEAR_VALUE,.clear_value2=LM_CLEAR_VALUE2};
+    assert(lm_private_dma_run(&s,&io)==LM_OK);
+    assert(s.submitted&&s.guards_valid&&s.cleaned&&!s.backing_retained);
+    assert(s.observed_value==LM_CLEAR_VALUE&&f.jobs_run==2);
+    assert(s.descriptor_status==0x00010013);
+    assert(!s.bad_offset&&!s.bad_job&&!f.pages&&!f.allocs&&!f.run);
+    puts("Private chained clear: two chained FRAGMENT jobs write two RGBA8 surfaces, job.next and release proved; RAM ONLY");
+}
+static void private_clear_chain_mismatch(void) {
+    struct fake f;struct lm_core*unused=bare_device(&f);assert(!lm_core_destroy(unused));
+    f.reg[0]=0x74021000;f.reg[0x100/4]=3;f.emulate_clear=true;f.corrupt_pixel2=true;
+    struct lm_ops io={.cookie=&f,.read32=rr,.write32=wr,.now_ns=now,.delay_us=delay,
+        .alloc=ma,.free=mf,.page_alloc=pa,.page_free=pf,.for_device=clean,.for_cpu=inval,
+        .barrier=barrier,.io_error=ioerr};
+    struct lm_private_dma s={.clear_test=true,.clear_chain=true,
+        .clear_value=LM_CLEAR_VALUE,.clear_value2=LM_CLEAR_VALUE2};
+    assert(lm_private_dma_run(&s,&io)==LM_EIO);
+    assert(!s.guards_valid&&s.bad_offset==LM_CLEAR_BYTES+4u);
+    assert(s.clear_actual==(LM_CLEAR_VALUE2^1u));
+    assert(s.job_result.expected==LM_CLEAR_VALUE2&&f.jobs_run==2);
+    assert(s.cleaned&&!s.backing_retained&&!f.pages&&!f.allocs);
+    puts("Private chained clear negative: a wrong pixel in the second surface is rejected with its exact offset/value; RAM ONLY");
+}
 int main(int argc,char**argv) {
     if(argc>1 && !strcmp(argv[1],"quarantine")){quarantine();return 0;}
     if(argc>1 && !strcmp(argv[1],"mmio")){io_failure();return 0;}
     if(argc>1 && !strcmp(argv[1],"private-quarantine")){private_dma_quarantine();return 0;}
-    if(argc>1 && !strcmp(argv[1],"private-clear")){private_clear();private_clear_mismatch();return 0;}
-    identity();mapping();isolation();oom();reclaim();failures();posted_write_proofs();private_dma_transaction();private_mmu_fault();private_clear();private_clear_mismatch();return 0;
+    if(argc>1 && !strcmp(argv[1],"private-clear")){private_clear();private_clear_mismatch();private_clear_chain();private_clear_chain_mismatch();return 0;}
+    identity();mapping();isolation();oom();reclaim();failures();posted_write_proofs();private_dma_transaction();private_mmu_fault();private_clear();private_clear_mismatch();private_clear_chain();private_clear_chain_mismatch();return 0;
 }
