@@ -183,12 +183,50 @@ static int private_dma_test(void) {
     } else printf("lancelot-mali: DMA state unknown; test VM/pages quarantined until reboot\n");
     return e;
 }
+/* Board evidence for the WACS2 window. The AP owns the WACS2 command window;
+ * peer processors use separate PWRAP windows (WACS_P2P / WACS_MD32) and the
+ * hardware arbiter serialises bus access, so there is no same-WACS2 peer to
+ * coordinate with. Sources:
+ *  - vendor pwrap_hal.c: pwrap_init() ends in _pwrap_enable(), which sets
+ *    HPRIO_ARB_EN=0x3fa65 with WACS0/WACS2/WACS_P2P/WACS_MD32 enabled, and
+ *    pwrap_wacs2_write() drives WACS2 directly unless SSPM IPI forwarding is
+ *    compiled in.
+ *  - shipping Shockwave 4.19 kernel (CONFIG_MTK_TINYSYS_SSPM_SUPPORT=y,
+ *    CONFIG_MTK_PMIC_WRAP=y): binds the mainline mtk-pmic-wrap driver, passes
+ *    the WACS2 PMIC write test, and enables VGPU/VSRAM through the regulator
+ *    framework while SSPM v1 runs; no PMIC IPI forwarding appears in dmesg.
+ *  - XNU read-only sampling at the same boot: WACS2 INIT=1, FSM/REQ idle,
+ *    SYNC_BUSY only from another channel.
+ * This is evidence for the AP WACS2 window, not proof that every other
+ * processor is stopped; the arbiter remains enabled. */
+static const char lancelot_pwrap_evidence[] =
+    "AP owns the WACS2 window; vendor pwrap_init enables WACS0/WACS2/P2P/MD32 "
+    "with HPRIO_ARB_EN=0x3fa65 and the shipping 4.19 kernel drives WACS2 "
+    "directly (write test pass, VGPU/VSRAM via regulators) while SSPM v1 "
+    "runs; SSPM uses the P2P/MD32 windows; XNU read-only sampling sees WACS2 "
+    "INIT=1 and FSM/REQ idle";
 void lancelot_mali_init(void) {
     uint32_t mode=0;
     if(!PE_parse_boot_argn("lancelot_mali",&mode,sizeof(mode))||mode==0)return;
     if(mode!=1&&mode!=3&&mode!=4) {printf("lancelot-mali: rejected mode=%u; no MMIO\n",mode);return;}
     if(mode==1) {firmware_gpu_receipt();lancelot_mali_observe();return;}
     if(!board_matches()) {printf("lancelot-mali: board contract rejected; no MMIO\n");return;}
+    /* Register the evidence-backed WACS2 handoff once, before any user. A
+     * second registration is rejected; that is fine for repeated init calls. */
+    if(!lancelot_pwrap_available()) {
+        static bool handoff_registered;
+        if(!handoff_registered) {
+            static const struct lancelot_pwrap_handoff h={.mode=LANCELOT_PWRAP_AP_EXCLUSIVE,
+                .evidence=lancelot_pwrap_evidence};
+            int he=lancelot_pwrap_register_handoff(&h);
+            printf("lancelot-mali: WACS2 handoff registration=%d evidence=board-vendor-mainline\n",he);
+            if(!he)handoff_registered=true;
+        }
+        if(!lancelot_pwrap_available()) {
+            printf("lancelot-mali: WACS2 handoff unavailable; no PWRAP/GPU access, no service\n");
+            return;
+        }
+    }
     const struct lm_gpu_pwrap_owner shared={.acquire=lancelot_pwrap_acquire,
         .release=lancelot_pwrap_release,.poison=shared_pwrap_poison};
     int registration=lm_gpu_register_pwrap_owner(&shared);
