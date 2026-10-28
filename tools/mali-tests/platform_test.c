@@ -458,16 +458,24 @@ test_pmic_provider(void)
     model.pmic[regs.swcid_addr / 2] = LMP_PMIC_CID_E2;
     model.regs[0x000 / 4] = 0; model.regs[0x004 / 4] = 1;
     model.regs[0x070 / 4] = 0; model.regs[0x090 / 4] = 1;
+    /* the stuck model reports WFVLDCLR, which only its owner may clear */
     assert(lmp_pmic_probe(&state, &io, &regs) == LMP_EBUSY);
-    for(unsigned fsm=2;fsm<=6;fsm+=2) {
+    for(unsigned fsm=2;fsm<=4;fsm+=2) {
         model=(struct pwrap_model){0};model.foreign_fsm=fsm;
         model.regs[0x004/4]=model.regs[0x090/4]=1;
-        assert(lmp_pmic_probe(&state,&io,&regs)==LMP_EBUSY);
+        /* a busy foreign FSM is waited out (read-only) and times out */
+        assert(lmp_pmic_probe(&state,&io,&regs)==LMP_ETIMEDOUT);
         assert(!model.writes&&!model.owned&&model.acquires==model.releases);
     }
+    model=(struct pwrap_model){0};model.foreign_fsm=6; /* LMP_PMIC_FSM_WFVLDCLR */
+    model.regs[0x004/4]=model.regs[0x090/4]=1;
+    /* WFVLDCLR waits for its owner to clear it; this probe must not */
+    assert(lmp_pmic_probe(&state,&io,&regs)==LMP_EBUSY);
+    assert(!model.writes&&!model.owned&&model.acquires==model.releases);
     model=(struct pwrap_model){0};model.foreign_req=true;
     model.regs[0x004/4]=model.regs[0x090/4]=1;
-    assert(lmp_pmic_probe(&state,&io,&regs)==LMP_EBUSY);
+    /* a pending foreign request is waited out, never cleared, and times out */
+    assert(lmp_pmic_probe(&state,&io,&regs)==LMP_ETIMEDOUT);
     assert(!model.writes&&!model.poisons&&!model.owned);
     model=(struct pwrap_model){0};model.hang_own_read=true;
     model.regs[0x004/4]=model.regs[0x090/4]=1;

@@ -95,6 +95,7 @@ lmp_pmic_wait_wacs(struct lmp_pmic_state *state, uint32_t wanted_fsm,
 
     if (!state || !state->io.now_ns || !state->io.delay_us)
         return LMP_EINVAL;
+    (void)own_command; /* the channel is only polled now; ownership no longer changes the wait */
     timeout = state->io.timeout_ns ? state->io.timeout_ns
                                    : LMP_PMIC_WACS_TIMEOUT_NS;
     start = state->io.now_ns(state->io.cookie);
@@ -105,10 +106,12 @@ lmp_pmic_wait_wacs(struct lmp_pmic_state *state, uint32_t wanted_fsm,
         init_done = (status >> 21) & 1u;
         if (!init_done)
             return LMP_ENODEV;
-        if (!own_command && (((status >> 19) & 1u) != 0 ||
-                             ((status >> 16) & 7u) != LMP_PMIC_FSM_IDLE ||
-                              ((status >> 20) & 1u) != LMP_PMIC_SYNC_IDLE))
-            return LMP_EBUSY; /* Never wait out or clear a foreign pending command. */
+        /* A foreign command may be in flight on the shared bus. Polling the
+         * status register does not touch or clear that command, so wait for
+         * the channel to become idle inside the existing bounded loop below
+         * instead of failing the probe at the first busy sample. The channel
+         * is never written here; a command that stays pending past the
+         * timeout still fails (ETIMEDOUT), and WFVLDCLR below remains EBUSY. */
         if (((status >> 16) & 7u) == LMP_PMIC_FSM_WFVLDCLR &&
             wanted_fsm == LMP_PMIC_FSM_IDLE) {
             return LMP_EBUSY;
