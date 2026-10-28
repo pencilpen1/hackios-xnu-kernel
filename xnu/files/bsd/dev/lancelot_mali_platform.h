@@ -115,6 +115,7 @@ struct lmp_state {
     bool prepared;
     bool started;
     bool failed;
+    uint32_t last_stage; /* lmp_start step reached: 1 require, 2 prepare, 3 power, 4 clock, 5 reset, 6 bus */
     bool teardown_safe;
     bool gpu_ready;
 

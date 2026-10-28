@@ -84,19 +84,43 @@ lancelot_ubuntu_bootstrap(void)
 		cursor += span;
 	}
 	if (cursor != end) return 0;
+	/* Each slot accepts one of a few known images: the original 4 MiB RAM
+	 * disk, or the GPU userland image that carries libOSMesa and gl_test.
+	 * The old variant stays valid so restoring the original profile cannot
+	 * be refused. Sizes are exact file lengths. */
+	struct lancelot_ramdisk_variant {
+		uint32_t size;
+		const char *hash;
+	};
 	static const struct {
-		const char *entry, *path, *hash;
+		const char *entry, *path;
+		struct lancelot_ramdisk_variant variants[2];
 	} files[] = {
-		{"ramdisk", "/hackios/20H392/touch-hardware-20261024/root.apfs", "81a86d265596387f227c7b8a3e021f991293c2900b69a89a38b0f29be6436763"},
-		{"bootdisk", "/hackios/20H392/flashboot.apfs", "14485e7c5ce125ef516168445c2500ac04ca5e40a908c2aef516b2d92c24ba0c"},
+		{"ramdisk", "/hackios/20H392/touch-hardware-20261024/root.apfs",
+		 {{4194304u, "81a86d265596387f227c7b8a3e021f991293c2900b69a89a38b0f29be6436763"},
+		  {5976064u, "501f6a4e0efadec2108d91c5f970379ba1a2317d1e97d3cbf114291e4b4e742f"}}},
+		{"bootdisk", "/hackios/20H392/flashboot.apfs",
+		 {{4194304u, "14485e7c5ce125ef516168445c2500ac04ca5e40a908c2aef516b2d92c24ba0c"},
+		  {0u, 0}}},
 	};
 	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
 		struct ext4_inode inode;
-		const uint32_t expected_size = 4194304;
-		if (!ext4_lookup(&fs, files[i].path, &inode) || inode.size != expected_size) {
-			print("ubuntu: missing/wrong-size %s\n", files[i].path);
+		const struct lancelot_ramdisk_variant *found = 0;
+		if (!ext4_lookup(&fs, files[i].path, &inode)) {
+			print("ubuntu: missing %s\n", files[i].path);
 			return 0;
 		}
+		for (unsigned v = 0; v < sizeof(files[i].variants) / sizeof(files[i].variants[0]); v++) {
+			if (files[i].variants[v].hash && files[i].variants[v].size == inode.size) {
+				found = &files[i].variants[v];
+				break;
+			}
+		}
+		if (!found) {
+			print("ubuntu: wrong-size %s\n", files[i].path);
+			return 0;
+		}
+		const uint32_t expected_size = found->size;
 		uint64_t offset = (uint64_t)(end - (uint8_t *)header);
 		if (offset > PAYLOAD_MAX_SIZE - 0x100000 - expected_size - 2 * sizeof(struct payload_entry)) return 0;
 		struct payload_entry *entry = (void *)end;
@@ -111,13 +135,13 @@ lancelot_ubuntu_bootstrap(void)
 		sha256(data, expected_size, hash);
 		static const char digits[] = "0123456789abcdef";
 		for (unsigned j = 0; j < 32; j++) {
-			if (digits[hash[j] >> 4] != files[i].hash[j * 2] || digits[hash[j] & 15] != files[i].hash[j * 2 + 1]) {
+			if (digits[hash[j] >> 4] != found->hash[j * 2] || digits[hash[j] & 15] != found->hash[j * 2 + 1]) {
 				print("ubuntu: SHA256 mismatch %s\n", files[i].path);
 				return 0;
 			}
 		}
 		end = data + expected_size;
-		print("ubuntu: %s %d bytes SHA256 verified (%s)\n", files[i].path, (uint64_t)expected_size, files[i].hash);
+		print("ubuntu: %s %d bytes SHA256 verified (%s)\n", files[i].path, (uint64_t)expected_size, found->hash);
 	}
 	memset(end, 0, sizeof(struct payload_entry));
 	header->size = (uint32_t)(end + sizeof(struct payload_entry) - (uint8_t *)(header + 1));

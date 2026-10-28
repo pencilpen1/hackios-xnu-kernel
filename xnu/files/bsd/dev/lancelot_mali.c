@@ -258,8 +258,14 @@ void lancelot_mali_init(void) {
     int e=lmp_init(&platform,&config,&io);struct lmp_status s={0};
     if(!e)e=lmp_status(&platform,&s);
     printf("lancelot-mali: mode=%u SPM=%#x/%#x domainMask=%#x match=%u statusResult=%d\n",mode,s.pwr_status,s.pwr_status_2nd,s.domain_mask,s.domain_ack_match,e);
+    /* Boot firmware can leave MFG powered; lmp_reset_release takes such a
+     * domain over in full mode instead of refusing it. Report the inherited
+     * bits so the log says which state the AP inherited. */
+    printf("lancelot-mali: MFG inherited MFG/CORE0/CORE1/ASYNC=%d/%d/%d/%d\n",
+        platform.initial_domain_on[0]?1:0,platform.initial_domain_on[1]?1:0,
+        platform.initial_domain_on[2]?1:0,platform.initial_domain_on[3]?1:0);
     if(e||mode==1)goto done;
-    if((e=lmp_start(&platform))) {printf("lancelot-mali: platform start failed=%d; no service\n",e);goto done;}
+    if((e=lmp_start(&platform))) {printf("lancelot-mali: platform start failed=%d stage=%u; no service\n",e,platform.last_stage?platform.last_stage:0);goto done;}
     uint32_t identity=0, gpu_status=0;
     e=lmp_gpu_read32(&platform,LMP_GPU_ID,&identity);
     if(!e)e=lmp_gpu_read32(&platform,LMP_GPU_STATUS,&gpu_status);

@@ -797,9 +797,16 @@ lmp_reset_release(struct lmp_state *state)
         state->initial_reset_released = true;
         return LMP_OK;
     }
-    /* An inherited powered domain with reset asserted is not ours to mutate. */
-    if (state->initial_domain_on[0])
-        return lmp_failed(state, LMP_EBUSY);
+    /* The boot chain can leave MFG powered with reset asserted (seen after a
+     * warm reboot). In full mode the board contract and the WACS2 handoff have
+     * already proved that the AP owns the GPU and the boot firmware is done
+     * with it, so the domain is taken over with the same documented reset
+     * release used for a domain this driver powered itself. The GPU core is
+     * soft-reset again before the first job, so no boot-time state survives.
+     * When the domain was not inherited powered-on the normal path below has
+     * always released reset the same way. The caller reports the inherited
+     * domain bits; this file stays free of printf so the loader build can
+     * include it. */
     error = lmp_update_pwr_con(state, LMP_SPM_MFG_PWR_CON,
                                LMP_PWR_RST_B, 0);
     if (error)
@@ -843,28 +850,36 @@ lmp_start(struct lmp_state *state)
 {
     int error;
 
+    if (state)
+        state->last_stage = 1;
     error = lmp_require_full(state);
     if (error)
         return error;
     if (!state->prepared) {
+        state->last_stage = 2;
         error = lmp_prepare(state);
         if (error)
             return error;
     }
     if (!state->status.domain_on) {
+        state->last_stage = 3;
         error = lmp_power_on(state);
         if (error)
             return error;
     }
+    state->last_stage = 4;
     error = lmp_clock_on(state);
     if (error)
         return error;
+    state->last_stage = 5;
     error = lmp_reset_release(state);
     if (error)
         return error;
+    state->last_stage = 6;
     error = lmp_bus_unprotect(state);
     if (error)
         return error;
+    state->last_stage = 0;
     state->started = true;
     state->gpu_ready = true;
     state->teardown_safe = true;

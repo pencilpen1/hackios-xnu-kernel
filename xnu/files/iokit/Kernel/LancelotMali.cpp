@@ -245,6 +245,8 @@ class LancelotMali : public IOService
 	OSDeclareDefaultStructors(LancelotMali);
 public:
 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn newUserClient(task_t owningTask, void *security_id, UInt32 type,
+	    OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
 };
 
 OSDefineMetaClassAndStructors(LancelotMali, IOService);
@@ -332,7 +334,44 @@ LancelotMali::start(IOService *provider)
 	setProperty(kIOUserClientClassKey, "LancelotMaliUserClient");
 	setName(LMAL_SERVICE_NAME);
 	registerService();
+	printf("LancelotMali: service published name=%s\n", LMAL_SERVICE_NAME);
 	return true;
+}
+
+IOReturn
+LancelotMali::newUserClient(task_t owningTask, void *security_id, UInt32 type,
+    OSDictionary *properties, IOUserClient **handler)
+{
+	LancelotMaliUserClient *client;
+
+	if (handler == NULL) {
+		return kIOReturnBadArgument;
+	}
+	*handler = NULL;
+	client = new LancelotMaliUserClient;
+	if (client == NULL) {
+		printf("LancelotMali: user client allocation failed\n");
+		return kIOReturnNoMemory;
+	}
+	if (!client->initWithTask(owningTask, security_id, type, properties)) {
+		printf("LancelotMali: user client refused type=%#x\n", type);
+		client->release();
+		return kIOReturnNotPermitted;
+	}
+	if (!client->attach(this)) {
+		printf("LancelotMali: user client attach failed\n");
+		client->release();
+		return kIOReturnError;
+	}
+	if (!client->start(this)) {
+		printf("LancelotMali: user client start failed\n");
+		client->detach(this);
+		client->release();
+		return kIOReturnNotPermitted;
+	}
+	printf("LancelotMali: user client opened type=%#x\n", type);
+	*handler = client;
+	return kIOReturnSuccess;
 }
 
 extern "C" void
@@ -382,7 +421,12 @@ LancelotMaliUserClient::initWithTask(task_t owningTask, void *securityID, UInt32
 	fClosing = false;
 	fCloseResult = kIOReturnSuccess;
 	fVMQuarantined = false;
-	if (type != LMAL_OPEN_TYPE || !lmal_authorized_task(owningTask)) {
+	if (type != LMAL_OPEN_TYPE) {
+		printf("LancelotMali: open type %#x refused (want %#x)\n", type, LMAL_OPEN_TYPE);
+		return false;
+	}
+	if (!lmal_authorized_task(owningTask)) {
+		printf("LancelotMali: task not authorized for the GPU service\n");
 		return false;
 	}
 	fTask = owningTask;
@@ -395,6 +439,8 @@ LancelotMaliUserClient::start(IOService *provider)
 {
 	if (!fAuthorized || provider == NULL || !lm_gpu_ready() ||
 	    !IOUserClient::start(provider)) {
+		printf("LancelotMali: client start refused auth=%d provider=%d ready=%d\n",
+		    fAuthorized ? 1 : 0, provider != NULL ? 1 : 0, lm_gpu_ready() ? 1 : 0);
 		return false;
 	}
 	fLock = IOLockAlloc();

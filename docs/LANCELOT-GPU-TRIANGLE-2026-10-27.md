@@ -393,3 +393,48 @@ fault-extra=0/0 gpu-fault-status=0
   （`243bd783…`）做基线；证据在
   `local/lancelot-gpu-20261026/private-dma/attempt23/loader-compare/`。
 - `gpu_complete=false`、`rendering_verified=false`、`desktop_verified=false`。
+
+## 12. attempt24（2026-10-28）：独立 tiler 探针
+
+- 设计：TILER job 改为独立链（index 1、dependency 0、JS1 head 指向 tiler），
+  vertex job 打包但不入链；CPU 直接填 POS_BUF/PSIZ（与着色器输出同样的全屏三角形）。
+- 结果：两次 submit 完成（`sequence=2`、`job-status=0`、`mmu=0`）；fragment 仍只写
+  1 像素 (0,0)；`heap+0x8000` 的 4 个非零字与 attempt23 **完全相同**：
+  `+0:0x84`、`+4:0x80`、`+0x80:0x9c080006`、`+0x84:0x0400bf7f`。
+- 含义：tiler 不依赖 vertex job 的执行；但两次 POS_BUF 内容相同，因此还不能
+  断定 tiler 忽略 position。下一个单变量是几何：in-bounds 三角形
+  `(-0.5,-0.5),(0.5,-0.5),(0,0.5)`，loader `8a119dad…` 已构建待部署。
+- 证据：`local/lancelot-gpu-20261026/private-dma/attempt24/`（`NOTES.md`、
+  `tilerprobe-runtime.log`、`make_*.py`、`loader-*.efi`）。
+
+## 13. attempt24 第二轮：根因——tiler 读屏幕空间坐标
+
+- in-bounds 三角形 `(-0.5,-0.5),(0.5,-0.5),(0,0.5)` 实测 `match=0`（零像素），
+  heap 4 个非零字不变（`8a119dad…`，日志 `centered-runtime.log` `a144f41d…`）。
+- 根因：Mesa Bifrost 编译器对 Mali 全系在**顶点着色器内**执行
+  `nir_lower_viewport_transform`，把 `gl_Position` 变成**屏幕空间（像素）坐标**；
+  tiler 直接用 position.xy 作为像素坐标。我们的 `tri.bin` 从 I/O-lowered NIR
+  （`@store_output`）编译，该 pass 只匹配 `store_deref`，所以变换没有进 shader
+  （反汇编无 FMUL/FADD/uniform load），position 仍是裁剪空间值。
+  于是全屏三角形在像素空间只剩 (0,0) 一个像素，in-bounds 三角形退化为 0 像素，
+  viewport 64→32 也因此毫无影响。
+- 验证：`loader-screen.efi` `fbf5ed14…`，顶点输入改为屏幕空间
+  `(0,0),(128,0),(0,128)`，应覆盖全部 4096 像素（待实机）。
+- 长期修复：用未 I/O lower 的 NIR，在 I/O lower 之前运行 viewport 变换，
+  并通过 push uniform/UBO 提供 viewport scale/offset；或直接使用 Mesa 用户态
+  编译产物。
+
+## 14. attempt24 生产 loader 实机 PASS（2026-10-28）
+
+- loader `c61cc59f…`（生产源码，屏幕空间顶点）实机结果：
+  `error=0 sequence=2 job-status=0 mmu=0 value=ff3366cc guards=1 bad-offset=0
+  bad-stage=0`；UEFI/XNU receipt 一致 `crc=0xb868599b`；XNU 只读恢复、
+  SPM all-off、SpringBoard 运行。
+- 诊断 loader `fbf5ed14…` 的 `tri-cover match=0x1000`（4096/4096 像素）证明
+  全屏覆盖；tiler heap 随几何变化，说明位置读取/binning 正常。
+- 生产源码提交 `a515822`：顶点改为屏幕空间 `(0,0),(128,0),(0,128)`，
+  校验器按窗口空间检查 position；host tests 全 PASS。
+- 证据：`local/lancelot-gpu-20261026/private-dma/attempt24/`
+  （`pass-runtime.log` `3a0fa0a9…`、`loader-pass.efi`、`NOTES.md`）。
+- 仍未证明：viewport 变换（由用户态 shader 完成）、纹理/深度/IOSurface/
+  CoreAnimation/Metal、XNU GPU 服务；`gpu_complete=false` 不变。
