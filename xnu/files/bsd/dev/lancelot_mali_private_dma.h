@@ -41,7 +41,15 @@
  * writable descriptor data; page B holds the shader binaries and is mapped
  * WRITE|EXEC. The output is the same 64x64 RGBA8 surface used by the clear
  * tests. The fragment shader writes (0.8, 0.4, 0.2, 1.0), which converts to
- * 0xff3366cc - exactly the clear colour, so every output word must match. */
+ * 0xff3366cc - exactly the clear colour, so every output word must match.
+ *
+ * Position convention: on Mali, vertex shaders output gl_Position already
+ * transformed to window (pixel) space - Mesa lowers this with
+ * nir_lower_viewport_transform inside the vertex shader - and the tiler
+ * consumes those pixel coordinates directly. This loader test therefore
+ * supplies screen-space vertices; the viewport descriptor only provides the
+ * scissor and z range. Real userland shaders apply the transform themselves
+ * from the viewport push uniforms. */
 #define LM_TRI_WIDTH 64u
 #define LM_TRI_HEIGHT 64u
 #define LM_TRI_BPP 4u
@@ -368,9 +376,11 @@ static inline void lm_v7_tri_prepare(uint32_t *a,uint8_t *b,uint64_t a_va,
     lm_v7_tri_attr_buffer(a+LM_TRI_VARY_BUF/4+8,a_va+LM_TRI_PSIZ_BUF,2,6);
     lm_v7_tri_fbd(a+LM_TRI_FBD/4,ctx);
     lm_v7_tri_rt(a+LM_TRI_RT/4,output);
-    /* Full-screen clip-space triangle. */
-    int32_t verts[6]={0xbf800000,0xbf800000,0x40400000,0xbf800000,
-        0xbf800000,0x40400000};
+    /* Full-surface screen-space triangle for the 64x64 target: the interior
+     * x+y<=128 covers every pixel centre (max 126). Mali tiler positions are
+     * in window space; the vertex shader passes them through unchanged. */
+    int32_t verts[6]={0x00000000,0x00000000,0x43000000,0x00000000,
+        0x00000000,0x43000000};
     memcpy(a+LM_TRI_VERTEX_DATA/4,verts,sizeof(verts));
     /* Guards after the used descriptor area and after the shader binaries. */
     for(unsigned i=LM_TRI_A_GUARD/4;i<LM_PAGE_SIZE/4u;i++)
@@ -390,8 +400,10 @@ static inline bool lm_v7_tri_validate(const struct lm_page *output,unsigned n,
                 *stage=0;*bad_word=p*LM_PAGE_SIZE+i*4u;*actual=v;return false;
             }
         }
-    static const uint32_t want_pos[12]={0xbf800000,0xbf800000,0,0x3f800000,
-        0x40400000,0xbf800000,0,0x3f800000,0xbf800000,0x40400000,0,0x3f800000};
+    /* The vertex shader writes gl_Position in window space (see above), so the
+     * position buffer must hold the screen-space triangle and w=1. */
+    static const uint32_t want_pos[12]={0x00000000,0x00000000,0,0x3f800000,
+        0x43000000,0x00000000,0,0x3f800000,0x00000000,0x43000000,0,0x3f800000};
     for(unsigned i=0;i<12;i++) {
         uint32_t v=a[LM_TRI_POS_BUF/4+i];
         if(v!=want_pos[i]) {

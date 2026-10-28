@@ -93,8 +93,9 @@ static void fake_triangle(struct fake*f,uint64_t jc) {
         assert(abuf[2]==8u&&abuf[3]==LM_PAGE_SIZE-LM_TRI_VERTEX_DATA);
         assert(abuf[4]==1u&&abuf[5]==0u&&abuf[6]==0u&&abuf[7]==0u);
         uint32_t *vin=gpu_address(f,tri_abuf_ptr(abuf));assert(vin);
-        static const uint32_t want_in[6]={0xbf800000u,0xbf800000u,0x40400000u,
-            0xbf800000u,0xbf800000u,0x40400000u};
+        /* Screen-space triangle (0,0),(128,0),(0,128); see LM topology note. */
+        static const uint32_t want_in[6]={0x00000000u,0x00000000u,0x43000000u,
+            0x00000000u,0x00000000u,0x43000000u};
         for(unsigned i=0;i<6;i++)assert(vin[i]==want_in[i]);
         uint32_t *vary=gpu_address(f,jq(vd,22));assert(vary);
         assert((vary[0]&0x1ffu)==1u&&((vary[0]>>10)&0x3fffffu)==(94u<<12));
@@ -137,9 +138,9 @@ static void fake_triangle(struct fake*f,uint64_t jc) {
         assert(vp[2]==0x42800000u&&vp[7]==0x003f003fu);
         assert(jq(td,4)==LM_PRIVATE_JOB_VA+LM_TRI_POS_BUF);
         uint32_t *pos=gpu_address(f,jq(td,4));assert(pos);
-        static const uint32_t want_pos[12]={0xbf800000u,0xbf800000u,0u,0x3f800000u,
-            0x40400000u,0xbf800000u,0u,0x3f800000u,
-            0xbf800000u,0x40400000u,0u,0x3f800000u};
+        static const uint32_t want_pos[12]={0x00000000u,0x00000000u,0u,0x3f800000u,
+            0x43000000u,0x00000000u,0u,0x3f800000u,
+            0x00000000u,0x43000000u,0u,0x3f800000u};
         for(unsigned i=0;i<12;i++)pos[i]=want_pos[i];
         uint16_t *psiz=gpu_address(f,jq(tj,16));assert(psiz);
         for(unsigned i=0;i<3;i++)psiz[i]=0x3c00u;
