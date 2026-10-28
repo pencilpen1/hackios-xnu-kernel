@@ -1,0 +1,7 @@
+
+# AIR -> NIR -> Panfrost/Bifrost; targets belong to Panfrost, not freedreno.
+lancelot_air_deps = [dep_m, idep_air, idep_mesautil, driver_softpipe, driver_panfrost, dep_libdrm]
+lancelot_air_includes = [inc_include, inc_src, inc_mapi, inc_mesa, inc_gallium, inc_gallium_aux, inc_gallium_winsys_sw, inc_gallium_winsys, include_directories('..')]
+air_run = executable('air_run', files('../../../compiler/air/air_run.c'), include_directories : lancelot_air_includes, dependencies : lancelot_air_deps, link_with : [libgallium, libgalliumvl_stub, libws_null, libpanfrostwinsys], build_by_default : false, install : false)
+libredwoodair = shared_library('redwoodair', files('../../../compiler/air/air_metal.c'), include_directories : lancelot_air_includes, dependencies : lancelot_air_deps, link_with : [libgallium, libgalliumvl_stub, libws_null, libpanfrostwinsys], build_by_default : false, install : false)
+air_metal_test = executable('air_metal_test', files('../../../compiler/air/air_metal_test.c'), include_directories : include_directories('../../../compiler/air'), link_with : libredwoodair, build_by_default : false, install : false)

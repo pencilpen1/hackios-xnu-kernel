@@ -1,0 +1,10 @@
+Subject: Panfrost screen queries DRI options; link xmlconfig implementation
+
+--- a/src/gallium/drivers/panfrost/meson.build
++++ b/src/gallium/drivers/panfrost/meson.build
+@@ -71,4 +71,5 @@ libpanfrost = static_library(
+     dep_libdrm,
+     idep_mesautil,
++    idep_xmlconfig,
+     idep_nir,
+     idep_pan_packers
