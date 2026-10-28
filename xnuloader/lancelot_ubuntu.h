@@ -98,7 +98,7 @@ lancelot_ubuntu_bootstrap(void)
 	} files[] = {
 		{"ramdisk", "/hackios/20H392/touch-hardware-20261024/root.apfs",
 		 {{4194304u, "81a86d265596387f227c7b8a3e021f991293c2900b69a89a38b0f29be6436763"},
-		  {5976064u, "501f6a4e0efadec2108d91c5f970379ba1a2317d1e97d3cbf114291e4b4e742f"}}},
+		  {6119424u, "845f9cd590a7d5b96ee397913893c4e873f8277c0387fd844668b1b69531d298"}}},
 		{"bootdisk", "/hackios/20H392/flashboot.apfs",
 		 {{4194304u, "14485e7c5ce125ef516168445c2500ac04ca5e40a908c2aef516b2d92c24ba0c"},
 		  {0u, 0}}},

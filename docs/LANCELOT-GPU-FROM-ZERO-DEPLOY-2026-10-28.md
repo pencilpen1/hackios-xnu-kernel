@@ -96,3 +96,61 @@ python tools/read-lancelot-log.py --runtime --quiet \
    （见 `docs/LANCELOT-GPU-MESA-BUILD-2026-10-27.md` 的产物哈希）；
 3. 运行 OSMesa 最小闭环：`OSMesaCreateContextExt` → `panfrost_drm_screen_create`
    → BO 创建/映射 → clear/triangle submit → 读回像素。
+
+## 7. 用户态 GPU（2026-10-28 实机打通）
+
+这一节记录把 GPU 交给 iOS 用户态进程的已验证做法；本轮已用 `gl_test`
+（OSMesa + panfrost）在真机上跑通，桌面合成（CoreAnimation）仍是下一步。
+
+### 7.1 构建 lancelot Mesa（panfrost + LMAL shim）
+
+```bash
+cd tools/mesa-lancelot
+REFERENCE=/home/pencilqwq/hackios-lancelot JOBS=8 ./mk-mesa-lancelot.sh
+# 产物：local/mesa-lancelot-build/out/libOSMesa.8.dylib
+# install name /redwood/lib/libOSMesa.8.dylib；overlay/shim 源码就在本目录
+llvm-strip -x libOSMesa.8.dylib   # 15.9 MB -> 14.8 MB，装进 4 MiB 级别的 root.apfs 需要
+```
+
+overlay（`tools/mesa-lancelot/apply-lancelot.py`）必须包含 **OSMesa ES profile** 两处修改
+（等价于用户态仓库的 `tools/mesa/osmesa-es-profile.patch`）：接受
+`OSMESA_ES_PROFILE(0x38)` 并把 profile 映射为 `API_OPENGLES2`。缺了它，
+`OSMesaCreateContextAttribs` 返回 NULL，gl_test 会打印
+`no OpenGL ES context`。
+
+### 7.2 造 GPU 用户态 root.apfs
+
+在已解包的 root 目录（原 profile 的 root.apfs 可用 `apfs-tool census/cat` 还原）里：
+
+- 放 `lib/libOSMesa.8.dylib`（上一步的 strip 产物）；
+- 编译并放 `bin/gl_test`：
+  `xnu-clang -arch arm64 -isysroot <iPhoneOS16.5.sdk> -O1 -framework CoreFoundation -framework IOKit \
+   <libOSMesa.8.dylib> -o gl_test <userland>/src/gl_test.c`
+- 在 `etc/rc` 的 `exec /sbin/launchd.ios` 之前加 `/redwood/bin/gl_test fill 64 64 &`；
+- 用 `tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=<rootdir>` 重新打包。
+
+### 7.3 部署
+
+- 把 root.apfs 写入 `/hackios/20H392/touch-hardware-20261024/`，更新该目录
+  `SHA256SUMS`（root.apfs 与 profile.json 两行）；先完整备份原 profile。
+- loader 的 ramdisk 表（`xnuloader/lancelot_ubuntu.h`）按 **size + SHA-256**
+  接受多个变体：原始 4 MiB (`81a86d26…`) 或 GPU 镜像（当前 `501f6a4e…`，
+  5,976,064 B）。换镜像后如果大小变化，需要同步该表并重建 loader。
+- 启动参数至少 `lancelot_mali=4`；`lancelot_gpu_*` loader 探针可保留也可去掉。
+
+### 7.4 判据
+
+```text
+LancelotMali: service published name=LancelotMali
+LancelotMali: user client opened type=0x4c4d0001
+LMAL: service opened
+LMAL: panfrost device fd=3
+gl_test: Mesa; Mali-G52 r1 (Panfrost); OpenGL ES 3.1 Mesa 25.0.7
+gl_test: fill: ... error 0
+```
+
+### 7.5 仍未完成
+
+- CoreAnimation/backboardd 使用该 GL（需要 `GL=1` 的 libredwood-gl/inject 镜像，
+  且 `userland/build.sh` 的编译分支要求 `ios165/rootfs` 已解包）；
+- IOSurface/CoreAnimation/Metal 全链路、桌面合成与长期稳定性。
