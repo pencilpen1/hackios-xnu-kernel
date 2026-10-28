@@ -21,9 +21,31 @@ bash xnuloader/build.sh lancelot
 cp xnuloader/loader-lancelot.efi "$OUT/loader.efi"
 case "$MODE" in
   boot)
+    # GPU bring-up flags. A from-source build must reproduce the same command
+    # line the packaged candidates use, otherwise the loader probes and the XNU
+    # Mali driver never run. Defaults are the read-only split: loader power,
+    # feature and private-DMA probes plus the shader triangle, and
+    # lancelot_mali=1 (XNU observation only, no WACS2 owner, no service).
+    #   LANCELOT_MALI_MODE=3|4  XNU full GPU bring-up / publish LancelotMali
+    #   LANCELOT_GPU_TRIANGLE=0 disable the loader triangle
+    #   LANCELOT_GPU_ARGS="..." replace the whole loader GPU flag set
+    MALI_MODE=${LANCELOT_MALI_MODE:-1}
+    case "$MALI_MODE" in
+      1|3|4) ;;
+      *) echo "LANCELOT_MALI_MODE must be 1, 3 or 4" >&2; exit 1 ;;
+    esac
+    TRIANGLE=${LANCELOT_GPU_TRIANGLE:-1}
+    case "$TRIANGLE" in
+      0) TRI_ARG= ;;
+      1) TRI_ARG=lancelot_gpu_triangle=1 ;;
+      *) echo "LANCELOT_GPU_TRIANGLE must be 0 or 1" >&2; exit 1 ;;
+    esac
+    GPU_ARGS=${LANCELOT_GPU_ARGS:-lancelot_gpu_power=1 lancelot_gpu_features=1 lancelot_gpu_dma=1 $TRI_ARG}
+    BOOT_CMDLINE="cpus=8 small_cores=0 small_cores_after=0 touchscreen=0 buttons=0 touch_exit=0 lancelot_touch=3 gpu=0 wifi=0 adsp=0 root_apfs=lancelot_ios sbstartup=observe sbactivation=local $GPU_ARGS lancelot_mali=$MALI_MODE"
+    BOOT_CMDLINE=$(printf '%s\n' "$BOOT_CMDLINE" | tr -s ' ')
     # Continue through all checkpoints. Panic/exception return remains available.
     python3 xnuloader/mkpayload.py -o "$OUT/boot.xnup" "kernel=$KERNEL" \
-      --ubuntu-boot --cmdline 'cpus=8 small_cores=0 small_cores_after=0 touchscreen=0 buttons=0 touch_exit=0 lancelot_touch=3 gpu=0 wifi=0 adsp=0 root_apfs=lancelot_ios sbstartup=observe sbactivation=local'
+      --ubuntu-boot --cmdline "$BOOT_CMDLINE"
     # Runtime USB capture precedes console rendering; -v needlessly keeps the
     # framebuffer text console active and scrolling over iOS's first frames.
     python3 tools/test-lancelot-payload.py "$OUT/boot.xnup" --expect-boot --expect-ubuntu --expect-graphics --expect-cpus 8
