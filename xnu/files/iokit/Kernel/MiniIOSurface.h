@@ -98,6 +98,7 @@ struct minisurf_aux {
 
 #define MINISURF_AUX_OFFSET     0x400           /* of the aux structure inside the shared page */
 
+class LancelotMaliCpuLease;
 class MiniIOSurface : public OSObject
 {
 	OSDeclareDefaultStructors(MiniIOSurface);
@@ -106,6 +107,9 @@ public:
 	uint32_t                        sid;
 	uint32_t                        holders;        /* clients, send rights, kernel users */
 	IOBufferMemoryDescriptor *      memory;         /* one page of shared state, then the pixels */
+	LancelotMaliCpuLease *           maliCpuLease;   /* owned root alias/final-fence gate, not user state */
+	OSObject *                      maliQueueFence; /* RedwoodMali's retained actual completion */
+	uint32_t                        maliQueueReaders; /* presenter reads exclude a new queued writer */
 	uint8_t *                       kbase;          /* the same, in the kernel */
 	/*
 	 * ... unless the surface was made around memory its maker has already (IOSurfaceAddress):
@@ -117,6 +121,7 @@ public:
 	task_t                          clientTask;     /* whose memory it is (not held: only compared) */
 	mach_vm_address_t               clientAddress;  /* ... and where it is there */
 	uint8_t *                       kpixels;        /* where the pixel memory starts in the kernel, either way */
+	uint64_t                        maliSeq; /* imported MT6768 real completion sequence */
 	uint32_t                        drawn;          /* the GPU's last submission that names the pixels (0: none; RedwoodGPU.cpp) */
 	struct minisurf_result          info;           /* addresses not filled in */
 	struct minisurf_plane           planes[MINISURF_MAX_PLANES];
@@ -165,6 +170,31 @@ void            MiniIOSurfaceCost(uint32_t * made, uint64_t * making, uint32_t *
 void            MiniIOSurfaceClearKept(void);
 /* Wait, for so many milliseconds at most, until the GPU is done with a surface's pixels (RedwoodGPU.cpp). */
 bool            MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds);
+extern "C" int lancelot_hakios_backend(void);
+bool            MiniIOSurfaceMaliDrawn(MiniIOSurface * surface, uint64_t milliseconds);
+bool            MiniIOSurfaceMaliReadBegin(MiniIOSurface * surface, uint64_t milliseconds);
+void            MiniIOSurfaceMaliReadEnd(MiniIOSurface * surface);
+extern "C" bool LancelotMaliQueueSurfaceReadBegin(MiniIOSurface *, uint64_t);
+extern "C" void LancelotMaliQueueSurfaceReadEnd(MiniIOSurface *);
+/* A swap owns its surfaces until show() returns. Keep the queue reader gate
+ * for that whole interval, including every early return. */
+class LancelotMaliQueueReadGroup {
+    MiniIOSurface *fHeld[16] = {};
+    uint32_t fCount = 0;
+public:
+    bool add(MiniIOSurface *surface, uint64_t ns) {
+        if (!surface) return true;
+        for (uint32_t i=0;i<fCount;i++) if (fHeld[i]==surface) return true;
+        if (fCount==16 || !LancelotMaliQueueSurfaceReadBegin(surface,ns)) return false;
+        fHeld[fCount++]=surface;return true;
+    }
+    ~LancelotMaliQueueReadGroup() {
+        while(fCount)LancelotMaliQueueSurfaceReadEnd(fHeld[--fCount]);
+    }
+    LancelotMaliQueueReadGroup() = default;
+    LancelotMaliQueueReadGroup(const LancelotMaliQueueReadGroup &) = delete;
+    LancelotMaliQueueReadGroup &operator=(const LancelotMaliQueueReadGroup &) = delete;
+};
 MiniIOSurface * MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat);
 void            MiniIOSurfaceDrop(MiniIOSurface * surface);
 /* A Mach send right for the surface in the task (what IOSurfaceCreateMachPort gives); 0 on failure. */

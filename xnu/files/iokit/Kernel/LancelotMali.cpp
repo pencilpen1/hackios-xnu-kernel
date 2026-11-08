@@ -27,11 +27,68 @@
 #include "lancelot_mali_uapi.h"
 #include "lancelot_mali_client_logic.h"
 #include "LancelotMaliExport.h"
+#include "LancelotMaliCpuLease.h"
+#include "../../bsd/dev/lancelot_mali_queue.h"
+static bool lmal_prepare_queued_client();
+static IOUserClient *lmal_create_queued_client();
+static bool lmal_prepare_hakios_client();
+static IOUserClient *lmal_create_hakios_client();
+
+/* Bounded metadata-only lease diagnostics: no pixels, no pointers, no behavior.
+ * Each missing lease is counted; the first 48 and then every 256th are printed. */
+static uint64_t gLmalLeaseCreated, gLmalLeaseMissing, gLmalImported, gLmalImportMissing;
+static uint64_t gLmalLeaseSingle, gLmalLeaseSingleMissing;
+static bool
+lmal_lease_diag_sample(uint64_t n)
+{
+	return n <= 48 || (n % 256) == 0;
+}
+static void
+lmal_lease_diag_create(uint32_t handle, uint64_t size, uint32_t flags, bool lease,
+    const struct lmal_cpu_lease_why *why)
+{
+	uint64_t created = __atomic_add_fetch(&gLmalLeaseCreated, 1, __ATOMIC_RELAXED);
+	bool single = size <= PAGE_SIZE;
+	if (single) __atomic_add_fetch(&gLmalLeaseSingle, 1, __ATOMIC_RELAXED);
+	uint64_t missing = lease ? __atomic_load_n(&gLmalLeaseMissing, __ATOMIC_RELAXED) :
+	    __atomic_add_fetch(&gLmalLeaseMissing, 1, __ATOMIC_RELAXED);
+	if (!lease && single) __atomic_add_fetch(&gLmalLeaseSingleMissing, 1, __ATOMIC_RELAXED);
+	if ((created % 32) == 0) {
+		printf("lancelot-lease-count: created=%llu missing=%llu single=%llu single_missing=%llu imported=%llu import_missing=%llu\n",
+		    (unsigned long long)created, (unsigned long long)missing,
+		    (unsigned long long)__atomic_load_n(&gLmalLeaseSingle, __ATOMIC_RELAXED),
+		    (unsigned long long)__atomic_load_n(&gLmalLeaseSingleMissing, __ATOMIC_RELAXED),
+		    (unsigned long long)__atomic_load_n(&gLmalImported, __ATOMIC_RELAXED),
+		    (unsigned long long)__atomic_load_n(&gLmalImportMissing, __ATOMIC_RELAXED));
+	}
+	if (lease || !lmal_lease_diag_sample(missing)) return;
+	printf("lancelot-lease-missing: site=bo_create pid=%d handle=%u size=%llu flags=%#x step=%u detail=%#x value=%llu pages=%u stage=%u first=%u bits=%u mismatch=%u final_first=%u final_bits=%u final_mismatch=%u created=%llu missing=%llu\n",
+	    proc_selfpid(), handle, (unsigned long long)size, flags, why->step, why->detail,
+	    (unsigned long long)why->value, why->pages, why->stage, why->first, why->bits, why->mismatch,
+	    why->final_first, why->final_bits, why->final_mismatch,
+	    (unsigned long long)created, (unsigned long long)missing);
+}
+static void
+lmal_lease_diag_import(uint32_t handle, uint32_t surface_id, uint64_t size, bool lease)
+{
+	uint64_t imported = __atomic_add_fetch(&gLmalImported, 1, __ATOMIC_RELAXED);
+	if (lease) return;
+	uint64_t missing = __atomic_add_fetch(&gLmalImportMissing, 1, __ATOMIC_RELAXED);
+	if (!lmal_lease_diag_sample(missing)) return;
+	printf("lancelot-lease-missing: site=surface_import pid=%d handle=%u surface=%u size=%llu imported=%llu import_missing=%llu\n",
+	    proc_selfpid(), handle, surface_id, (unsigned long long)size,
+	    (unsigned long long)imported, (unsigned long long)missing);
+}
 
 extern "C" {
 /* A wrapper-owned bootarg/platform state machine prepares the core first. */
 void lancelot_mali_init(void);
 void LancelotMaliPublish(void);
+/* Parent-owned facade: one globalmali_lock lease across the two exact calls.
+ * This declaration does not publish an async selector/capability. */
+int lm_gpu_submit_pair(struct lm_vm *, uint64_t, uint64_t, uint64_t,
+    struct lm_job_result results[2], const struct lm_range *, uint32_t,
+    const struct lm_range *, uint32_t, int32_t, uint64_t);
 }
 
 #define LMAL_MAX_BOS             ((uint32_t)LMAL_MAX_SUBMIT_BOS)
@@ -49,6 +106,9 @@ static bool gLancelotModeRead;
 static char gLancelotClientName[64];
 static uint32_t gLancelotClientPid;
 static bool gLancelotClientIdentity;
+/* Panfrost's non-coherent default is CPU write-combine. WB is a comparison
+ * mode with the existing submit-time CPU maintenance, not hardware coherency. */
+static uint32_t gLancelotBOCached;
 
 static void
 lmal_read_bootargs(void)
@@ -59,14 +119,25 @@ lmal_read_bootargs(void)
 	gLancelotModeRead = true;
 	gLancelotMode = 0;
 	(void)PE_parse_boot_argn("lancelot_mali", &gLancelotMode, sizeof(gLancelotMode));
+	(void)PE_parse_boot_argn("lancelot_bocache", &gLancelotBOCached, sizeof(gLancelotBOCached));
+	if (gLancelotBOCached > 1) {
+		printf("LancelotMali: invalid bocache=%u (0=writecombine 1=writeback)\n", gLancelotBOCached);
+	}
 	bzero(gLancelotClientName, sizeof(gLancelotClientName));
 	gLancelotClientPid = 0;
 	bool has_name = PE_parse_boot_argn("lancelot_mali_client", gLancelotClientName,
 	    sizeof(gLancelotClientName));
 	bool has_pid = PE_parse_boot_argn("lancelot_mali_client_pid", &gLancelotClientPid,
 	    sizeof(gLancelotClientPid));
-	/* A non-root client is admitted only when both exact identity components are configured. */
-	gLancelotClientIdentity = has_name && has_pid && gLancelotClientName[0] != '\0' && gLancelotClientPid != 0;
+	/* A non-root client is admitted by the process name configured in the boot argument, and
+	 * by its pid as well when one is configured. A pid is optional for a client whose pid
+	 * launchd assigns at boot -- the window server is the one this service is for -- and
+	 * requiring one there would make the identity a different process every boot. */
+	if (!has_pid) {
+		gLancelotClientPid = 0;
+	}
+	gLancelotClientIdentity = has_name && gLancelotClientName[0] != '\0' &&
+	    (!has_pid || gLancelotClientPid != 0);
 }
 
 static bool
@@ -74,7 +145,7 @@ lmal_render_enabled(void)
 {
 	lmal_read_bootargs();
 	/* Modes 1..3 are platform bring-up/self-test only. */
-	return gLancelotMode == 4;
+	return gLancelotMode == 4 && gLancelotBOCached <= 1;
 }
 
 static bool
@@ -92,14 +163,19 @@ lmal_authorized_task(task_t task)
 	if (cred != NULL && kauth_cred_getuid(cred) == 0) {
 		return true;
 	}
-	/* The non-root path is an exact configured (pid, process-name) pair. */
-	if (!gLancelotClientIdentity || (uint32_t)proc_pid(p) != gLancelotClientPid) {
+	/* The non-root path is the configured process name, and the pid too when one was given. */
+	if (!gLancelotClientIdentity ||
+	    (gLancelotClientPid != 0 && (uint32_t)proc_pid(p) != gLancelotClientPid)) {
 		return false;
 	}
 	char name[sizeof(gLancelotClientName)];
 	bzero(name, sizeof(name));
 	proc_name(proc_pid(p), name, sizeof(name));
-	return strncmp(name, gLancelotClientName, sizeof(name)) == 0;
+	if (strncmp(name, gLancelotClientName, sizeof(name)) != 0) {
+		return false;
+	}
+	printf("LancelotMali: non-root client %s pid=%d admitted by the boot argument\n", name, proc_pid(p));
+	return true;
 }
 
 static uint64_t
@@ -138,6 +214,85 @@ lmal_result_from_ioreturn(IOReturn ret)
 		return LMAL_EPERM;
 	}
 	return LMAL_EINVAL;
+}
+
+/* Prepared worker/facade boundary. NOT wired to a user selector: current CPU
+ * exports/IOSurface aliases do not yet supply the required queue lease. All
+ * ranges are materialized before enqueue; no allocation/copyin/task lookup
+ * occurs in this dispatch. Actual owner identity is retained in the payload. */
+static inline int
+lmal_pair_execute_facade(const struct lmal_pair_payload *p,
+    const struct lm_range *vt_ranges, const struct lm_range *fs_ranges,
+    uint64_t remaining_ns, struct lmal_pair_execution *execution)
+{
+    static_assert(sizeof(struct lm_range) == LMAL_PAIR_CORE_RANGE_BYTES,
+        "pair metadata range budget/layout");
+    static_assert(sizeof(struct lmal_pair_range_snapshot) == sizeof(struct lm_range) &&
+        offsetof(struct lmal_pair_range_snapshot, va) == offsetof(struct lm_range, va) &&
+        offsetof(struct lmal_pair_range_snapshot, pages) == offsetof(struct lm_range, pages) &&
+        offsetof(struct lmal_pair_range_snapshot, flags) == offsetof(struct lm_range, flags),
+        "pair/core exact range fields");
+    if (!p || !execution || !vt_ranges || !fs_ranges || !p->pins_applied ||
+        !p->authorized || !p->kernel_arrays_owned || !p->objects_retained ||
+        !p->pair_token || !p->identity || p->identity->source_task != p->source_task ||
+        p->identity->source_pid != p->source_pid || p->source_pid <= 0 ||
+        p->identity->client != p->client || p->identity->vm != p->vm ||
+        !remaining_ns || remaining_ns > LMAL_MAX_WAIT_NS) return LMAL_EINVAL;
+    if (vt_ranges != p->stage[0].ranges || fs_ranges != p->stage[1].ranges)
+        return LMAL_EINVAL;
+    for (uint32_t stage = 0; stage < 2; ++stage) {
+        const struct lm_range *ranges = stage ? fs_ranges : vt_ranges;
+        const struct lmal_pair_stage_snapshot *s = &p->stage[stage];
+        if (!s->bo_count || s->bo_count > LMAL_MAX_SUBMIT_BOS || !s->bos ||
+            s->requirements != stage || !s->jc ||
+            (s->jc & 63u)) return LMAL_EINVAL;
+        if (s->bo_count > LMAL_PAIR_STAGE_BO_LIMIT) return LMAL_ENOTSUP;
+        for (uint32_t i = 0; i < s->bo_count; ++i) {
+            const struct lmal_pair_bo_snapshot *b = &s->bos[i];
+            /* Keep GPU-only optimization out of this initial queue adapter.
+             * RO is still explicit; all CPU/alias leases must be real. */
+            if (!b->lease_retained || !b->cpu_aliases_excluded ||
+                !b->external_aliases_excluded || ranges[i].va != b->va ||
+                ranges[i].pages != b->bytes / LMAL_PAGE_SIZE ||
+                ranges[i].flags != (b->readonly ? LM_RANGE_READONLY : 0))
+                return LMAL_ENOTSUP;
+        }
+    }
+    struct lm_job_result results[2];
+    bzero(results, sizeof(results));
+    int ret = lm_gpu_submit_pair((struct lm_vm *)p->vm, p->stage[0].jc,
+        p->stage[1].jc, remaining_ns, results, vt_ranges, p->stage[0].bo_count,
+        fs_ranges, p->stage[1].bo_count, p->source_pid, p->pair_token);
+    bzero(execution, sizeof(*execution));
+    for (uint32_t i = 0; i < 2; ++i) {
+        execution->sequence[i] = results[i].sequence;
+        execution->started_ns[i] = results[i].started_ns;
+        execution->completed_ns[i] = results[i].completed_ns;
+        execution->job_status[i] = results[i].job_status;
+        execution->error[i] = results[i].pair_stage_error;
+        if (results[i].pair_stage_attempted) {
+            execution->attempted_mask |= 1u << i;
+            if (!results[i].pair_stage_error) execution->completed_mask |= 1u << i;
+        }
+    }
+    execution->dma_safe = !results[0].quarantined && !results[1].quarantined &&
+        lm_gpu_vm_safe_to_free((struct lm_vm *)p->vm);
+    execution->offline = !lm_gpu_ready();
+    bool malformed = false;
+    for (uint32_t i = 0; i < 2; ++i)
+        if (!results[i].pair_stage_attempted && (results[i].sequence ||
+            results[i].pair_stage_error || results[i].started_ns || results[i].completed_ns))
+            malformed = true;
+    if (malformed || (!ret && (execution->attempted_mask != 3 ||
+        execution->completed_mask != 3 || !results[0].sequence || !results[1].sequence ||
+        results[0].gpu_fault || results[0].mmu_fault ||
+        results[1].gpu_fault || results[1].mmu_fault))) {
+        execution->dma_safe = 0;
+        execution->offline = 1;
+        execution->completed_mask = 0;
+        return LMAL_EIO;
+    }
+    return ret;
 }
 
 static IOReturn
@@ -250,9 +405,23 @@ public:
 };
 
 OSDefineMetaClassAndStructors(LancelotMali, IOService);
+OSDefineMetaClassAndStructors(LancelotMaliCpuLease, OSObject);
+extern "C" void lmal_cpu_lease_retain(void *p) {
+    if (p) ((LancelotMaliCpuLease *)p)->retain();
+}
+extern "C" void lmal_cpu_lease_release(void *p) {
+    if (p) ((LancelotMaliCpuLease *)p)->release();
+}
+extern "C" int lmal_cpu_lease_map_lock(void *p, int reference) {
+    return p ? ((LancelotMaliCpuLease *)p)->lockMapping(reference != 0) : LMAL_OK;
+}
+extern "C" void lmal_cpu_lease_map_unlock(void *p) {
+    if (p) ((LancelotMaliCpuLease *)p)->unlockMapping();
+}
 
 struct lmal_bo {
 	IOMemoryDescriptor *memory;
+	LancelotMaliCpuLease *cpu_lease;
 	LancelotMaliExport *export_memory;
 	MiniIOSurface *surface;
 	uint64_t gpu_va;
@@ -283,6 +452,8 @@ class LancelotMaliUserClient : public IOUserClient
 	uint64_t fFaults;
 	uint64_t fResets;
 	uint64_t fQuarantined;
+	uint64_t fSyncPairToken, fSyncPairReportAt;
+	uint64_t fSyncPairRejectCount, fSyncPairRejectAt;
 	bool fAuthorized;
 	bool fClosing;
 	IOReturn fCloseResult;
@@ -304,7 +475,10 @@ class LancelotMaliUserClient : public IOUserClient
 	int bo_wait(const struct lmal_bo_wait *request);
 	int surface_query(const struct lmal_surface_query *request, struct lmal_surface_query *response);
 	int surface_import(const struct lmal_surface_import *request, struct lmal_surface_import *response);
-	int submit(const struct lmal_submit *request, struct lmal_submit *response);
+	int submit(const struct lmal_submit *request, struct lmal_submit *response, uint64_t readonly = 0);
+	int submit_pair_sync(const struct lmal_submit_pair_sync *, struct lmal_submit_pair_sync *, uint64_t,
+	    struct lmal_pair_admission * = NULL);
+	void pair_admission_diagnostic(uint32_t, int, const struct lmal_pair_admission *);
 	int sync_create(const struct lmal_syncobj_create *request, struct lmal_syncobj_create *response);
 	int sync_destroy(const struct lmal_syncobj_handle *request);
 	int sync_set_array(const struct lmal_syncobj_array *request, bool signaled);
@@ -331,8 +505,13 @@ LancelotMali::start(IOService *provider)
 	    !IOService::start(provider)) {
 		return false;
 	}
-	setProperty(kIOUserClientClassKey, "LancelotMaliUserClient");
+	if (lancelot_hakios_backend() && !lmal_prepare_hakios_client()) return false;
+	if (lancelot_mali_queued_backend() && !lmal_prepare_queued_client()) return false;
+    setProperty(kIOUserClientClassKey, lancelot_hakios_backend()?"LancelotHakiosMaliUserClient":lancelot_mali_queued_backend() ?
+        "LancelotMaliQueuedUserClient" : "LancelotMaliUserClient");
 	setName(LMAL_SERVICE_NAME);
+	printf("LancelotMali: bocache=%u BO CPU=%s; IOSurface keeps owner cache policy\n",
+	    gLancelotBOCached, gLancelotBOCached ? "writeback" : "writecombine");
 	registerService();
 	printf("LancelotMali: service published name=%s\n", LMAL_SERVICE_NAME);
 	return true;
@@ -342,13 +521,13 @@ IOReturn
 LancelotMali::newUserClient(task_t owningTask, void *security_id, UInt32 type,
     OSDictionary *properties, IOUserClient **handler)
 {
-	LancelotMaliUserClient *client;
+	IOUserClient *client;
 
 	if (handler == NULL) {
 		return kIOReturnBadArgument;
 	}
 	*handler = NULL;
-	client = new LancelotMaliUserClient;
+	client = lancelot_hakios_backend()?lmal_create_hakios_client():lancelot_mali_queued_backend() ? lmal_create_queued_client() : new LancelotMaliUserClient;
 	if (client == NULL) {
 		printf("LancelotMali: user client allocation failed\n");
 		return kIOReturnNoMemory;
@@ -417,6 +596,10 @@ LancelotMaliUserClient::initWithTask(task_t owningTask, void *securityID, UInt32
 	fFaults = 0;
 	fResets = 0;
 	fQuarantined = 0;
+	fSyncPairToken = 0;
+	fSyncPairReportAt = 0;
+	fSyncPairRejectCount = 0;
+	fSyncPairRejectAt = 0;
 	fAuthorized = false;
 	fClosing = false;
 	fCloseResult = kIOReturnSuccess;
@@ -431,6 +614,8 @@ LancelotMaliUserClient::initWithTask(task_t owningTask, void *securityID, UInt32
 	}
 	fTask = owningTask;
 	fAuthorized = true;
+	proc_t owner = (proc_t)get_bsdtask_info(owningTask);
+	printf("LancelotMali: client identity pid=%d task-authorized=1\n", owner != NULL ? proc_pid(owner) : -1);
 	return true;
 }
 
@@ -441,6 +626,9 @@ LancelotMaliUserClient::start(IOService *provider)
 	    !IOUserClient::start(provider)) {
 		printf("LancelotMali: client start refused auth=%d provider=%d ready=%d\n",
 		    fAuthorized ? 1 : 0, provider != NULL ? 1 : 0, lm_gpu_ready() ? 1 : 0);
+		if (fAuthorized && provider != NULL && !lm_gpu_ready()) {
+			lm_gpu_report_first_failure(); /* Cached original reason, no hardware access/revival. */
+		}
 		return false;
 	}
 	fLock = IOLockAlloc();
@@ -448,6 +636,8 @@ LancelotMaliUserClient::start(IOService *provider)
 	fSyncs = IONewZero(struct lmal_sync, LMAL_MAX_SYNCS);
 	fNextVA = LM_VA_MIN;
 	if (fLock == NULL || fBOs == NULL || fSyncs == NULL) {
+		printf("LancelotMali: client metadata allocation failed lock=%u bos=%u syncs=%u\n",
+		    fLock != NULL, fBOs != NULL, fSyncs != NULL);
 		if (fSyncs != NULL) {
 			IODelete(fSyncs, struct lmal_sync, LMAL_MAX_SYNCS);
 			fSyncs = NULL;
@@ -464,6 +654,7 @@ LancelotMaliUserClient::start(IOService *provider)
 	}
 	fVM = lm_gpu_vm_new();
 	if (fVM == NULL) {
+		printf("LancelotMali: client VM creation failed ready=%u\n", lm_gpu_ready());
 		IODelete(fSyncs, struct lmal_sync, LMAL_MAX_SYNCS);
 		fSyncs = NULL;
 		IODelete(fBOs, struct lmal_bo, LMAL_MAX_BOS);
@@ -567,8 +758,13 @@ LancelotMaliUserClient::create_memory(uint64_t size, IOBufferMemoryDescriptor **
 	if (size > UINT32_MAX || lmal_round_backing(size) != size || size == 0) {
 		return LMAL_EINVAL;
 	}
+	/* Select the memory object's cache mode at allocation, before any export.
+	 * XNU applies it to the backing and default-cache mappings inherit it.
+	 * Changing only IOConnectMapMemory's user alias would leave mismatched
+	 * aliases. Imported IOSurfaces use their owner's descriptor instead. */
 	IOBufferMemoryDescriptor *m = IOBufferMemoryDescriptor::inTaskWithOptions(
-	    kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared,
+	    kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
+	    (gLancelotBOCached ? 0 : kIOMapWriteCombineCache),
 	    (vm_size_t)size, PAGE_SIZE);
 	if (m == NULL) {
 		return LMAL_ENOMEM;
@@ -604,6 +800,11 @@ LancelotMaliUserClient::collect_pages(IOMemoryDescriptor *memory, uint64_t size,
 	IOBufferMemoryDescriptor *buffer = OSDynamicCast(IOBufferMemoryDescriptor, memory);
 	if (buffer != NULL) {
 		cpu = (uint8_t *)buffer->getBytesNoCopy();
+		for (uint32_t i = 0; i < LMAL_MAX_BOS; i++)
+			if (fBOs[i].used && fBOs[i].memory == memory && fBOs[i].cpu_lease != NULL) {
+				cpu = (uint8_t *)fBOs[i].cpu_lease->cacheAddress();
+				break;
+			}
 	} else {
 		/* IOSubMemoryDescriptor has no getBytesNoCopy; derive its known pixel base below. */
 		for (uint32_t i = 0; i < LMAL_MAX_BOS; i++) {
@@ -667,6 +868,10 @@ LancelotMaliUserClient::discard_unmapped_bo(struct lmal_bo *b, bool map_attempte
 	/* Core mapping modifies software tables only; failed maps roll back before
 	 * returning. An unattempted page collection cannot give DMA this backing. */
 	bool safe = !map_attempted || (fVM != NULL && !fVMQuarantined && lm_gpu_vm_safe_to_free(fVM));
+	if (safe && b->cpu_lease != NULL) {
+		b->cpu_lease->release();
+		b->cpu_lease = NULL;
+	}
 	int cleanup = lmal_client_cleanup_new_backing(b->memory, b->surface, safe,
 	    lmal_complete_new_memory, lmal_drop_new_memory, lmal_drop_new_surface);
 	if (cleanup == LMAL_OK) {
@@ -718,6 +923,10 @@ LancelotMaliUserClient::release_bo(struct lmal_bo *b)
 	}
 	if (b->memory != NULL) {
 		b->memory->release();
+	}
+	if (b->cpu_lease != NULL) {
+		b->cpu_lease->release();
+		b->cpu_lease = NULL;
 	}
 	if (b->surface != NULL) {
 		MiniIOSurfaceDrop(b->surface);
@@ -773,12 +982,15 @@ LancelotMaliUserClient::bo_create(const struct lmal_bo_create *request,
 	bzero(b, sizeof(*b));
 	b->used = true;
 	b->memory = memory;
+	struct lmal_cpu_lease_why lease_why = {};
+	b->cpu_lease = LancelotMaliCpuLease::withRoot(memory, true, 2, &lease_why);
 	b->size = size;
 	b->gpu_va = va;
 	b->flags = request->flags | LMAL_BO_FIXED_BACKING;
 	if ((b->flags & (LMAL_BO_EXEC | LMAL_BO_NOEXEC)) == 0) {
 		b->flags |= LMAL_BO_NOEXEC;
 	}
+	lmal_lease_diag_create(index + 1, size, b->flags, b->cpu_lease != NULL, &lease_why);
 	b->prepared = true;
 	struct lm_page *pages = NULL;
 	ret = collect_pages(memory, size, &pages);
@@ -862,6 +1074,14 @@ LancelotMaliUserClient::bo_wait(const struct lmal_bo_wait *request)
 	struct lmal_bo *b = bo(request->handle);
 	if (b == NULL) {
 		return LMAL_EINVAL;
+	}
+	if (b->cpu_lease != NULL) {
+		uint64_t now = lmal_now_ns();
+		uint64_t remaining = request->absolute_monotonic_ns > now ?
+		    request->absolute_monotonic_ns - now : 0;
+		if (remaining > LMAL_MAX_WAIT_NS) remaining = LMAL_MAX_WAIT_NS;
+		int waited = b->cpu_lease->waitCpu(remaining);
+		if (waited) return waited;
 	}
 	if (b->last_status != 0) {
 		return (int)b->last_status;
@@ -974,7 +1194,10 @@ LancelotMaliUserClient::surface_import(const struct lmal_surface_import *request
 	b->used = true;
 	b->memory = sub;
 	b->surface = surface;
+	b->cpu_lease = surface->maliCpuLease;
+	if (b->cpu_lease != NULL) b->cpu_lease->retain();
 	b->surface_id = request->surface_id;
+	lmal_lease_diag_import(index + 1, request->surface_id, size, b->cpu_lease != NULL);
 	b->gpu_va = va;
 	b->size = size;
 	b->flags = request->flags | LMAL_BO_NOEXEC | LMAL_BO_FIXED_BACKING;
@@ -1120,15 +1343,22 @@ LancelotMaliUserClient::sync_wait(const struct lmal_syncobj_wait *request,
 
 int
 LancelotMaliUserClient::submit(const struct lmal_submit *request,
-    struct lmal_submit *response)
+    struct lmal_submit *response, uint64_t readonly)
 {
 	uint32_t *handles = NULL;
+	uint32_t *access = NULL;
 	uint32_t *sync_handles = NULL;
 	bool jc_valid = false;
 	uint64_t jc_end = 0;
 	int ret = LMAL_OK;
 	struct lmal_bo **refs = NULL;
+	struct lm_range *ranges = NULL;
 	uint32_t ref_count = 0;
+	LancelotMaliCpuLease **cpu_leases = NULL;
+	uint64_t *cpu_cookies = NULL;
+	bool *cpu_writers = NULL;
+	uint32_t cpu_count = 0;
+	uint64_t cpu_deadline = 0;
 	if (request->h.flags != 0 || request->bo_count == 0 ||
 	    request->bo_count > LMAL_MAX_SUBMIT_BOS || request->in_sync_count > LMAL_MAX_SUBMIT_SYNCS ||
 	    (request->requirements & ~UINT32_C(1)) != 0 || request->timeout_ns > LMAL_MAX_WAIT_NS ||
@@ -1152,6 +1382,18 @@ LancelotMaliUserClient::submit(const struct lmal_submit *request,
 		lmal_free_u32_array(sync_handles, request->in_sync_count);
 		return LMAL_ENOMEM;
 	}
+	if (readonly != 0) {
+		ret = lmal_copy_u32_array(readonly, request->bo_count, LMAL_MAX_SUBMIT_BOS, &access);
+		if (ret != LMAL_OK) {
+			goto submit_out;
+		}
+		for (uint32_t i = 0; i < request->bo_count; i++) {
+			if (access[i] & ~LMAL_ACCESS_READONLY) {
+				ret = LMAL_EINVAL;
+				goto submit_out;
+			}
+		}
+	}
 	for (uint32_t i = 0; i < request->bo_count; i++) {
 		struct lmal_bo *b = bo(handles[i]);
 		if (b == NULL) {
@@ -1161,11 +1403,17 @@ LancelotMaliUserClient::submit(const struct lmal_submit *request,
 		bool duplicate = false;
 		for (uint32_t j = 0; j < ref_count; j++) {
 			if (refs[j] == b) {
+				if (access != NULL) {
+					access[j] &= access[i]; /* Any writable duplicate wins. */
+				}
 				duplicate = true;
 				break;
 			}
 		}
 		if (!duplicate) {
+			if (access != NULL) {
+				access[ref_count] = access[i];
+			}
 			refs[ref_count++] = b;
 		}
 	}
@@ -1215,6 +1463,62 @@ LancelotMaliUserClient::submit(const struct lmal_submit *request,
 			goto submit_out;
 		}
 	}
+	/* Exact retained mappings, deduplicated above. The optional core workset
+	 * masks all other PTEs before narrowing CPU maintenance. */
+	ranges = IONew(struct lm_range, ref_count);
+	if (ranges == NULL) {
+		ret = LMAL_ENOMEM;
+		goto submit_out;
+	}
+	for (uint32_t i = 0; i < ref_count; i++) {
+		ranges[i].va = refs[i]->gpu_va;
+		ranges[i].pages = (uint32_t)(refs[i]->size / LMAL_PAGE_SIZE);
+		bool contains_job = request->jc >= refs[i]->gpu_va &&
+		    request->jc - refs[i]->gpu_va < refs[i]->size;
+		ranges[i].flags = lmal_client_gpu_only_eligible(gLancelotBOCached == 0,
+		    refs[i]->surface != NULL, refs[i]->export_memory != NULL, contains_job) ? LM_RANGE_GPU_ONLY : 0;
+		if (access != NULL && access[i] == LMAL_ACCESS_READONLY) {
+			if (contains_job) {
+				ret = LMAL_EINVAL;
+				goto submit_out;
+			}
+			ranges[i].flags |= LM_RANGE_READONLY;
+		}
+	}
+	/* Legacy remains synchronous, but cannot bypass active CPU/presenter
+	 * ownership. Sort roots identically to the presenter's reader acquisition. */
+	cpu_leases = IONew(LancelotMaliCpuLease *, ref_count);
+	cpu_cookies = IONew(uint64_t, ref_count);
+	cpu_writers = IONew(bool, ref_count);
+	if (!cpu_leases || !cpu_cookies || !cpu_writers) { ret = LMAL_ENOMEM; goto submit_out; }
+	bzero(cpu_cookies, sizeof(*cpu_cookies) * ref_count);
+	for (uint32_t i = 0; i < ref_count; i++) {
+		LancelotMaliCpuLease *lease = refs[i]->cpu_lease;
+		if (!lease) continue;
+		uint32_t j = 0;
+		while (j < cpu_count && (uintptr_t)cpu_leases[j] < (uintptr_t)lease) j++;
+		bool writer = (refs[i]->flags & LMAL_BO_WRITE) &&
+		    !(ranges[i].flags & LM_RANGE_READONLY);
+		if (j < cpu_count && cpu_leases[j] == lease) { cpu_writers[j] |= writer; continue; }
+		for (uint32_t k = cpu_count; k > j; k--) {
+			cpu_leases[k] = cpu_leases[k - 1]; cpu_writers[k] = cpu_writers[k - 1];
+		}
+		cpu_leases[j] = lease;
+		cpu_writers[j] = writer;
+		cpu_count++;
+	}
+	{
+		uint64_t now = lmal_now_ns();
+		if (!now || lmal_add_overflow_u64(now, request->timeout_ns, &cpu_deadline)) {
+			ret = LMAL_EINVAL; goto submit_out;
+		}
+	}
+	for (uint32_t i = 0; i < cpu_count; i++) {
+		uint64_t now = lmal_now_ns();
+		if (now >= cpu_deadline) { ret = LMAL_ETIMEDOUT; goto submit_out; }
+		ret = cpu_leases[i]->beginGpu(cpu_deadline - now, &cpu_cookies[i], false, cpu_writers[i]);
+		if (ret) goto submit_out;
+	}
 	for (uint32_t i = 0; i < ref_count; i++) {
 		refs[i]->in_flight++;
 	}
@@ -1229,11 +1533,14 @@ LancelotMaliUserClient::submit(const struct lmal_submit *request,
 	{
 		struct lm_job_result result;
 		bzero(&result, sizeof(result));
+		for (uint32_t i = 0; i < cpu_count; i++)
+			(void)cpu_leases[i]->markLegacy(cpu_cookies[i]);
 		/* Keep the client lock while the core performs its serialized wait.
 		 * ExternalMethod is not assumed to serialize calls; refs and slot generations
 		 * therefore cannot be changed by close/map/reset while DMA owns them. */
-		ret = lm_gpu_submit_wait(fVM, request->jc, request->requirements,
-		    request->timeout_ns, &result);
+		uint64_t now = lmal_now_ns();
+		ret = now >= cpu_deadline ? LMAL_ETIMEDOUT : lm_gpu_submit_ranges(fVM,
+		    request->jc, request->requirements, cpu_deadline - now, &result, ranges, ref_count);
 		response->sequence = result.sequence;
 		response->job_status = result.job_status;
 		if (result.gpu_fault || result.mmu_fault) {
@@ -1245,6 +1552,15 @@ LancelotMaliUserClient::submit(const struct lmal_submit *request,
 		if (result.quarantined || !lm_gpu_vm_safe_to_free(fVM)) {
 			fVMQuarantined = true;
 			fQuarantined++;
+		}
+		for (uint32_t i = 0; i < cpu_count; i++) {
+			int ended = cpu_leases[i]->endGpu(cpu_cookies[i], ret,
+			    !fVMQuarantined && !result.quarantined);
+			cpu_cookies[i] = 0; /* unknown DMA retains its cookie inside the root */
+			if (ended) {
+				if (!ret) ret = ended;
+				fVMQuarantined = true;
+			}
 		}
 		if (ret == LMAL_OK) {
 			fJobsCompleted++;
@@ -1265,11 +1581,24 @@ LancelotMaliUserClient::submit(const struct lmal_submit *request,
 		}
 	}
 submit_out:
+	if (cpu_cookies != NULL) {
+		for (uint32_t i = 0; i < cpu_count; i++)
+			if (cpu_cookies[i]) (void)cpu_leases[i]->endGpu(cpu_cookies[i], LMAL_OK, true);
+		IODelete(cpu_cookies, uint64_t, ref_count);
+	}
+	if (cpu_leases != NULL) IODelete(cpu_leases, LancelotMaliCpuLease *, ref_count);
+	if (cpu_writers != NULL) IODelete(cpu_writers, bool, ref_count);
+	lmal_free_u32_array(access, request->bo_count);
+	if (ranges != NULL) {
+		IODelete(ranges, struct lm_range, ref_count);
+	}
 	IODelete(refs, struct lmal_bo *, request->bo_count);
 	lmal_free_u32_array(handles, request->bo_count);
 	lmal_free_u32_array(sync_handles, request->in_sync_count);
 	return ret;
 }
+
+#include "lancelot_mali_sync_pair.inc"
 
 IOReturn
 LancelotMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
@@ -1290,7 +1619,21 @@ LancelotMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
 		return kIOReturnBadArgument;
 	}
 	if (b->export_memory == NULL) {
-		b->export_memory = LancelotMaliExport::withBacking(b->memory, fTask);
+		if (b->cpu_lease != NULL) {
+			int waited = b->cpu_lease->waitCpu(LMAL_MAX_WAIT_NS);
+			if (waited) { IOLockUnlock(fLock); return lmal_ioreturn(waited); }
+		}
+		/* Serialize the first CPU ownership handoff before any mapping object
+		 * escapes. Once export_memory exists, future submits conservatively
+		 * maintain this BO even if every map has since been unmapped. */
+		if (gLancelotBOCached == 0 && b->surface == NULL) {
+			int result = lm_gpu_vm_cpu_access(fVM, b->gpu_va, (uint32_t)(b->size / LMAL_PAGE_SIZE));
+			if (result != LMAL_OK) {
+				IOLockUnlock(fLock);
+				return lmal_ioreturn(result);
+			}
+		}
+		b->export_memory = LancelotMaliExport::withBacking(b->memory, fTask, b->cpu_lease);
 		if (b->export_memory == NULL) {
 			IOLockUnlock(fLock);
 			return kIOReturnNoMemory;
@@ -1392,12 +1735,41 @@ LancelotMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgume
 	int result = lmal_client_validate(selector, &r, args->structureInputSize,
 	    args->structureOutput != NULL ? args->structureOutputSize : 0);
 	if (result != LMAL_OK) {
+		if ((selector == LMAL_SELECTOR_SUBMIT_PAIR_SYNC || selector == LMAL_SELECTOR_CHECK_PAIR_SYNC) &&
+		    IOLockTryLock(fLock)) {
+			if (fAuthorized && current_task() == fTask && !fClosing) {
+				struct lmal_pair_admission detail = {};
+				detail.reason = LMAL_PAIR_REASON_WIRE;
+				detail.stage_index = LMAL_PAIR_STAGE_NONE;
+				pair_admission_diagnostic(selector, result, &detail);
+			}
+			IOLockUnlock(fLock);
+		}
 		args->structureOutputSize = 0;
 		return lmal_ioreturn(result);
 	}
 	/* Own the client across sync_wait's unlocked sleep and concurrent Close. */
 	retain();
-	IOLockLock(fLock);
+	uint64_t pair_started = 0;
+	if (selector == LMAL_SELECTOR_SUBMIT_PAIR_SYNC || selector == LMAL_SELECTOR_CHECK_PAIR_SYNC) {
+		pair_started = lmal_now_ns();
+		bool locked = false;
+		int lock_error = pair_started ? LMAL_ETIMEDOUT : LMAL_EIO;
+		for (uint32_t i = 0; pair_started && i < 10000; i++) {
+			uint64_t now = lmal_now_ns();
+			if (now < pair_started) { lock_error = LMAL_EIO; break; }
+			if (now-pair_started >= r.submit_pair_sync.timeout_ns) break;
+			if (IOLockTryLock(fLock)) { locked = true; break; }
+			IOSleep(1); /* bounded, preemptible client-lock wait */
+		}
+		if (!locked) {
+			size_t written = 0;
+			int copied = lmal_client_copy_reply(args->structureOutput, args->structureOutputSize,
+			    &r, selector, lock_error, &written);
+			args->structureOutputSize = (uint32_t)written;
+			release(); return lmal_ioreturn(copied);
+		}
+	} else IOLockLock(fLock);
 	if (!fAuthorized || current_task() != fTask) result = LMAL_EPERM;
 	else if (fClosing || fVM == NULL) result = LMAL_ENODEV;
 	else switch (selector) {
@@ -1422,6 +1794,16 @@ LancelotMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgume
 	case LMAL_SELECTOR_SUBMIT:
 		result = submit(&r.submit, &r.submit);
 		break;
+	case LMAL_SELECTOR_SUBMIT_ACCESS:
+		result = submit(&r.submit_access.submit, &r.submit_access.submit, r.submit_access.bo_readonly);
+		break;
+	case LMAL_SELECTOR_SUBMIT_PAIR_SYNC:
+		result = submit_pair_sync(&r.submit_pair_sync, &r.submit_pair_sync, pair_started);
+		break;
+	case LMAL_SELECTOR_CHECK_PAIR_SYNC:
+		result = submit_pair_sync(&r.check_pair_sync.submit, &r.check_pair_sync.submit,
+		    pair_started, &r.check_pair_sync.admission);
+		break;
 	case LMAL_SELECTOR_SYNCOBJ_CREATE:
 		result = sync_create(&r.sync_create, &r.sync_create);
 		break;
@@ -1443,7 +1825,7 @@ LancelotMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgume
 		r.caps.quarantined = fQuarantined;
 		r.caps.max_bo_bytes = (uint32_t)LMAL_MAX_BO_BYTES;
 		r.caps.max_vm_bytes = (uint32_t)LMAL_MAX_VM_BYTES;
-		r.caps.flags = 0;
+		r.caps.flags = LMAL_CAP_SUBMIT_ACCESS | LMAL_CAP_SUBMIT_PAIR_SYNC | LMAL_CAP_CHECK_PAIR_SYNC;
 		break;
 	case LMAL_SELECTOR_SURFACE_QUERY:
 		r.surface_query.handle = 0;
@@ -1468,3 +1850,7 @@ LancelotMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgume
 	release();
 	return lmal_ioreturn(copied);
 }
+
+#include "lancelot_mali_queue_client.inc"
+
+#include "lancelot_hakios_client.inc"

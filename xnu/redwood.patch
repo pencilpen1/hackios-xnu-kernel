@@ -65,7 +65,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 index 44274016a4cf..9cd24b42caca 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,42 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,50 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -80,6 +80,14 @@ index 44274016a4cf..9cd24b42caca 100644
 +bsd/dev/redwood_ufs.c	standard
 +bsd/dev/lancelot_emmc.c	standard
 +bsd/dev/lancelot_usb.c	standard
++bsd/dev/lancelot_mali_observe.c	standard
++bsd/dev/lancelot_pwrap.c	standard
++bsd/dev/lancelot_mali.c	standard
++bsd/dev/lancelot_mali_core.c	standard
++bsd/dev/lancelot_mali_platform.c	standard
++bsd/dev/lancelot_mali_pmic.c	standard
++bsd/dev/lancelot_sspm_pmic.c	standard
++bsd/dev/lancelot_sspm_boot.c	standard
 +bsd/dev/redwood_ufshc.c	standard
 +bsd/dev/redwood_net.c		standard
 +bsd/dev/redwood_virtio_net.c	standard
@@ -1707,7 +1715,7 @@ diff --git a/iokit/conf/files b/iokit/conf/files
 index 5fb0a52062e0..6c430c2b23c7 100644
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -79,6 +79,14 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
+@@ -79,6 +79,15 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
  iokit/Kernel/IOGuardPageMemoryDescriptor.cpp		optional iokitcpp
  
  iokit/Kernel/IOPlatformExpert.cpp			optional iokitcpp
@@ -1715,6 +1723,7 @@ index 5fb0a52062e0..6c430c2b23c7 100644
 +iokit/Kernel/MiniIOSurface.cpp			optional iokitcpp
 +iokit/Kernel/MiniIOMobileFramebuffer.cpp		optional iokitcpp
 +iokit/Kernel/RedwoodGPU.cpp				optional iokitcpp
++iokit/Kernel/LancelotMali.cpp			optional iokitcpp
 +iokit/Kernel/RedwoodWLAN.cpp			optional iokitcpp
 +iokit/Kernel/RedwoodBattery.cpp			optional iokitcpp
 +iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp

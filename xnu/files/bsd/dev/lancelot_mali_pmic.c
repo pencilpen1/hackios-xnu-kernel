@@ -456,6 +456,41 @@ lmp_pmic_is_enabled(struct lmp_pmic_state *state, enum lmp_rail rail, bool *valu
     return lmp_pmic_transaction_end(state, lmp_pmic_is_enabled_locked(state, rail, value));
 }
 int
+lmp_pmic_cpu_rails(struct lmp_pmic_state *state, struct lmp_cpu_rails *rails)
+{
+    if (!rails) return LMP_EINVAL;
+    lmp_pmic_zero(rails, sizeof(*rails));
+    int error = lmp_pmic_transaction_begin(state);
+    if (error) return error;
+    /* Source: supplied MT6768 upmu_hw.h DA_*_VOSEL/EN/STB definitions.
+     * A read still issues WACS2 CMD/VLDCLR; it is NOT raw MMIO-only observation. */
+    static const uint16_t addr[2][4] = {
+        {0x141eu,0x1420u,0x1ba2u,0x1ba4u}, /* VPROC12/VSRAM12 */
+        {0x139eu,0x13a0u,0x1b60u,0x1b62u}  /* VPROC11/VSRAM11 */
+    };
+    uint16_t sample[2][2][4];
+    for (unsigned pass=0;pass<2;pass++) for (unsigned c=0;c<2;c++) for (unsigned i=0;i<4;i++) {
+        error=lmp_pmic_read16(state,addr[c][i],&sample[pass][c][i]);
+        if (error) goto done;
+        sample[pass][c][i] = i&1 ? sample[pass][c][i]&3u :
+            (sample[pass][c][i] >> (i==2?8:0))&0x7fu;
+    }
+    for (unsigned c=0;c<2;c++) {
+        for (unsigned i=0;i<4;i++) if (sample[0][c][i]!=sample[1][c][i]) {
+            error=LMP_EBUSY;goto done;
+        }
+        if (sample[0][c][1]!=3 || sample[0][c][3]!=3) {error=LMP_EBUSY;goto done;}
+        uint32_t proc=500000u+sample[0][c][0]*6250u;
+        uint32_t sram=500000u+sample[0][c][2]*6250u;
+        if (proc<600000u || proc>1120000u || sram<850000u || sram>1120000u ||
+            sram<proc || sram-proc>262500u) {error=LMP_EIO;goto done;}
+        rails->vproc_uv[c]=proc;rails->vsram_uv[c]=sram;
+    }
+done:
+    if (error) lmp_pmic_zero(rails, sizeof(*rails));
+    return lmp_pmic_transaction_end(state,error);
+}
+int
 lmp_pmic_enable(struct lmp_pmic_state *state, enum lmp_rail rail)
 {
     int error = lmp_pmic_transaction_begin(state);
@@ -484,10 +519,56 @@ lmp_pmic_set_voltage_uv(struct lmp_pmic_state *state, enum lmp_rail rail, uint32
     return lmp_pmic_transaction_end(state, lmp_pmic_set_voltage_uv_locked(state, rail, uv));
 }
 
+int
+lmp_pmic_gpu_rails(struct lmp_pmic_state *state, struct lmp_gpu_rails *rails)
+{
+    uint16_t enable[2][LMP_RAIL_COUNT], selector[2][LMP_RAIL_COUNT];
+    int error;
+    if (!rails) return LMP_EINVAL;
+    lmp_pmic_zero(rails, (uint32_t)sizeof(*rails));
+    error = lmp_pmic_transaction_begin(state);
+    if (error) return error;
+    for (unsigned pass = 0; pass < 2; pass++) {
+        for (unsigned i = 0; i < LMP_RAIL_COUNT; i++) {
+            enum lmp_rail rail = (enum lmp_rail)i;
+            error = lmp_pmic_field_read(state,
+                lmp_pmic_en_field(&state->regs, rail, true), &enable[pass][i]);
+            if (error) goto done;
+            /* Live DVFS requires DA, never a disabled rail's stale DA/RG. */
+            error = lmp_pmic_field_read(state,
+                lmp_pmic_vosel_field(&state->regs, rail, true), &selector[pass][i]);
+            if (error) goto done;
+        }
+    }
+    for (unsigned i = 0; i < LMP_RAIL_COUNT; i++) {
+        if (enable[0][i] != enable[1][i] || selector[0][i] != selector[1][i]) {
+            error = LMP_EBUSY; goto done;
+        }
+        rails->enabled[i] = enable[0][i] != 0;
+        rails->uv[i] = 500000u + (uint32_t)selector[0][i] * 6250u;
+    }
+done:
+    if (error) lmp_pmic_zero(rails, (uint32_t)sizeof(*rails));
+    return lmp_pmic_transaction_end(state, error);
+}
+
 static int
 lmp_pmic_cb_is_enabled(void *cookie, enum lmp_rail rail, bool *enabled)
 {
     return lmp_pmic_is_enabled((struct lmp_pmic_state *)cookie, rail, enabled);
+}
+
+int lmp_pmic_native_ap_ready(struct lmp_pmic_state *state) {
+    int error=lmp_pmic_transaction_begin(state);if(error)return error;
+    /* MT6358 GPU OP_EN registers from the already saved provider map. Read
+     * only: never clear HW/SPM sources to manufacture AP ownership. */
+    const uint16_t address[2]={0x1510u,0x1bd0u};
+    uint16_t value[2][2]={{0}};
+    for(unsigned pass=0;pass<2&&!error;pass++)for(unsigned rail=0;rail<2&&!error;rail++)
+        error=lmp_pmic_read16(state,address[rail],&value[pass][rail]);
+    if(!error)for(unsigned rail=0;rail<2;rail++)
+        if(value[0][rail]!=1u||value[1][rail]!=value[0][rail]) {error=LMP_ENOTSUP;break;}
+    return lmp_pmic_transaction_end(state,error);
 }
 
 static int
@@ -514,6 +595,12 @@ lmp_pmic_cb_get_voltage(void *cookie, enum lmp_rail rail, uint32_t *uv)
     return lmp_pmic_get_voltage_uv((struct lmp_pmic_state *)cookie, rail, uv);
 }
 
+static int
+lmp_pmic_cb_read_rails(void *cookie, struct lmp_gpu_rails *rails)
+{
+    return lmp_pmic_gpu_rails((struct lmp_pmic_state *)cookie, rails);
+}
+
 int
 lmp_pmic_get_platform_ops(struct lmp_pmic_state *state,
                           struct lmp_pmic_ops *ops)
@@ -527,5 +614,6 @@ lmp_pmic_get_platform_ops(struct lmp_pmic_state *state,
     ops->disable = lmp_pmic_cb_disable;
     ops->set_voltage_uv = lmp_pmic_cb_set_voltage;
     ops->get_voltage_uv = lmp_pmic_cb_get_voltage;
+    ops->read_rails = lmp_pmic_cb_read_rails;
     return LMP_OK;
 }

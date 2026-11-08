@@ -94,11 +94,30 @@ lancelot_ubuntu_bootstrap(void)
 	};
 	static const struct {
 		const char *entry, *path;
-		struct lancelot_ramdisk_variant variants[2];
+		struct lancelot_ramdisk_variant variants[21];
 	} files[] = {
 		{"ramdisk", "/hackios/20H392/touch-hardware-20261024/root.apfs",
 		 {{4194304u, "81a86d265596387f227c7b8a3e021f991293c2900b69a89a38b0f29be6436763"},
-		  {6119424u, "845f9cd590a7d5b96ee397913893c4e873f8277c0387fd844668b1b69531d298"}}},
+		  {6373376u, "537d98abb1a73234e62068f1e18dcc8ceffd3e5f0e55cb439423b4a1b9bc8536"},
+		  {6377472u, "25049136ec4c6727ad7c85335cb1409b32d4f3893b6d5afc26cb090a8806e121"},
+		  {6377472u, "0fcc4ff64fb44cc1caff0c26fd073c12ddb25c27ef6284719cd32abac8dbd901"},
+		  {6377472u, "08dc268f9d040aa2acc1ad934de501a1addfa6be6800226ec1c30e3254baef4f"},
+		  {6377472u, "50f5b99f8840236bd862fee6775459495a0c4953c65cef718404745498da2981"},
+		  {6385664u, "8fe5a98ad9eed9206fd6a671be0112053a38e787bdf593c82b8a333d21736427"},
+		  {6385664u, "81ba3afaffd06e4d30087b242db1da307e05d78675d8316ee1bb2c7d28d51a65"},
+		  {6389760u, "ca6fcd66f125c9cdcca27557df97bddb6fec786c5562b3cb41da5f249cb03e16"},
+		  {6402048u, "c077e683899ab6c6cddff8f3b894eb2c261de3bfca4f62476a97816232725578"},
+		  {6406144u, "ebf267c728303b83b4a8eb6610852b4b0a9d2ee5482b3b12ecad67c6a863830f"},
+		  {6406144u, "2dabe8042075985b1c17e0a8cf1e5351b1273a8dfce3e94e65accf62950eeb77"},
+		  {6406144u, "ae7739193e5d729212987fc759119951cbd40e27c04b8753c1d9c1285bd04ff1"},
+		  {6406144u, "b9134a04f572151821dab89451cd2ae9aa13e0bd3cbad55f9ac65b892a9e36a2"},
+		  {6410240u, "b8a6957306e01d39cbde35281203a4cc24c4c28a1e17fdc1b373fdf9e6cf8bc8"},
+		  {6414336u, "dc97e2b511efbcb1fee4431af0aacff35a303c834eb7496b7c13444ee4442fea"},
+		  {6414336u, "d8bd0bd39ebdb626c6720a5ccf81fc46f0adddcd32ec064f3cf07875736abac9"},
+		  {6426624u, "38076f5aa7f0d16955995848493a23f9a6c19fa7609eb24a61c5a2f93d5c25ab"},
+		  {6426624u, "80422ed9d165334d177e4dcc7b62f832ca8342e1ef9d5f838b343f0095744b46"},
+		  {6426624u, "7d68892b14a8b883258c11120c4711a7f11328295b8c1160bbf2fe5ce8b1f615"},
+		  {6426624u, "30f9823aa00e81a1e279de1c4d19717c5a3c3abfd89679740821292f1e6a21a3"}}},
 		{"bootdisk", "/hackios/20H392/flashboot.apfs",
 		 {{4194304u, "14485e7c5ce125ef516168445c2500ac04ca5e40a908c2aef516b2d92c24ba0c"},
 		  {0u, 0}}},
@@ -134,11 +153,22 @@ lancelot_ubuntu_bootstrap(void)
 		}
 		sha256(data, expected_size, hash);
 		static const char digits[] = "0123456789abcdef";
-		for (unsigned j = 0; j < 32; j++) {
-			if (digits[hash[j] >> 4] != found->hash[j * 2] || digits[hash[j] & 15] != found->hash[j * 2 + 1]) {
-				print("ubuntu: SHA256 mismatch %s\n", files[i].path);
-				return 0;
+		/* The first size match above bounds the read, not the image identity.
+		 * Hash once, then try every same-size pin in this file's whitelist. */
+		found = 0;
+		for (unsigned v = 0; v < sizeof(files[i].variants) / sizeof(files[i].variants[0]); v++) {
+			const struct lancelot_ramdisk_variant *candidate = &files[i].variants[v];
+			if (!candidate->hash || candidate->size != expected_size) continue;
+			unsigned j;
+			for (j = 0; j < 32; j++) {
+				if (digits[hash[j] >> 4] != candidate->hash[j * 2] ||
+				    digits[hash[j] & 15] != candidate->hash[j * 2 + 1]) break;
 			}
+			if (j == 32) { found = candidate; break; }
+		}
+		if (!found) {
+			print("ubuntu: SHA256 mismatch %s\n", files[i].path);
+			return 0;
 		}
 		end = data + expected_size;
 		print("ubuntu: %s %d bytes SHA256 verified (%s)\n", files[i].path, (uint64_t)expected_size, found->hash);

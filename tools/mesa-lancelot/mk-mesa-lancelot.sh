@@ -34,6 +34,7 @@ if [[ ! -f "$S/.lancelot-overlay" ]]; then
  python3 "$MESA/apply-lancelot.py" "$S"
  python3 "$MESA/apply-lancelot-fences.py" "$S"
  python3 "$MESA/apply-lancelot-screen.py" "$S"
+ python3 "$MESA/apply-hakios-mtk.py" "$S"
  printf '%s\n' "$FINGERPRINT" > "$S/.lancelot-overlay"
 fi
 printf '%s\n' "$S" > "$B/current-source"
@@ -59,7 +60,7 @@ needs_exe_wrapper = true
 INI
 if [[ ! -f "$BUILD/build.ninja" ]]; then
  meson setup "$BUILD" "$S" --cross-file "$B/cross.ini" --wrap-mode=nofallback \
-  --prefix=/redwood --libdir=lib --buildtype=release -Db_ndebug=true \
+  --prefix=/redwood --libdir=lib --buildtype=release -Doptimization=s -Db_ndebug=true \
   -Dplatforms= -Dgallium-drivers=softpipe,panfrost -Dvulkan-drivers= \
   -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dosmesa=true -Dllvm=disabled \
   -Dshared-glapi=enabled -Dgles1=disabled -Dgles2=enabled -Dopengl=true \

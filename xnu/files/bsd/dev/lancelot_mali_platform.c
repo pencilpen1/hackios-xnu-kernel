@@ -978,3 +978,481 @@ lmp_teardown(struct lmp_state *state)
     state->teardown_safe = false;
     return LMP_OK;
 }
+
+/* Direct AP GPU DVFS is an explicit, separately guarded backend. Never infer
+ * GPU control from the CPU SSPM protocol or an idle PWRAP snapshot. */
+static int
+lmp_dvfs_fail(struct lmp_state *s, int error)
+{
+    s->failed = true;
+    s->gpu_ready = false;
+    s->status.gpu_accessible = false;
+    s->teardown_safe = false;
+    s->dvfs.attached = false;
+    s->dvfs.transitioning = false;
+    s->dvfs.meter_valid = false;
+    s->dvfs.limit_policy_valid = false;
+    s->dvfs.operation_active = false;
+    if (!s->dvfs.error) s->dvfs.error = error;
+    if (s->dvfs.ops.revoke) s->dvfs.ops.revoke(s->dvfs.ops.cookie, error);
+    /* Leave the last known/unknown clock and voltage alone. A failed MMIO
+     * write may have completed; rollback/reset at a guessed clock is unsafe. */
+    return error;
+}
+
+static int
+lmp_dvfs_guard(struct lmp_state *s)
+{
+    if (!s->dvfs.ops.guard) return LMP_ENOTSUP;
+    if (s->dvfs.operation_active) {
+        uint64_t now = s->ops.now_ns(s->ops.cookie);
+        if (now < s->dvfs.operation_start_ns ||
+            now - s->dvfs.operation_start_ns >= s->config.timeout_ns) return LMP_ETIMEDOUT;
+    }
+    int error = s->dvfs.ops.guard(s->dvfs.ops.cookie);
+    if (!error && s->dvfs.operation_active) {
+        uint64_t now = s->ops.now_ns(s->ops.cookie);
+        if (now < s->dvfs.operation_start_ns ||
+            now - s->dvfs.operation_start_ns >= s->config.timeout_ns) return LMP_ETIMEDOUT;
+    }
+    return error;
+}
+static void lmp_dvfs_begin(struct lmp_state *s) {
+    s->dvfs.operation_start_ns = s->ops.now_ns(s->ops.cookie);
+    s->dvfs.operation_active = true;
+}
+static int lmp_dvfs_finish(struct lmp_state *s,int error) {
+    s->dvfs.operation_active = false;return error;
+}
+
+/* Meter setup and restore mutate a shared resource too. Recheck the mandatory
+ * guard at each write boundary; a completed read/write may have revealed lost
+ * rights since entry. On refusal do not restore a now-foreign counter. This
+ * does not create an ownership token or replace a real producer-side lease. */
+static int
+lmp_dvfs_meter_write(struct lmp_state *s, uint32_t offset, uint32_t value)
+{
+    int error = lmp_dvfs_guard(s);
+    if (error) return error;
+    return lmp_write(s, LMP_BANK_TOP, offset, value);
+}
+
+static bool
+lmp_dvfs_clock_equal(const struct lmp_dvfs_clock *a,
+                     const struct lmp_dvfs_clock *b)
+{
+    if (a->top != b->top) return false;
+    for (unsigned i = 0; i < 3; i++) {
+        /* CON1's PCW-change latch may self-clear; DDS/postdiv must not. */
+        uint32_t mask = i == 1 ? ~LGD_PLL_CHANGE : UINT32_MAX;
+        if ((a->mfg[i] & mask) != (b->mfg[i] & mask) || a->main[i] != b->main[i]) return false;
+    }
+    return a->hz == b->hz && a->park_hz == b->park_hz;
+}
+
+static int
+lmp_dvfs_read_clock(struct lmp_state *s, struct lmp_dvfs_clock *out)
+{
+    struct lmp_dvfs_clock sample[2] = {{0}};
+    const uint32_t delta[3] = {0, 4, 12};
+    uint32_t parent;
+    int error;
+    for (unsigned pass = 0; pass < 2; pass++) {
+        struct lmp_dvfs_clock *c = &sample[pass];
+        if ((error = lmp_read(s, LMP_BANK_TOP, LMP_TOP_CLK_CFG_1, &c->top))) return error;
+        for (unsigned i = 0; i < 3; i++) {
+            if ((error = lmp_read(s, LMP_BANK_APMIXED, LMP_APMIXED_MFGPLL_CON0 + delta[i], &c->mfg[i]))) return error;
+            if ((error = lmp_read(s, LMP_BANK_APMIXED, LMP_APMIXED_MAINPLL_CON0 + delta[i], &c->main[i]))) return error;
+        }
+        parent = c->top & LMP_TOP_MFG_SEL_MASK;
+        if ((parent != 1u && parent != 2u) || (c->top & LMP_TOP_MFG_GATE) ||
+            !(c->mfg[0] & LMP_PLL_EN) || !(c->main[0] & LMP_PLL_EN) ||
+            !(c->mfg[2] & LMP_PLL_PWR_ON) || !(c->main[2] & LMP_PLL_PWR_ON) ||
+            (c->mfg[2] & LMP_PLL_ISO_EN) || (c->main[2] & LMP_PLL_ISO_EN) ||
+            (c->mfg[1] & ~(LGD_PLL_FIELDS | LGD_PLL_CHANGE)) ||
+            !lgd_pll_hz(c->main[1], 3u, &c->park_hz) ||
+            !lgd_pll_hz(parent == 1u ? c->mfg[1] : c->main[1], parent == 1u ? 1u : 3u, &c->hz)) return LMP_ENOTSUP;
+    }
+    if (!lmp_dvfs_clock_equal(&sample[0], &sample[1])) return LMP_EIO;
+    *out = sample[0]; return LMP_OK;
+}
+
+static int
+lmp_dvfs_read_rails(struct lmp_state *s, struct lmp_gpu_rails *out, uint32_t hz)
+{
+    int error = s->ops.pmic.read_rails(s->ops.pmic.cookie, out);
+    if (error) return error;
+    if (!out->enabled[0] || !out->enabled[1] ||
+        !lgd_rail_pair_valid(out->uv[0], out->uv[1]) ||
+        out->uv[0] < lmp_required_vgpu(hz)) return LMP_EIO;
+    return LMP_OK;
+}
+
+/* CKGEN ID5 = hf_fmfg_ck. Pinned clk-mt6768.c mt_get_ckgen_freq(),
+ * not the CPU PLL meter and not a nominal-frequency echo. Only TOP debug,
+ * divider-for-meter and counter control are touched, never clock muxes/gates.
+ * Guard follows the explicit control policy; native AP does not advertise a
+ * foreign-peer lease. Fresh busy/setup/result/restore checks remain mandatory.
+ * Frequency resolution is 26MHz/1024 (~25.4kHz); tolerate four counts. */
+static int
+lmp_dvfs_measure(struct lmp_state *s, uint32_t expected_hz)
+{
+    uint32_t dbg, misc, control, count, restored;
+    uint64_t measured, difference;
+    int error;
+    s->dvfs.meter_valid = false;
+    if ((error = lmp_dvfs_guard(s))) return error;
+    if ((error = lmp_read(s, LMP_BANK_TOP, LMP_TOP_CLK26CALI_0, &control))) return error;
+    if (control != 0) return LMP_EBUSY;
+    if ((error = lmp_read(s, LMP_BANK_TOP, LMP_TOP_CLK_DBG_CFG, &dbg))) return error;
+    if ((error = lmp_read(s, LMP_BANK_TOP, LMP_TOP_CLK_MISC_CFG_0, &misc))) return error;
+    if ((error = lmp_dvfs_meter_write(s, LMP_TOP_CLK_DBG_CFG, (dbg & 0xffffc0fcu) | (5u << 8) | 1u))) return error;
+    if ((error = lmp_dvfs_meter_write(s, LMP_TOP_CLK_MISC_CFG_0, misc & 0x00ffffffu))) return error;
+    if ((error = lmp_read(s, LMP_BANK_TOP, LMP_TOP_CLK_DBG_CFG, &restored))) return error;
+    if (restored != ((dbg & 0xffffc0fcu) | (5u << 8) | 1u)) return LMP_EIO;
+    if ((error = lmp_read(s, LMP_BANK_TOP, LMP_TOP_CLK_MISC_CFG_0, &restored))) return error;
+    if (restored != (misc & 0x00ffffffu)) return LMP_EIO;
+    if ((error = lmp_dvfs_meter_write(s, LMP_TOP_CLK26CALI_0, 0x1000u))) return error;
+    if ((error = lmp_dvfs_meter_write(s, LMP_TOP_CLK26CALI_0, 0x1010u))) return error;
+    /* Demand a fresh busy acknowledgement, not an old completed count after
+     * a silently dropped START. Preemption can miss this short window: that
+     * is an explicit conservative failure, never a fabricated measurement. */
+    if ((error = lmp_read(s, LMP_BANK_TOP, LMP_TOP_CLK26CALI_0, &control))) return error;
+    if ((control & 0x1010u) != 0x1010u) return LMP_EIO;
+    if ((error = lmp_wait_mask(s, LMP_BANK_TOP, LMP_TOP_CLK26CALI_0, 0x10u, 0))) return error;
+    if ((error = lmp_read(s, LMP_BANK_TOP, LMP_TOP_CLK26CALI_1, &count))) return error;
+    /* Restore only after known counter completion. On any transport error or
+     * unknown completion, stop instead of guessing/issuing further commands. */
+    if ((error = lmp_dvfs_meter_write(s, LMP_TOP_CLK_DBG_CFG, dbg))) return error;
+    if ((error = lmp_dvfs_meter_write(s, LMP_TOP_CLK_MISC_CFG_0, misc))) return error;
+    if ((error = lmp_dvfs_meter_write(s, LMP_TOP_CLK26CALI_0, 0))) return error;
+    if ((error = lmp_read(s, LMP_BANK_TOP, LMP_TOP_CLK_DBG_CFG, &restored))) return error;
+    if (restored != dbg) return LMP_EIO;
+    if ((error = lmp_read(s, LMP_BANK_TOP, LMP_TOP_CLK_MISC_CFG_0, &restored))) return error;
+    if (restored != misc) return LMP_EIO;
+    if ((error = lmp_read(s, LMP_BANK_TOP, LMP_TOP_CLK26CALI_0, &restored))) return error;
+    if (restored != 0) return LMP_EIO;
+    measured = (uint64_t)(count & 0xffffu) * 26000000u / 1024u;
+    difference = measured > expected_hz ? measured - expected_hz : expected_hz - measured;
+    if (!measured || difference > 102000u) return LMP_EIO;
+    if ((error = lmp_dvfs_guard(s))) return error;
+    s->dvfs.measured_hz = (uint32_t)measured;
+    s->dvfs.meter_count = count & 0xffffu;
+    s->dvfs.meter_samples++;
+    s->dvfs.measured_ns = s->ops.now_ns(s->ops.cookie);
+    s->dvfs.meter_valid = true;
+    return LMP_OK;
+}
+
+static int
+lmp_dvfs_checkpoint(struct lmp_state *s)
+{
+    struct lmp_dvfs_clock c;
+    struct lmp_gpu_rails rails;
+    struct lmp_status status;
+    uint32_t cg, protect, ack;
+    bool protected;
+    int error;
+    if ((error = lmp_dvfs_guard(s))) return error;
+    if ((error = lmp_status(s, &status))) return error;
+    if (!status.domain_on) return LMP_EIO;
+    if ((error = lmp_check_pwr_con(s))) return error;
+    if ((error = lmp_read_bus_state(s, &protect, &ack, &protected))) return error;
+    if ((protect | ack) & LMP_MFG_PROT_MASK) return LMP_EIO;
+    if ((error = lmp_read(s, LMP_BANK_MFGCFG, LMP_MFG_CG_CON, &cg))) return error;
+    if (cg & 1u) return LMP_EIO;
+    if ((error = lmp_dvfs_read_clock(s, &c))) return error;
+    if (!lmp_dvfs_clock_equal(&s->dvfs.clock, &c)) return LMP_EIO;
+    if ((error = lmp_dvfs_read_rails(s, &rails, c.hz))) return error;
+    for (unsigned i = 0; i < LMP_RAIL_COUNT; i++)
+        if (rails.uv[i] != s->dvfs.rails.uv[i] || rails.enabled[i] != s->dvfs.rails.enabled[i]) return LMP_EIO;
+    return LMP_OK;
+}
+
+/* Optional startup absence is normal: <=850MHz still follows load in BOTH
+ * directions. Existing valid lower hardware caps always win. Runtime failure
+ * after a provider starts is NOT absence: preserve protection, never replace
+ * a failed real sensor/limit with invented data or the850MHz startup ceiling.
+ * Mandatory PMIC/clock/ownership/quiescence guards are entirely separate. */
+static int
+lmp_dvfs_live_cap(struct lmp_state *s, uint32_t *cap)
+{
+    struct lmp_dvfs_limits limits = {0};
+    uint32_t invalid, result;
+    uint64_t now;
+    int error = s->dvfs.ops.limits ? s->dvfs.ops.limits(s->dvfs.ops.cookie, &limits) : LMP_ENODEV;
+    now = s->ops.now_ns(s->ops.cookie);
+    s->dvfs.limit_policy_valid = false;
+    if ((limits.started_mask | limits.valid_mask | limits.fault_mask) & ~LMP_DVFS_LIMIT_ALL) {
+        error = LMP_EINVAL; goto failed;
+    }
+    s->dvfs.provider_started_mask |= limits.started_mask | limits.valid_mask;
+    s->dvfs.provider_valid_mask = limits.valid_mask;
+    s->dvfs.provider_missing_mask = LMP_DVFS_LIMIT_ALL & ~s->dvfs.provider_started_mask;
+    invalid = limits.fault_mask | (s->dvfs.provider_started_mask & ~limits.valid_mask);
+    s->dvfs.provider_fault_mask = invalid;
+    /* Aggregate ENODEV/ENOTSUP is startup absence only if every started
+     * component remains valid and at least one component never started. */
+    if (error && (error != LMP_ENODEV && error != LMP_ENOTSUP)) goto failed;
+    if (invalid || (error && !s->dvfs.provider_missing_mask)) {
+        if (!error) error = LMP_EIO;
+        goto failed;
+    }
+    if (limits.valid_mask) {
+        if (limits.sampled_ns > now) {
+            error = LMP_EIO; goto stale;
+        }
+        if (limits.valid_until_ns <= now || now - limits.sampled_ns > UINT64_C(100000000)) {
+            error = LMP_ETIMEDOUT; goto stale;
+        }
+    }
+    result = limits.valid_mask == LMP_DVFS_LIMIT_ALL ? LGD_MAX_KHZ * 1000u : LMP_DVFS_OPTIONAL_MAX_HZ;
+    if ((limits.valid_mask & LMP_DVFS_LIMIT_THERMAL) && result > limits.thermal_max_hz) result = limits.thermal_max_hz;
+    if ((limits.valid_mask & LMP_DVFS_LIMIT_BATTERY) && result > limits.battery_max_hz) result = limits.battery_max_hz;
+    if ((limits.valid_mask & LMP_DVFS_LIMIT_POWER) && result > limits.power_max_hz) result = limits.power_max_hz;
+    *cap = result;
+    s->dvfs.effective_max_hz = result;
+    s->dvfs.provider_error = LMP_OK;
+    s->dvfs.limit_policy_valid = true;
+    return LMP_OK;
+stale:
+    s->dvfs.provider_fault_mask |= limits.valid_mask;
+failed:
+    s->dvfs.provider_error = error;
+    return error;
+}
+
+static int
+lmp_dvfs_permission(struct lmp_state *s, uint32_t demand_hz, uint32_t peak_hz,
+                    bool needs_boost, uint32_t starting_hz)
+{
+    uint32_t cap;
+    int error = lmp_dvfs_live_cap(s, &cap);
+    if (error) return error;
+    /* A lowering transition may transiently park above a new cap only when
+     * still <= the inherited/current rate and no voltage increase is needed. */
+    if (demand_hz > cap || (peak_hz > cap && (needs_boost || peak_hz > starting_hz))) return LMP_ENOTSUP;
+    return LMP_OK;
+}
+
+int
+lmp_dvfs_attach(struct lmp_state *s, const struct lmp_dvfs_ops *ops)
+{
+    struct lmp_dvfs_clock c;
+    struct lmp_gpu_rails rails;
+    uint32_t index, cap;
+    int error = lmp_require_full(s);
+    if (error) return error;
+    if (!s->started || !s->gpu_ready) return LMP_ENODEV;
+    if (s->dvfs.attached || s->dvfs.transitioning) return LMP_EBUSY;
+    if (!ops || !ops->guard || !ops->revoke || ops->control_policy > LMP_DVFS_NATIVE_AP ||
+        !s->ops.pmic.read_rails || !s->ops.pmic.set_voltage_uv) return LMP_ENOTSUP;
+    s->dvfs.ops = *ops;
+    lmp_dvfs_begin(s);
+    if ((error = lmp_dvfs_guard(s))) return error == LMP_EBUSY ? lmp_dvfs_finish(s,error) : lmp_dvfs_fail(s, error);
+    if ((error = lmp_dvfs_read_clock(s, &c))) return lmp_dvfs_fail(s, error);
+    if ((c.top & LMP_TOP_MFG_SEL_MASK) != 1u || !lgd_index_from_hz(c.hz, &index)) return lmp_dvfs_finish(s,LMP_ENOTSUP);
+    if ((error = lmp_dvfs_read_rails(s, &rails, c.hz))) return lmp_dvfs_fail(s, error);
+    s->dvfs.clock = c; s->dvfs.rails = rails; s->dvfs.current_opp = index;
+    s->dvfs.stage = 1;
+    if ((error = lmp_dvfs_checkpoint(s))) return lmp_dvfs_fail(s, error);
+    if ((error = lmp_dvfs_measure(s, c.hz))) return lmp_dvfs_fail(s, error);
+    if ((error = lmp_dvfs_live_cap(s, &cap))) return lmp_dvfs_fail(s, error);
+    if (cap < 299000000u) return lmp_dvfs_fail(s, LMP_ENOTSUP);
+    s->source_hz = c.hz;
+    s->dvfs.stage = 0; s->dvfs.attached = true;
+    return lmp_dvfs_finish(s,LMP_OK);
+}
+
+/* Each individual rail move is at most one selector (6.25mV), and both
+ * endpoints satisfy the100..250mV delta. The entire analog slew between them
+ * does too. This is a bounded springboard construction valid even for an
+ * inherited overvolted pair, not just canonical OPP pairs. Up: SRAM then GPU;
+ * down: GPU then SRAM, except at delta boundaries where the other rail must
+ * move first. No blind restore if a provider write/DA verification fails. */
+static int
+lmp_dvfs_move_rails(struct lmp_state *s, const struct lmp_gpu_rails *goal,
+                   uint32_t demand_hz, uint32_t peak_hz, bool boost, uint32_t start_hz)
+{
+    for (unsigned step = 0; step < 256u; step++) {
+        uint32_t gpu = s->dvfs.rails.uv[0], sram = s->dvfs.rails.uv[1], next[2] = {gpu, sram};
+        enum lmp_rail rail;
+        int error;
+        if (gpu == goal->uv[0] && sram == goal->uv[1]) return LMP_OK;
+        if (sram < goal->uv[1] && lgd_rail_pair_valid(gpu, sram + LGD_RAIL_STEP_UV)) rail = LMP_RAIL_VSRAM_GPU;
+        else if (gpu < goal->uv[0] && lgd_rail_pair_valid(gpu + LGD_RAIL_STEP_UV, sram)) rail = LMP_RAIL_VGPU;
+        else if (gpu > goal->uv[0] && lgd_rail_pair_valid(gpu - LGD_RAIL_STEP_UV, sram)) rail = LMP_RAIL_VGPU;
+        else if (sram > goal->uv[1] && lgd_rail_pair_valid(gpu, sram - LGD_RAIL_STEP_UV)) rail = LMP_RAIL_VSRAM_GPU;
+        else return LMP_EIO;
+        next[rail] = next[rail] < goal->uv[rail] ? next[rail] + LGD_RAIL_STEP_UV : next[rail] - LGD_RAIL_STEP_UV;
+        if (next[0] < lmp_required_vgpu(s->dvfs.clock.hz)) return LMP_EIO;
+        if ((error = lmp_dvfs_checkpoint(s))) return error;
+        if ((error = lmp_dvfs_permission(s, demand_hz, peak_hz, boost, start_hz))) return error;
+        if ((error = lmp_dvfs_guard(s))) return error;
+        s->dvfs.changed = true; /* failed callback may still change the rail */
+        if ((error = s->ops.pmic.set_voltage_uv(s->ops.pmic.cookie, rail, next[rail]))) return error;
+        s->dvfs.rails.uv[rail] = next[rail];
+        if ((error = lmp_dvfs_checkpoint(s))) return error;
+    }
+    return LMP_ETIMEDOUT;
+}
+
+static int
+lmp_dvfs_mux(struct lmp_state *s, uint32_t parent, uint32_t demand_hz,
+             uint32_t peak_hz, bool boost, uint32_t start_hz)
+{
+    const uint32_t offsets[3] = {LMP_TOP_CLK_CFG_1_CLR, LMP_TOP_CLK_CFG_1_SET, LMP_TOP_CLK_CFG_UPDATE};
+    const uint32_t values[3] = {LMP_TOP_MFG_SEL_MASK, parent, LMP_TOP_MFG_UPDATE};
+    int error;
+    if ((error = lmp_dvfs_checkpoint(s))) return error;
+    for (unsigned i = 0; i < 3; i++) {
+        if ((error = lmp_dvfs_guard(s))) return error;
+        if ((error = lmp_dvfs_permission(s, demand_hz, peak_hz, boost, start_hz))) return error;
+        if ((error = lmp_dvfs_guard(s))) return error;
+        s->dvfs.changed = true;
+        if ((error = lmp_write(s, LMP_BANK_TOP, offsets[i], values[i]))) return error;
+    }
+    if ((error = lmp_wait_mask(s, LMP_BANK_TOP, LMP_TOP_CLK_CFG_UPDATE, LMP_TOP_MFG_UPDATE, 0))) return error;
+    s->dvfs.clock.top = (s->dvfs.clock.top & ~LMP_TOP_MFG_SEL_MASK) | parent;
+    if (!lgd_pll_hz(parent == 1u ? s->dvfs.clock.mfg[1] : s->dvfs.clock.main[1], parent == 1u ? 1u : 3u, &s->dvfs.clock.hz)) return LMP_EIO;
+    if ((error = lmp_dvfs_checkpoint(s))) return error;
+    return lmp_dvfs_measure(s, s->dvfs.clock.hz);
+}
+
+int
+lmp_dvfs_target(struct lmp_state *s, uint32_t index)
+{
+    struct lgd_opp target, parking;
+    struct lmp_gpu_rails peak, goal;
+    uint32_t word, start_hz, peak_hz, difference, cap;
+    bool boost;
+    int error = lmp_require_full(s);
+    if (error) return error;
+    if (!s->dvfs.attached || !s->started || !s->gpu_ready) return LMP_ENOTSUP;
+    if (s->dvfs.transitioning) return LMP_EBUSY;
+    if (!lgd_get_opp(index, &target) || !lgd_pll_word(target.khz, &word)) return LMP_EINVAL;
+    lmp_dvfs_begin(s);
+    if ((error = lmp_dvfs_guard(s))) return error == LMP_EBUSY ? lmp_dvfs_finish(s,error) : lmp_dvfs_fail(s, error);
+    s->dvfs.stage = 1; s->dvfs.target_opp = index;
+    if ((error = lmp_dvfs_checkpoint(s))) return lmp_dvfs_fail(s, error);
+    if ((error = lmp_dvfs_measure(s, s->dvfs.clock.hz))) return lmp_dvfs_fail(s, error);
+    /* Even a same-OPP request must enforce a newly lower live cap. Demand is
+     * clamped to a real OPP; a provider shutdown cap below the minimum revokes
+     * service instead of allowing another job at an unsupported frequency. */
+    if ((error = lmp_dvfs_live_cap(s, &cap))) return lmp_dvfs_fail(s, error);
+    while (target.khz * 1000u > cap && index + 1u < LGD_OPP_COUNT) {
+        index++;
+        (void)lgd_get_opp(index, &target);
+    }
+    if (target.khz * 1000u > cap) return lmp_dvfs_fail(s, LMP_ENOTSUP);
+    (void)lgd_pll_word(target.khz, &word);
+    s->dvfs.target_opp = index;
+    if (index == s->dvfs.current_opp) { s->dvfs.stage = 0; return lmp_dvfs_finish(s,LMP_OK); }
+    if (!lgd_floor_opp(s->dvfs.clock.park_hz, &parking)) return lmp_dvfs_finish(s,LMP_ENOTSUP);
+    /* A meter cannot distinguish coincident parent rates. Refuse rather than
+     * call a shadow mux readback proof of safe parking. */
+    difference = s->dvfs.clock.hz > s->dvfs.clock.park_hz ? s->dvfs.clock.hz - s->dvfs.clock.park_hz : s->dvfs.clock.park_hz - s->dvfs.clock.hz;
+    if (difference <= 204000u) return lmp_dvfs_finish(s,LMP_ENOTSUP);
+    difference = target.khz * 1000u > s->dvfs.clock.park_hz ? target.khz * 1000u - s->dvfs.clock.park_hz : s->dvfs.clock.park_hz - target.khz * 1000u;
+    if (difference <= 204000u) return lmp_dvfs_finish(s,LMP_ENOTSUP);
+    start_hz = s->dvfs.clock.hz;
+    peak_hz = target.khz * 1000u;
+    if (peak_hz < s->dvfs.clock.park_hz) peak_hz = s->dvfs.clock.park_hz;
+    peak = s->dvfs.rails; goal = s->dvfs.rails;
+    goal.uv[0] = target.vgpu_uv; goal.uv[1] = target.vsram_uv;
+    if (peak.uv[0] < target.vgpu_uv) peak.uv[0] = target.vgpu_uv;
+    if (peak.uv[0] < parking.vgpu_uv) peak.uv[0] = parking.vgpu_uv;
+    if (peak.uv[1] < target.vsram_uv) peak.uv[1] = target.vsram_uv;
+    if (peak.uv[1] < parking.vsram_uv) peak.uv[1] = parking.vsram_uv;
+    if (!lgd_rail_pair_valid(peak.uv[0], peak.uv[1])) return lmp_dvfs_finish(s,LMP_ENOTSUP);
+    boost = peak_hz > start_hz || peak.uv[0] > s->dvfs.rails.uv[0] || peak.uv[1] > s->dvfs.rails.uv[1];
+    if ((error = lmp_dvfs_permission(s, target.khz * 1000u, peak_hz, boost, start_hz)))
+        return s->dvfs.limit_policy_valid ? lmp_dvfs_finish(s,error) : lmp_dvfs_fail(s, error);
+    s->dvfs.transitioning = true; s->dvfs.changed = false;
+    s->dvfs.stage = 2;
+    if ((error = lmp_dvfs_move_rails(s, &peak, target.khz * 1000u, peak_hz, boost, start_hz))) return lmp_dvfs_fail(s, error);
+    s->dvfs.stage = 3;
+    if ((error = lmp_dvfs_mux(s, 2u, target.khz * 1000u, peak_hz, boost, start_hz))) return lmp_dvfs_fail(s, error);
+    s->dvfs.stage = 4;
+    if ((error = lmp_dvfs_checkpoint(s))) return lmp_dvfs_fail(s, error);
+    if ((error = lmp_dvfs_permission(s, target.khz * 1000u, peak_hz, boost, start_hz))) return lmp_dvfs_fail(s, error);
+    if ((error = lmp_dvfs_guard(s))) return lmp_dvfs_fail(s, error);
+    if ((error = lmp_write(s, LMP_BANK_APMIXED, LMP_APMIXED_MFGPLL_CON1, word))) return lmp_dvfs_fail(s, error);
+    s->dvfs.clock.mfg[1] = word;
+    {
+        uint64_t before = s->ops.now_ns(s->ops.cookie), after;
+        s->ops.delay_us(s->ops.cookie, 20u);
+        after = s->ops.now_ns(s->ops.cookie);
+        if (after < before || after - before < 20000u) return lmp_dvfs_fail(s, LMP_ETIMEDOUT);
+    }
+    if ((error = lmp_dvfs_checkpoint(s))) return lmp_dvfs_fail(s, error);
+    /* Prove output still on the parking source after the PLL write. */
+    if ((error = lmp_dvfs_measure(s, s->dvfs.clock.park_hz))) return lmp_dvfs_fail(s, error);
+    s->dvfs.stage = 5;
+    if ((error = lmp_dvfs_mux(s, 1u, target.khz * 1000u, peak_hz, boost, start_hz))) return lmp_dvfs_fail(s, error);
+    s->dvfs.stage = 6;
+    if ((error = lmp_dvfs_move_rails(s, &goal, target.khz * 1000u, peak_hz, boost, start_hz))) return lmp_dvfs_fail(s, error);
+    s->dvfs.stage = 7;
+    if ((error = lmp_dvfs_checkpoint(s))) return lmp_dvfs_fail(s, error);
+    if ((error = lmp_dvfs_measure(s, s->dvfs.clock.hz))) return lmp_dvfs_fail(s, error);
+    s->source_hz = s->dvfs.clock.hz;
+    for (unsigned i = 0; i < LMP_RAIL_COUNT; i++) s->observed_uv[i] = s->dvfs.rails.uv[i];
+    s->dvfs.current_opp = index; s->dvfs.transitions++;
+    s->dvfs.transitioning = false; s->dvfs.stage = 0;
+    return lmp_dvfs_finish(s,LMP_OK);
+}
+
+int lmp_dvfs_admit(struct lmp_state *s,uint32_t index,uint64_t max_age_ns,bool *reused) {
+    if(reused)*reused=false;
+    int error=lmp_require_full(s);if(error)return error;
+    if(!max_age_ns || max_age_ns>UINT64_C(10000000) ||
+       s->dvfs.ops.control_policy!=LMP_DVFS_NATIVE_AP)return lmp_dvfs_target(s,index);
+    if(!s->dvfs.attached || !s->started || !s->gpu_ready)return LMP_ENOTSUP;
+    if(s->dvfs.transitioning || s->dvfs.operation_active)return LMP_EBUSY;
+    struct lgd_opp target;
+    if(!lgd_get_opp(index,&target))return LMP_EINVAL;
+    uint64_t now=s->ops.now_ns(s->ops.cookie);
+    if(s->dvfs.meter_valid && now<s->dvfs.measured_ns)return lmp_dvfs_fail(s,LMP_EIO);
+    if(!s->dvfs.meter_valid || !s->dvfs.measured_ns || now-s->dvfs.measured_ns>=max_age_ns)
+        return lmp_dvfs_target(s,index);
+    lmp_dvfs_begin(s);
+    /* These fresh checks include all mandatory resource guards and both DA
+     * rail values. A fresh live cap can force a lower OPP immediately. */
+    uint32_t cap;
+    if((error=lmp_dvfs_checkpoint(s)) || (error=lmp_dvfs_live_cap(s,&cap)))
+        return lmp_dvfs_fail(s,error);
+    uint32_t selected=index;
+    while(target.khz*1000u>cap && selected+1u<LGD_OPP_COUNT) {
+        ++selected;(void)lgd_get_opp(selected,&target);
+    }
+    if(target.khz*1000u>cap)return lmp_dvfs_fail(s,LMP_ENOTSUP);
+    now=s->ops.now_ns(s->ops.cookie);
+    if(now<s->dvfs.measured_ns)return lmp_dvfs_fail(s,LMP_EIO);
+    if(selected==s->dvfs.current_opp && now-s->dvfs.measured_ns<max_age_ns) {
+        if((error=lmp_dvfs_guard(s)))return lmp_dvfs_fail(s,error);
+        now=s->ops.now_ns(s->ops.cookie);
+        if(now<s->dvfs.measured_ns)return lmp_dvfs_fail(s,LMP_EIO);
+        if(now-s->dvfs.measured_ns<max_age_ns) {
+            s->dvfs.target_opp=selected;s->dvfs.stage=0;
+            if(reused)*reused=true;
+            return lmp_dvfs_finish(s,LMP_OK); /* original measurement timestamp retained */
+        }
+    }
+    (void)lmp_dvfs_finish(s,LMP_OK);
+    return lmp_dvfs_target(s,index);
+}
+
+int lmp_dvfs_verify(struct lmp_state *s,struct lmp_dvfs_sample *out) {
+    if(!out)return LMP_EINVAL;
+    *out=(struct lmp_dvfs_sample){0};
+    int error=lmp_require_full(s);if(error)return error;
+    if(!s->dvfs.attached||!s->started||!s->gpu_ready)return LMP_ENODEV;
+    if(s->dvfs.transitioning||s->dvfs.operation_active)return LMP_EBUSY;
+    lmp_dvfs_begin(s);
+    if((error=lmp_dvfs_checkpoint(s))||
+       (error=lmp_dvfs_measure(s,s->dvfs.clock.hz))||
+       (error=lmp_dvfs_checkpoint(s)))return lmp_dvfs_fail(s,error);
+    out->clock=s->dvfs.clock;out->rails=s->dvfs.rails;
+    out->measured_hz=s->dvfs.measured_hz;out->measured_ns=s->dvfs.measured_ns;
+    return lmp_dvfs_finish(s,LMP_OK);
+}

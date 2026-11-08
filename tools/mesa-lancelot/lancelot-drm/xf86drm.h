@@ -24,6 +24,8 @@ int drmOpenWithType(const char *,const char *,int);
 int drmClose(int);
 int lancelot_drm_dup(int);
 int drmIoctl(int,unsigned long,void *);
+struct drm_panfrost_submit;
+int lancelot_drm_submit_access(int, const struct drm_panfrost_submit *, const uint32_t *);
 int drmCommandWriteRead(int,unsigned long,void *,unsigned long);
 int drmCommandWrite(int,unsigned long,const void *,unsigned long);
 drmVersionPtr drmGetVersion(int);
@@ -37,6 +39,7 @@ int drmSyncobjDestroy(int,uint32_t);
 int drmSyncobjReset(int,const uint32_t *,uint32_t);
 int drmSyncobjSignal(int,const uint32_t *,uint32_t);
 int drmSyncobjWait(int,uint32_t *,unsigned,int64_t,unsigned,uint32_t *);
+int lancelot_drm_syncobj_snapshot(int,uint32_t,uint32_t *);
 int drmSyncobjFDToHandle(int,int,uint32_t *);
 int drmSyncobjHandleToFD(int,uint32_t,int *);
 int drmSyncobjImportSyncFile(int,uint32_t,int);
@@ -56,6 +59,15 @@ void *drmGetHashTable(void);
 void *lancelot_bo_map(int,uint32_t,uint64_t,off_t,size_t,int,int,void *);
 int lancelot_bo_unmap(int,void *,size_t);
 int64_t lancelot_bo_import_size(int,uint32_t);
+struct lancelot_surface_info { uint32_t handle; uint64_t size; uint32_t offset,row_bytes,width,height,pixel_format,planes; };
+int lancelot_surface_query(int,uint32_t,struct lancelot_surface_info *);
 struct lancelot_job_stats { uint64_t submitted,completed,faults; };
 int lancelot_drm_job_stats(int,struct lancelot_job_stats *);
+struct lancelot_job_profile { uint64_t token,start_ns,end_ns,jm_ns,worker_ns; uint32_t hz; int32_t error; };
+int lancelot_drm_job_profile(int,uint64_t,struct lancelot_job_profile *);
+/* AIR/Metal hooks: global native sequence, relative wait, and display handoff.
+ * Wait/mark return 0 or a positive errno, as the public MTK AIR contract does. */
+uint64_t lancelot_drm_last_seq(void);
+int lancelot_drm_wait_seq(uint64_t,int64_t);
+int lancelot_drm_surface_seq(uint32_t,uint64_t);
 #endif

@@ -28,28 +28,13 @@ if ! cmp -s xnu/files/osfmk/arm64/loader_return.c "$RETURN_SOURCE"; then
   exit 1
 fi
 python3 tools/test-loader-early-return.py "$RETURN_SOURCE"
-for file in bsd/dev/lancelot_usb.c bsd/dev/lancelot_musb.h bsd/dev/lancelot_emmc.c bsd/dev/lancelot_msdc.h bsd/dev/lancelot_mmc_mode.h bsd/dev/lancelot_storage.h \
-            bsd/dev/lancelot_nt36672_protocol.c bsd/dev/lancelot_nt36672_protocol.h \
-            bsd/dev/lancelot_touch_selftest.h bsd/dev/lancelot_touch_queue_selftest.h \
-            bsd/dev/lancelot_spi.h bsd/dev/lancelot_touch_platform.h bsd/dev/lancelot_touch.c \
-             bsd/dev/lancelot_nt36672_hw.c bsd/dev/lancelot_nt36672_hw.h \
-             bsd/dev/lancelot_smp.h \
-             bsd/dev/lancelot_cache.h \
-             bsd/dev/lancelot_mali_observe.c bsd/dev/lancelot_mali_observe.h bsd/dev/lancelot_pwrap.c bsd/dev/lancelot_pwrap.h \
-             bsd/dev/lancelot_mali.c bsd/dev/lancelot_mali_core.c bsd/dev/lancelot_mali_core.h \
-             bsd/dev/lancelot_mali_platform.c bsd/dev/lancelot_mali_platform.h \
-              bsd/dev/lancelot_mali_pmic.c bsd/dev/lancelot_mali_pmic.h bsd/dev/lancelot_mali_smoke.h \
-              bsd/dev/lancelot_sspm_pmic.c bsd/dev/lancelot_sspm_pmic.h \
-              bsd/dev/lancelot_sspm_boot.c bsd/dev/lancelot_sspm_selftest.h \
-             iokit/Kernel/LancelotMali.cpp iokit/Kernel/LancelotMaliExport.h \
-             iokit/Kernel/lancelot_mali_uapi.h iokit/Kernel/lancelot_mali_client_logic.h \
-            bsd/dev/lancelot_ext4.h bsd/dev/lancelot_sha256.h bsd/dev/redwood_input.c bsd/sys/redwood_input.h \
-            bsd/miscfs/apfs/apfs_vfsops.c; do
-  if ! cmp -s "xnu/files/$file" "xnu-src/xnu-8796.121.2/$file"; then
-    echo "$file differs from the tracked port source; reconcile local XNU edits before building" >&2
-    exit 1
-  fi
-done
+python3 tools/check-lancelot-source-tree.py xnu-src/xnu-8796.121.2
+python3 tools/test-lancelot-data.py
+python3 tools/test-lancelot-msdc-write.py
+python3 tools/test-lancelot-fifo-adapter.py
+python3 tools/test-lancelot-cpu-sampler.py
+python3 tools/test-lancelot-completion.py
+python3 tools/test-lancelot-hfs-xattr.py
 python3 tools/test-lancelot-msdc.py
 python3 tools/test-lancelot-usb.py
 python3 tools/test-lancelot-nt36672-protocol.py
@@ -73,6 +58,8 @@ if ! bash xnu-build.sh -j"$JOBS" build > out/lancelot/kernel-build.log 2>&1; the
 fi
 test -s "$KERNEL"
 python3 tools/verify-xnu-checkpoint.py "$KERNEL" | tee out/lancelot/kernel-verification.txt
+python3 tools/test-lancelot-static-hfs.py --kernel "$KERNEL" \
+  --tree xnu-src/xnu-8796.121.2 --out "out/lancelot/static-hfs-$(date -u +%Y%m%d-%H%M%S)-$$"
 cp "$KERNEL" out/lancelot/mach.lancelot
 sha256sum out/lancelot/mach.lancelot >> out/lancelot/kernel-verification.txt
 KERNEL=out/lancelot/mach.lancelot CHECKPOINT=${CHECKPOINT:-5} bash common/build-lancelot.sh "$MODE"

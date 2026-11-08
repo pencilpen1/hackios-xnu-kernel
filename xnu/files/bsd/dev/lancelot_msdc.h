@@ -1,9 +1,12 @@
-/* MT6768 MSDC0 counted read-only PIO. Card configuration commands used by
- * lancelot_mmc_mode.h are volatile; no media write/erase commands exist here. */
+/* MT6768 MSDC0 counted PIO, read-only by default. Card configuration commands
+ * used by lancelot_mmc_mode.h are volatile. An opt-in exact-sector gate admits
+ * CMD24 and cache flush for the validated persistent data file; erase and
+ * partition-switch commands remain unsupported. */
 #ifndef LANCELOT_MSDC_H
 #define LANCELOT_MSDC_H
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 #define LM_CFG 0x00u
 #define LM_PS 0x08u
@@ -40,11 +43,16 @@ struct lancelot_msdc {
 	uint64_t timeout;
 	uint32_t last_int, last_response, last_stage;
 	void (*read_fifo)(void *, uint8_t *, unsigned); /* optional word-burst adapter */
+	void (*write_fifo)(void *, const uint8_t *, unsigned); /* ordered TX word burst */
 	uint64_t (*critical_enter)(void *);
 	void (*critical_exit)(void *, uint64_t);
 	uint32_t rca, last_command;
 	int recovery_status;
 	uint64_t commands_sent, multi_reads, recoveries;
+    /* Enabled only after a caller has validated its own persistent file
+     * extents. The original read-only transport keeps writes disabled. */
+    bool media_write_enabled;
+    uint64_t media_write_first,media_write_end;
 };
 enum { LM_OK = 0, LM_TIMEOUT = -1, LM_IO = -2, LM_CONFIG = -3, LM_SWITCH_REJECTED = -4 };
 static int
@@ -67,9 +75,12 @@ lm_command(struct lancelot_msdc *m, uint32_t raw, uint32_t argument)
 {
 	uint32_t command = raw & 63;
 	if (command != 6 && command != 8 && command != 12 && command != 13 &&
-	    command != 17 && command != 18 && command != 23) return LM_CONFIG;
+    command != 17 && command != 18 && command != 23 &&
+    !(m->media_write_enabled && command==24 && raw==(24u|(1u<<7)|(1u<<11)|(1u<<13)|(512u<<16)))) return LM_CONFIG;
 	if (command == 6 && (raw != (6u | (7u << 7)) ||
-	    (argument & 0xffff00ffu) != ((3u << 24) | (183u << 16)) || ((argument >> 8) & 255) > 2)) return LM_CONFIG;
+    (((argument & 0xffff00ffu) != ((3u << 24) | (183u << 16)) || ((argument >> 8) & 255) > 2) &&
+     !(m->media_write_enabled && argument==((3u<<24)|(32u<<16)|(1u<<8)))))) return LM_CONFIG;
+    if(command==24 && (argument<m->media_write_first || argument>=m->media_write_end))return LM_CONFIG;
 	m->last_command = command;
 	int status = lm_wait_clear(m, LM_STATUS, command == 12 ? 2 : 3);
 	if (status != LM_OK) return status;
@@ -205,5 +216,78 @@ static int
 lancelot_msdc_ext_csd(struct lancelot_msdc *m, uint8_t out[512])
 {
 	return lm_data_read(m, LM_READ_EXT_CSD, 0, 1, out, 512);
+}
+/* New data-file-only write path. One sector at a time bounds IRQ-off latency;
+ * the caller supplies a proved initialized extent and a readback buffer. */
+#define LM_TX 0x18u
+#define LM_WRITE_SINGLE (24u|(1u<<7)|(1u<<11)|(1u<<13)|(512u<<16))
+#define LM_WRITE_ERROR ((1u<<14)|(1u<<15)|(1u<<16))
+static inline void
+lm_fifo_write(struct lancelot_msdc *m,const uint8_t *data,unsigned bytes)
+{
+    if(m->write_fifo){m->write_fifo(m->ctx,data,bytes/4);return;}
+    for(unsigned i=0;i<bytes;i+=4) {
+        uint32_t word=(uint32_t)data[i]|(uint32_t)data[i+1]<<8|
+            (uint32_t)data[i+2]<<16|(uint32_t)data[i+3]<<24;
+        m->write(m->ctx,LM_TX,word);
+    }
+}
+static inline int
+lancelot_msdc_write_sector(struct lancelot_msdc *m,uint32_t sector,const uint8_t data[512])
+{
+    if(!data || !m->media_write_enabled || sector<m->media_write_first || sector>=m->media_write_end || !m->timeout)
+        return LM_CONFIG;
+    if((m->critical_enter==NULL)!=(m->critical_exit==NULL))return LM_CONFIG;
+    uint64_t saved=m->critical_enter?m->critical_enter(m->ctx):0;
+    uint32_t events=LM_EVENTS|(1u<<16),mask=m->read(m->ctx,LM_INTEN);
+    int result=LM_CONFIG;bool started=false;
+    m->last_int=m->last_response=0;m->last_stage=1;
+    uint32_t cfg=m->read(m->ctx,LM_CFG);
+    if((cfg&9)!=9 || (cfg&4))goto leave;
+    if((result=lm_wait_clear(m,LM_STATUS,3))!=LM_OK)goto leave;
+    m->write(m->ctx,LM_INTEN,mask&~events);
+    m->write(m->ctx,LM_FIFO,1u<<31);
+    if((result=lm_wait_clear(m,LM_FIFO,1u<<31))!=LM_OK)goto restore;
+    m->write(m->ctx,LM_INT,events);m->write(m->ctx,LM_COUNT,1);
+    started=true;
+    if((result=lm_command(m,LM_WRITE_SINGLE,sector))!=LM_OK)goto restore;
+    m->last_stage=4;
+    unsigned sent=0;uint64_t began=m->ticks(m->ctx);
+    while(sent<512) {
+        m->last_int=m->read(m->ctx,LM_INT);
+        if(m->last_int&(LM_CMD_ERROR|LM_WRITE_ERROR)){result=LM_IO;goto restore;}
+        uint32_t occupied=(m->read(m->ctx,LM_FIFO)>>16)&255u;
+        if(occupied>128){result=LM_IO;goto restore;}
+        unsigned room=(128-occupied)&~3u;if(room>512-sent)room=512-sent;
+        if(room){lm_fifo_write(m,data+sent,room);sent+=room;}
+        if(sent<512 && (m->last_int&LM_DATA_DONE)){result=LM_IO;goto restore;}
+        if(m->ticks(m->ctx)-began>=m->timeout){result=LM_TIMEOUT;goto restore;}
+    }
+    m->last_stage=5;
+    for(;;) {
+        m->last_int=m->read(m->ctx,LM_INT);
+        if(m->last_int&(LM_CMD_ERROR|LM_WRITE_ERROR)){result=LM_IO;break;}
+        if(m->last_int&LM_DATA_DONE){result=lm_wait_clear(m,LM_STATUS,3);break;}
+        if(m->ticks(m->ctx)-began>=m->timeout){result=LM_TIMEOUT;break;}
+    }
+    if(result==LM_OK)result=lm_card_ready(m);
+restore:
+    if(result!=LM_OK && started)(void)lm_recover_read(m);
+    m->write(m->ctx,LM_INT,events);m->write(m->ctx,LM_INTEN,mask);
+leave:
+    if(m->critical_exit)m->critical_exit(m->ctx,saved);
+    return result;
+}
+static inline int
+lancelot_msdc_flush(struct lancelot_msdc *m)
+{
+    if(!m->media_write_enabled)return LM_CONFIG;
+    if((m->critical_enter==NULL)!=(m->critical_exit==NULL))return LM_CONFIG;
+    uint64_t saved=m->critical_enter?m->critical_enter(m->ctx):0;
+    int result=lm_card_ready(m);
+    if(result==LM_OK)result=lm_command(m,6u|(7u<<7),(3u<<24)|(32u<<16)|(1u<<8));
+    if(result==LM_OK)result=lm_card_ready(m);
+    if(m->critical_exit)m->critical_exit(m->ctx,saved);
+    return result;
 }
 #endif

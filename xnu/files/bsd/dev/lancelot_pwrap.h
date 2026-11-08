@@ -31,4 +31,14 @@ void lancelot_pwrap_release(void *unused);
  * No foreign response is consumed/cleared as a recovery shortcut. */
 int lancelot_pwrap_poison(void);
 bool lancelot_pwrap_available(void);
+/* Orderly freeze while threads/IRQs still work. Permanently denies normal
+ * WACS2 clients after the current owner retires; no register writes here. */
+int lancelot_pwrap_freeze_for_return(uint64_t timeout_ns);
+/* Final singleton access avoids a mutex abandoned on a stopped CPU. begin
+ * independently checks the real boot MPIDR and PSCI OFF for every other AP.
+ * This is a WACS2 context transition, not PMIC-target/foreign-peer permission. */
+int lancelot_pwrap_return_begin(uint32_t boot_mpidr);
+int lancelot_pwrap_return_acquire(uint64_t timeout_ns);
+void lancelot_pwrap_return_release(void);
+int lancelot_pwrap_return_poison(void);
 #endif

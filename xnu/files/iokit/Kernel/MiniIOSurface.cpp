@@ -29,6 +29,14 @@
 #include <sys/proc.h>
 
 #include "MiniIOSurface.h"
+#include "LancelotMaliCpuLease.h"
+extern "C" {
+int lancelot_mali_queued_backend(void);
+bool LancelotMaliQueueSurfaceWait(MiniIOSurface *, uint64_t);
+bool LancelotMaliQueueSurfaceReadBegin(MiniIOSurface *, uint64_t);
+void LancelotMaliQueueSurfaceReadEnd(MiniIOSurface *);
+void LancelotMaliQueueSurfaceRelease(MiniIOSurface *);
+}
 
 static_assert(sizeof(struct minisurf_plane) == 0x80, "plane layout");
 static_assert(sizeof(struct minisurf_result) == 0x68, "result layout");
@@ -123,6 +131,30 @@ traceLine(const char * format, ...)
 
 OSDefineMetaClassAndStructors(MiniIOSurface, OSObject);
 
+static uint64_t maliCpuWaitNs(uint64_t milliseconds)
+{
+	return milliseconds > LMAL_MAX_WAIT_NS / 1000000 ? LMAL_MAX_WAIT_NS : milliseconds * 1000000;
+}
+bool MiniIOSurfaceMaliDrawn(MiniIOSurface *surface, uint64_t milliseconds)
+{
+	if (!LancelotMaliQueueSurfaceWait(surface, maliCpuWaitNs(milliseconds))) return false;
+	return surface == NULL || surface->maliCpuLease == NULL ||
+	    surface->maliCpuLease->waitCpu(maliCpuWaitNs(milliseconds)) == LMAL_OK;
+}
+bool MiniIOSurfaceMaliReadBegin(MiniIOSurface *surface, uint64_t milliseconds)
+{
+	if (!LancelotMaliQueueSurfaceReadBegin(surface, maliCpuWaitNs(milliseconds))) return false;
+	bool allowed = surface != NULL && (surface->maliCpuLease == NULL ||
+	    surface->maliCpuLease->beginCpuRead(maliCpuWaitNs(milliseconds)) == LMAL_OK);
+	if (!allowed) LancelotMaliQueueSurfaceReadEnd(surface);
+	return allowed;
+}
+void MiniIOSurfaceMaliReadEnd(MiniIOSurface *surface)
+{
+	if (surface != NULL && surface->maliCpuLease != NULL) surface->maliCpuLease->endCpuRead();
+	LancelotMaliQueueSurfaceReadEnd(surface);
+}
+
 /*
  * The memory of the big surfaces is kept when they go, a few pieces of it, and given to the
  * next surface of the same size. CoreAnimation makes a surface of the whole display for every
@@ -141,6 +173,7 @@ OSDefineMetaClassAndStructors(MiniIOSurface, OSObject);
 
 static struct {
 	IOBufferMemoryDescriptor *      memory;
+	LancelotMaliCpuLease *          lease;
 	bool                            clear;          /* cleared since it was last a surface's */
 	bool                            busy;           /* being cleared right now */
 	uint64_t                        since;          /* when it was kept */
@@ -183,10 +216,12 @@ surfaceMemoryClear(thread_call_param_t unused0 __unused, thread_call_param_t unu
 
 /* Memory for a surface: the state page and `bytes` after it, all zeroes. */
 static IOBufferMemoryDescriptor *
-surfaceMemory(vm_size_t bytes)
+surfaceMemory(vm_size_t bytes, bool *fresh, LancelotMaliCpuLease **lease)
 {
 	IOBufferMemoryDescriptor * memory = NULL;
 	bool clear = false;
+	*fresh = false; /* kept roots have exported history; never late-register */
+	*lease = NULL;
 
 	if (bytes >= SURFACE_KEEP_FROM && gSurfaceKeptLock != NULL) {
 		IOLockLock(gSurfaceKeptLock);
@@ -196,8 +231,10 @@ surfaceMemory(vm_size_t bytes)
 				if (gSurfaceKept[i].memory != NULL && !gSurfaceKept[i].busy && (pass == 1 || gSurfaceKept[i].clear) &&
 				    gSurfaceKept[i].memory->getCapacity() == bytes) {
 					memory = gSurfaceKept[i].memory;
+					*lease = gSurfaceKept[i].lease;
 					clear = gSurfaceKept[i].clear;
 					gSurfaceKept[i].memory = NULL;
+					gSurfaceKept[i].lease = NULL;
 				}
 			}
 		}
@@ -208,8 +245,12 @@ surfaceMemory(vm_size_t bytes)
 		}
 	}
 	if (memory == NULL) {
-		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, bytes,
+		/* Explicit WB also requests IOMD's persistent memory entry, allowing
+		 * a fresh root lease without changing any existing page's cache mode. */
+		IOOptionBits cache = (lancelot_hakios_backend() || lancelot_mali_queued_backend()) ? kIOMapCopybackCache : 0;
+		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared | cache, bytes,
 		    PAGE_SIZE);
+		*fresh = memory != NULL;
 	}
 	return memory;
 }
@@ -221,20 +262,24 @@ surfaceMemory(vm_size_t bytes)
  * was kept any more -- each made afresh and freed (2 to 4 ms, and 1 to 2) instead of 0.3 and 0.05.
  */
 static void
-surfaceMemoryBack(IOBufferMemoryDescriptor * memory)
+surfaceMemoryBack(IOBufferMemoryDescriptor * memory, LancelotMaliCpuLease *lease)
 {
 	IOBufferMemoryDescriptor * evicted = NULL;
+	LancelotMaliCpuLease *evictedLease = NULL;
+	bool sole = lease ? lease->canRecycle(memory) :
+	    (!lancelot_mali_queued_backend() && memory->getRetainCount() == 1);
 
-	if (memory->getCapacity() >= SURFACE_KEEP_FROM && memory->getRetainCount() != 1) {
+	if (memory->getCapacity() >= SURFACE_KEEP_FROM && !sole) {
 		OSIncrementAtomic(&gSurfacesNotKept[0]);
 	}
-	if (memory->getCapacity() >= SURFACE_KEEP_FROM && memory->getRetainCount() == 1 && gSurfaceKeptLock != NULL) {
+	if (memory->getCapacity() >= SURFACE_KEEP_FROM && sole && gSurfaceKeptLock != NULL) {
 		int oldest = -1;
 
 		IOLockLock(gSurfaceKeptLock);
 		for (unsigned i = 0; i < SURFACE_KEPT && memory != NULL; i++) {
 			if (gSurfaceKept[i].memory == NULL) {
 				gSurfaceKept[i].memory = memory;
+				gSurfaceKept[i].lease = lease;lease = NULL;
 				gSurfaceKept[i].clear = gSurfaceKept[i].busy = false;
 				gSurfaceKept[i].since = mach_absolute_time();
 				memory = NULL;
@@ -244,13 +289,16 @@ surfaceMemoryBack(IOBufferMemoryDescriptor * memory)
 		}
 		if (memory != NULL && oldest >= 0) {
 			evicted = gSurfaceKept[oldest].memory;
+			evictedLease = gSurfaceKept[oldest].lease;
 			gSurfaceKept[oldest].memory = memory;
+			gSurfaceKept[oldest].lease = lease;lease = NULL;
 			gSurfaceKept[oldest].clear = gSurfaceKept[oldest].busy = false;
 			gSurfaceKept[oldest].since = mach_absolute_time();
 			memory = NULL;
 			gSurfacesNotKept[1]++;
 		}
 		IOLockUnlock(gSurfaceKeptLock);
+		OSSafeReleaseNULL(evictedLease);
 		if (evicted != NULL) {
 			evicted->release();
 		}
@@ -264,7 +312,7 @@ surfaceMemoryBack(IOBufferMemoryDescriptor * memory)
 			return;
 		}
 	}
-	memory->release();
+	OSSafeReleaseNULL(lease);memory->release();
 }
 
 void
@@ -284,6 +332,7 @@ MiniIOSurface::free(void)
 	}
 
 	OSSafeReleaseNULL(values);
+	LancelotMaliQueueSurfaceRelease(this);
 	OSSafeReleaseNULL(clientMap);
 	if (client != NULL) {
 		client->complete();
@@ -291,9 +340,10 @@ MiniIOSurface::free(void)
 		client = NULL;
 	}
 	if (memory != NULL) {
-		surfaceMemoryBack(memory);
+		surfaceMemoryBack(memory,maliCpuLease);maliCpuLease = NULL;
 		memory = NULL;
 	}
+	OSSafeReleaseNULL(maliCpuLease);
 	OSObject::free();
 	OSAddAtomic64((SInt64) (mach_absolute_time() - began), (SInt64 *) &gSurfaceFreeing);
 	OSIncrementAtomic(&gSurfacesFreed);
@@ -612,7 +662,8 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 		alloc = dictNumber(props, "IOSurfaceAllocSize", (uint32_t) needed);
 	}
 
-	s->memory = surfaceMemory((vm_size_t) PAGE_SIZE + (wrapped ? 0 : alloc));
+	bool freshMemory = false;
+	s->memory = surfaceMemory((vm_size_t) PAGE_SIZE + (wrapped ? 0 : alloc), &freshMemory, &s->maliCpuLease);
 	if (s->memory == NULL) {
 		IOLog("MiniIOSurface: no memory for %u bytes (%u surfaces, %llu MB in use)\n", alloc, gSurfaceCount,
 		    gSurfaceBytes >> 20);
@@ -621,6 +672,15 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 		return NULL;
 	}
 	s->kbase = (uint8_t *) s->memory->getBytesNoCopy();
+	if (wrapped == NULL) {
+		struct lmal_cpu_lease_why why={};
+		if(!s->maliCpuLease)s->maliCpuLease = LancelotMaliCpuLease::withRoot(s->memory, freshMemory, 1, &why);
+		if(!s->maliCpuLease && (lancelot_mali_queued_backend() || lancelot_hakios_backend()))
+			IOLog("lancelot-surface-lease: sid=%u fresh=%u bytes=%llu step=%u detail=%#x value=%llu\n",
+			    s->sid,freshMemory,(uint64_t)s->memory->getLength(),why.step,why.detail,why.value);
+		if (s->maliCpuLease != NULL)
+			s->kbase = (uint8_t *) s->maliCpuLease->cacheAddress();
+	}
 	s->values = OSDictionary::withCapacity(4);
 	s->kpixels = s->kbase + PAGE_SIZE;
 	if (wrapped != NULL) {
@@ -867,6 +927,9 @@ struct minisurf_client_ref {
 	IOMemoryMap *   map;                    /* the whole of it in the client's address space */
 	IOMemoryMap *   pixelMap;               /* ... the pixels, where those are another client's memory */
 	uint32_t        use[2];                 /* what this client added to the use counts */
+	uint32_t        maliReads, maliWrites;  /* nested CPU locks, one root lease per kind */
+	uint64_t        maliGeneration;        /* survives array moves, never reused */
+	bool            maliPending;
 	bool            detached;               /* the client let go of it and will release shortly */
 };
 
@@ -878,6 +941,8 @@ class IOSurfaceRootUserClient : public IOUserClient
 	struct minisurf_client_ref *    fRefs;
 	uint32_t                        fRefCount;
 	uint32_t                        fRefCapacity;
+	uint64_t                        fNextRefGeneration;
+	bool                            fClosing;
 	IOExternalTrap                  fTraps[kSurfaceTrapCount];
 
 	struct minisurf_client_ref * findRef(uint32_t sid, bool detached);
@@ -901,7 +966,7 @@ class IOSurfaceRootUserClient : public IOUserClient
 	IOReturn trapUnlock(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn trapDetach(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn trapRelease(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
-	IOReturn lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut);
+	IOReturn lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut, bool unlock);
 	IOReturn useCountCommon(uint32_t sid, uint32_t category, int delta);
 
 public:
@@ -924,6 +989,7 @@ IOSurfaceRootUserClient::initWithTask(task_t owningTask, void * securityID, UInt
 		return false;
 	}
 	fTask = owningTask;
+	fClosing = false;
 	return true;
 }
 
@@ -949,6 +1015,7 @@ IOReturn
 IOSurfaceRootUserClient::clientClose(void)
 {
 	IOLockLock(gSurfaceLock);
+	fClosing = true;
 	while (fRefCount != 0) {
 		dropRef(&fRefs[fRefCount - 1]);
 	}
@@ -993,6 +1060,7 @@ IOSurfaceRootUserClient::addRef(MiniIOSurface * surface)
 {
 	struct minisurf_client_ref * ref;
 	IOMemoryMap * map;
+	if (fClosing || fNextRefGeneration == UINT64_MAX) return NULL;
 
 	if (fRefCount == fRefCapacity) {
 		uint32_t capacity = fRefCapacity ? fRefCapacity * 2 : 16;
@@ -1008,7 +1076,10 @@ IOSurfaceRootUserClient::addRef(MiniIOSurface * surface)
 		fRefs = refs;
 		fRefCapacity = capacity;
 	}
+	if (surface->maliCpuLease != NULL && surface->maliCpuLease->lockMapping(false) != LMAL_OK)
+		return NULL;
 	map = surface->memory->createMappingInTask(fTask, 0, kIOMapAnywhere);
+	if (surface->maliCpuLease != NULL) surface->maliCpuLease->unlockMapping();
 	if (map == NULL) {
 		IOLog("MiniIOSurface: cannot map surface %u (%u bytes) into the client\n", surface->sid, surface->info.allocSize);
 		return NULL;
@@ -1016,6 +1087,7 @@ IOSurfaceRootUserClient::addRef(MiniIOSurface * surface)
 	ref = &fRefs[fRefCount++];
 	bzero(ref, sizeof(*ref));
 	ref->surface = surface;
+	ref->maliGeneration = ++fNextRefGeneration;
 	ref->map = map;
 	if (surface->client != NULL && surface->clientTask != fTask) {
 		ref->pixelMap = surface->client->createMappingInTask(fTask, 0, kIOMapAnywhere);
@@ -1028,6 +1100,10 @@ void
 IOSurfaceRootUserClient::dropRef(struct minisurf_client_ref * ref)
 {
 	MiniIOSurface * s = ref->surface;
+	if (s->maliCpuLease != NULL) {
+		if (ref->maliReads) s->maliCpuLease->endUserCpu(fTask, false);
+		if (ref->maliWrites) s->maliCpuLease->endUserCpu(fTask, true);
+	}
 
 	for (unsigned c = 0; c < 2; c++) {
 		s->useCount[c] -= ref->use[c];
@@ -1736,18 +1812,83 @@ IOSurfaceRootUserClient::trapDecrementUseCount(void * p1, void * p2, void * p3, 
 }
 
 /*
- * Lock and unlock do not exclude anybody: the memory is shared and always mapped.
- * What matters is the seed, which tells readers that the pixels may have changed.
+ * Legacy surfaces keep the seed-only lock contract. Owned Mali roots additionally
+ * keep counted task CPU locks, and the actual UPL lease blocks escaped mappings
+ * during GPU ownership; a Surface lock Boolean alone is not an alias barrier.
  */
 IOReturn
-IOSurfaceRootUserClient::lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut)
+IOSurfaceRootUserClient::lockCommon(uint32_t sid, uint32_t options, user_addr_t seedOut, bool unlock)
 {
 	struct minisurf_client_ref * ref;
+	MiniIOSurface * held = NULL;
+	uint64_t heldGeneration = 0;
+	bool readOnly = (options & kSurfaceLockReadOnly) != 0;
+	int acquired = LMAL_OK;
+	IOReturn ret = kIOReturnSuccess;
 	uint32_t seed = 0;
 
+	retain();
 	IOLockLock(gSurfaceLock);
 	ref = findRef(sid, false);
-	if (ref != NULL) {
+	if (ref == NULL || fClosing || current_task() != fTask) {
+		IOLockUnlock(gSurfaceLock); release(); return kIOReturnNotFound;
+	}
+	if (!unlock && ref->surface->maliQueueFence != NULL) {
+		held = ref->surface;
+		heldGeneration = ref->maliGeneration;
+		surfaceHold(held);
+		IOLockUnlock(gSurfaceLock);
+		bool completed = LancelotMaliQueueSurfaceWait(held, LMAL_MAX_WAIT_NS);
+		IOLockLock(gSurfaceLock);
+		ref = findRef(sid, false);
+		if (!completed || fClosing || !ref || ref->surface != held || ref->maliGeneration != heldGeneration) {
+			surfaceUnhold(held);
+			IOLockUnlock(gSurfaceLock);release();
+			return completed ? kIOReturnNotReady : kIOReturnTimeout;
+		}
+		surfaceUnhold(held);held = NULL;
+	}
+	if (ref->surface->maliCpuLease != NULL) {
+		uint32_t *count = readOnly ? &ref->maliReads : &ref->maliWrites;
+		uint32_t other = readOnly ? ref->maliWrites : ref->maliReads;
+		if (ref->maliPending || other || (unlock && !*count) || (!unlock && *count == UINT32_MAX)) {
+			IOLockUnlock(gSurfaceLock); release(); return kIOReturnBusy;
+		}
+		if (unlock) {
+			if (--*count == 0) {
+				ref->surface->maliCpuLease->endUserCpu(fTask, !readOnly);
+			}
+		} else if (*count) {
+			++*count;
+		} else {
+			/* Never wait holding the global surface lock: the producer's
+			 * unlock/close and final GPU retirement must remain runnable. */
+			ref->maliPending = true;
+			held = ref->surface;
+			heldGeneration = ref->maliGeneration;
+			surfaceHold(held);
+			IOLockUnlock(gSurfaceLock);
+			acquired = held->maliCpuLease->beginUserCpu(fTask, !readOnly, LMAL_MAX_WAIT_NS);
+			IOLockLock(gSurfaceLock);
+			ref = findRef(sid, false);
+			if (fClosing || !ref || ref->surface != held || ref->maliGeneration != heldGeneration ||
+			    !ref->maliPending || acquired) {
+				if (!acquired) {
+					held->maliCpuLease->endUserCpu(fTask, !readOnly);
+				}
+				/* Clear only the original ref (possibly detached/moved), never
+				 * the pending flag of a newer lookup for this same surface. */
+				for (uint32_t i = 0; i < fRefCount; ++i)
+					if (fRefs[i].maliGeneration == heldGeneration) fRefs[i].maliPending = false;
+				ret = acquired == LMAL_ETIMEDOUT ? kIOReturnTimeout : kIOReturnNotReady;
+			} else {
+				ref->maliPending = false;
+				if (readOnly) ref->maliReads = 1;
+				else ref->maliWrites = 1;
+			}
+		}
+	}
+	if (ret == kIOReturnSuccess) {
 		struct minisurf_shared * sh = ref->surface->shared();
 
 		if (!(options & kSurfaceLockReadOnly)) {
@@ -1755,26 +1896,25 @@ IOSurfaceRootUserClient::lockCommon(uint32_t sid, uint32_t options, user_addr_t 
 		}
 		seed = sh->seed;
 	}
+	if (held) surfaceUnhold(held);
 	IOLockUnlock(gSurfaceLock);
-	if (ref == NULL) {
-		return kIOReturnNotFound;
-	}
-	if (seedOut != 0) {
+	if (ret == kIOReturnSuccess && seedOut != 0) {
 		copyout(&seed, seedOut, sizeof(seed));
 	}
-	return kIOReturnSuccess;
+	release();
+	return ret;
 }
 
 IOReturn
 IOSurfaceRootUserClient::trapLock(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6)
 {
-	return lockCommon((uint32_t) (uintptr_t) p1, (uint32_t) (uintptr_t) p2, (user_addr_t) (uintptr_t) p3);
+	return lockCommon((uint32_t) (uintptr_t) p1, (uint32_t) (uintptr_t) p2, (user_addr_t) (uintptr_t) p3, false);
 }
 
 IOReturn
 IOSurfaceRootUserClient::trapUnlock(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6)
 {
-	return lockCommon((uint32_t) (uintptr_t) p1, (uint32_t) (uintptr_t) p2, (user_addr_t) (uintptr_t) p3);
+	return lockCommon((uint32_t) (uintptr_t) p1, (uint32_t) (uintptr_t) p2, (user_addr_t) (uintptr_t) p3, true);
 }
 
 /*

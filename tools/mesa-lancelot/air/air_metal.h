@@ -62,14 +62,11 @@ struct rwa_compute_info {
 struct rwa_device *rwa_device_open(char *why, size_t why_size);
 void rwa_device_close(struct rwa_device *device);
 
-/* What the driver should call the active renderer, as Mesa knows it. Never NULL.
- * Lancelot uses Panfrost/Bifrost; an explicit software request reports softpipe. */
+/* What the driver should call the GPU, as Mesa knows it ("Adreno 7c+ Gen 3"). Never NULL. */
 const char *rwa_device_name(struct rwa_device *device);
 
-/* Memory a shader can read and write, and the processor can too. Lancelot uses
- * wired normal-WB pages; the LMAL kernel performs explicit PoC maintenance before
- * and after synchronous DMA. A register barrier is not a cache flush.
- * Callers must not concurrently mutate/map-shared contents during a dispatch.
+/* Memory a shader can read and write, and the processor can too. The mapping is write
+ * combined, as the kernel makes it, so a driver has nothing to flush.
  *
  * It is also what an index buffer is (rwa_draw.index_buffer): Metal has one buffer
  * object and the application decides at the draw what the bytes in it are, so this makes
@@ -191,6 +188,27 @@ int rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned laye
 int rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,
 		     const unsigned origin[3], const unsigned size[3], void *bytes,
 		     size_t stride, char *why, size_t why_size);
+
+/*
+ * MTLBlitCommandEncoder's copies, done by the GPU in the order of the draws around them: a
+ * region of one texture into another (the same format, or one of the same texel size), a
+ * range of one buffer into another, and a range of a buffer filled with one byte. 0, or -1
+ * and a sentence.
+ */
+int rwa_texture_copy(struct rwa_texture *dst, unsigned dst_level, unsigned dst_slice,
+		     const unsigned dst_origin[3], struct rwa_texture *src, unsigned src_level,
+		     unsigned src_slice, const unsigned src_origin[3], const unsigned size[3],
+		     char *why, size_t why_size);
+int rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color,
+		     unsigned color_count, const float *clear_color, struct rwa_texture *depth,
+		     const float *clear_depth, const unsigned *clear_stencil, char *why,
+		     size_t why_size);
+int rwa_buffer_copy(struct rwa_buffer *dst, size_t dst_offset, struct rwa_buffer *src,
+		    size_t src_offset, size_t size, char *why, size_t why_size);
+/* -generateMipmapsForTexture:: every level below the base, filtered from the one above it */
+int rwa_texture_mipmaps(struct rwa_texture *texture, char *why, size_t why_size);
+int rwa_buffer_fill(struct rwa_buffer *buffer, size_t offset, size_t size, uint8_t value,
+		    char *why, size_t why_size);
 
 /*
  * What a depth/stencil texture holds, by aspect, which is the reading rwa_texture_read
@@ -580,6 +598,15 @@ int rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings 
 
 /* Wait for everything dispatched so far, with a real fence. 0, or -1 and a sentence. */
 int rwa_finish(struct rwa_device *device, char *why, size_t why_size);
+/* where the draws' time went since the last call, in ns: validation, binding checks, fixed
+ * state, the stages' resources, draw_vbo, unbinding; then the number of draws */
+void rwa_draw_profile(uint64_t out[7]);
+
+/* The work so far sent off without waiting, and the number of its last job; a wait for it. */
+uint64_t rwa_flush_seq(struct rwa_device *device);
+int rwa_wait_seq(uint64_t seq, int64_t timeout_ns);
+void rwa_submit_profile(uint64_t out[5]);
+int rwa_surface_seq(uint32_t surface, uint64_t seq);
 
 /*
  * ---------------------------------------------------------------------------------------
@@ -1081,6 +1108,20 @@ void rwa_depth_stencil_destroy(struct rwa_depth_stencil *state);
  *     governs them all when independent blending is off, so the second attachment would
  *     silently get the first one's equation.
  */
+/*
+ * The function constants of the NEXT rwa_render_create on this thread, per stage: Metal's index
+ * and the value's bytes as one little-endian word, which is the packing the translator reads
+ * (component i at bit i * width). Without a call every constant is zero, as before. A runtime
+ * that specializes nothing itself -- the window server's, where Apple's compiler service cannot
+ * read the library -- hands the values here instead of a specialized module.
+ */
+struct rwa_constant {
+	unsigned index;
+	uint64_t bits;
+};
+void rwa_render_constants(const struct rwa_constant *vertex, unsigned vertex_count,
+			  const struct rwa_constant *fragment, unsigned fragment_count);
+
 struct rwa_render *rwa_render_create(struct rwa_device *device,
 				     const void *vertex_bitcode, size_t vertex_size,
 				     const char *vertex_entry,
@@ -1304,6 +1345,13 @@ struct rwa_draw {
 	unsigned vertex_buffer_table_count;
 	const struct rwa_buffer_bind *fragment_buffer_table;
 	unsigned fragment_buffer_table_count;
+
+	/* Appended 27 October, in both copies: -setViewport:'s rectangle (x, y, width, height in
+	 * pixels; NULL: the whole attachment) and -setScissorRect: (x, y, width, height; NULL: none).
+	 * Both were ignored, and CoreAnimation draws a dirty region or part of an atlas through them:
+	 * a layer meant for one rectangle drew over the whole frame. */
+	const float *viewport;
+	const unsigned *scissor;
 };
 
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,

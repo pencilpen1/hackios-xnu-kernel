@@ -9,6 +9,7 @@
 #include <mach/mach_time.h>
 #include <time.h>
 #include <limits.h>
+#include <stdbool.h>
 /* Mesa uses CLOCK_MONOTONIC; LMAL wire deadlines use mach_absolute_time ns.
  * Convert through remaining duration, never assume the clocks share an epoch. */
 static uint64_t wire_deadline(uint64_t absolute)
@@ -36,7 +37,7 @@ static int kr_errno(kern_return_t kr) {
  }
  return -1;
 }
-int lm_transport_open(uintptr_t *out) {
+int legacy_transport_open(uintptr_t *out) {
  io_service_t service=IOServiceGetMatchingService(0,IOServiceMatching(LMAL_SERVICE_NAME));
  if (!service) {fprintf(stderr,"LMAL: no service %s in the registry\n",LMAL_SERVICE_NAME);errno=ENODEV;return -1;}
  io_connect_t conn=IO_OBJECT_NULL;
@@ -46,8 +47,8 @@ int lm_transport_open(uintptr_t *out) {
  fprintf(stderr,"LMAL: service opened\n");
  *out=conn;return 0;
 }
-void lm_transport_close(uintptr_t c){IOServiceClose((io_connect_t)c);}
-int lm_transport_call(uintptr_t c,uint32_t selector,void *p,size_t n){
+void legacy_transport_close(uintptr_t c){IOServiceClose((io_connect_t)c);}
+int legacy_transport_call(uintptr_t c,uint32_t selector,void *p,size_t n){
  if(selector==LMAL_SELECTOR_BO_WAIT&&n==sizeof(struct lmal_bo_wait)){
   struct lmal_bo_wait*q=p;q->absolute_monotonic_ns=wire_deadline(q->absolute_monotonic_ns);
  }
@@ -60,13 +61,15 @@ int lm_transport_call(uintptr_t c,uint32_t selector,void *p,size_t n){
  if(out!=n){errno=EPROTO;return -1;}
  return 0;
 }
-int lm_transport_map(uintptr_t c,uint32_t handle,uintptr_t *address,uint64_t *size){
+int legacy_transport_map(uintptr_t c,uint32_t handle,uintptr_t *address,uint64_t *size){
  mach_vm_address_t a=0;mach_vm_size_t n=0;
  kern_return_t kr=IOConnectMapMemory64((io_connect_t)c,handle,mach_task_self(),&a,&n,kIOMapAnywhere);
  if(kr!=KERN_SUCCESS)return kr_errno(kr);
  *address=(uintptr_t)a;*size=n;return 0;
 }
-int lm_transport_unmap(uintptr_t c,uint32_t handle,uintptr_t a){
+int legacy_transport_unmap(uintptr_t c,uint32_t handle,uintptr_t a){
  kern_return_t kr=IOConnectUnmapMemory64((io_connect_t)c,handle,mach_task_self(),(mach_vm_address_t)a);
  return kr==KERN_SUCCESS?0:kr_errno(kr);
 }
+
+#include "lancelot_queue_transport.inc"

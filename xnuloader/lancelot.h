@@ -523,6 +523,65 @@ lancelot_observe_pmic(const char *cmdline)
 	print("lancelot-pmic: before-handoff observation only; XNU/secure-world ownership still unproven, no GPU power/DMA\n");
 }
 
+static int lancelot_fwlease_locate(const char *line,const void *kernel,uint32_t bytes,struct lgh_slot_region *region) {
+    if(!region)return 0;
+    lgh_zero(region,sizeof(*region));
+    /* This runs before materializing another kernel into its RAM window. A
+     * failed/armed lifetime must not be escaped by dropping the opt-in. */
+    if(loader_gpu_lease||loader_gpu_lease_armed||loader_gpu_lease_failed)return 0;
+    int mode=lpm_requested_named(line,"lancelot_gpu_lease=");
+    if(!mode)return 1;
+    if(mode!=1||lgh_find_kernel_slot(kernel,bytes,region))return 0;
+    return 1;
+}
+static int lancelot_fwlease_prepare(const char *line,uint32_t mpidr,uint32_t off,uint64_t checkpoint) {
+    /* Once a producer has been invoked, failure can retain a real reference.
+     * Never escape that lifetime by retrying with the opt-in argument absent. */
+    if(loader_gpu_lease || loader_gpu_lease_armed || loader_gpu_lease_failed)return 0;
+    int mode=lpm_requested_named(line,"lancelot_gpu_lease=");
+    if(!mode)return 1;
+    if(mode!=1 || checkpoint || !mtk_usb_offer[2] || !loader_gpu_kernel_slot ||
+       !lgh_slot_template_valid(loader_gpu_kernel_slot))return 0;
+    const efi_guid guid=EFI_MTK_GPU_LEASE_GUID;
+    efi_mtk_gpu_lease *candidate=NULL;
+    if(EFI_ERROR(BS->locate_protocol(&guid,NULL,(void **)&candidate)) || !candidate ||
+       candidate->revision!=1 || candidate->size!=sizeof(*candidate)||
+       !candidate->prepare||!candidate->seal||!candidate->release)return 0;
+    lgh_zero(&loader_gpu_bundle,sizeof(loader_gpu_bundle));
+    loader_gpu_lease_failed=1;
+    efi_status s=candidate->prepare(candidate,mtk_usb_offer[2],mpidr,off,&loader_gpu_bundle.offer);
+    if(EFI_ERROR(s))return 0;
+    struct lgh_offer prepared=loader_gpu_bundle.offer;
+    if(prepared.state!=LGH_PREPARED || prepared.crc!=lgh_crc(&prepared,sizeof(prepared),52))return 0;
+    prepared.state=LGH_SEALED;lgh_seal_offer(&prepared);
+    if(!lgh_offer_valid(&prepared,mtk_usb_offer[2]))return 0;
+    loader_gpu_lease=candidate;loader_gpu_lease_failed=0;
+    print("lancelot-gpu-lease: prepared AP_ONLY MAINPLL reference; peer_permissions=UNVERIFIED DVFS_grant=0\n");
+    return 1;
+}
+static int lancelot_fwlease_seal(void) {
+    if(loader_gpu_lease_failed || loader_gpu_lease_armed)return 0;
+    if(!loader_gpu_lease)return 1;
+    if(!loader_gpu_kernel_slot||!lgh_slot_template_valid(loader_gpu_kernel_slot))return 0;
+    efi_status s=loader_gpu_lease->seal(loader_gpu_lease,loader_gpu_bundle.offer.nonce,&loader_gpu_bundle.offer);
+    if(EFI_ERROR(s)||!lgh_offer_valid(&loader_gpu_bundle.offer,mtk_usb_offer[2]))return 0;
+    loader_gpu_expected_offer=loader_gpu_bundle.offer;
+    loader_gpu_kernel_slot->bundle.offer=loader_gpu_bundle.offer;
+    loader_gpu_lease_armed=1;
+    clean_dcache((uint64_t)(uintptr_t)loader_gpu_kernel_slot,(uint64_t)(uintptr_t)loader_gpu_kernel_slot+sizeof(*loader_gpu_kernel_slot));
+    clean_dcache((uint64_t)(uintptr_t)&loader_gpu_kernel_slot,(uint64_t)(uintptr_t)&loader_gpu_kernel_slot+sizeof(loader_gpu_kernel_slot));
+    clean_dcache((uint64_t)(uintptr_t)&loader_gpu_lease_armed,(uint64_t)(uintptr_t)&loader_gpu_lease_armed+sizeof(loader_gpu_lease_armed));
+    clean_dcache((uint64_t)(uintptr_t)&loader_gpu_expected_offer,(uint64_t)(uintptr_t)&loader_gpu_expected_offer+sizeof(loader_gpu_expected_offer));
+    return 1;
+}
+static int lancelot_fwlease_finish(void) {
+    if(!loader_gpu_lease_armed)return 1;
+    if(!loader_gpu_kernel_slot||!lgh_slot_header_valid(loader_gpu_kernel_slot)||
+       !lgh_bytes_same(&loader_gpu_kernel_slot->bundle.offer,&loader_gpu_expected_offer,sizeof(loader_gpu_expected_offer)))return 0;
+    if(EFI_ERROR(loader_gpu_lease->release(loader_gpu_lease,&loader_gpu_kernel_slot->bundle.returned)))return 0;
+    loader_gpu_lease_armed=0;loader_gpu_lease=NULL;loader_gpu_kernel_slot=NULL;return 1;
+}
+
 static efi_status
 lancelot_boot(void)
 {

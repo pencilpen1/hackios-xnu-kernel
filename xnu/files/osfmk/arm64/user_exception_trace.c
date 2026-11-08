@@ -11,6 +11,9 @@
  */
 
 #include <arm/thread.h>
+#include <arm/cpu_data_internal.h>
+#include <arm/cpu_internal.h>
+#include <arm/machine_routines.h>
 #include <kern/debug.h>
 #include <kern/misc_protos.h>
 #include <kern/startup.h>
@@ -19,6 +22,9 @@
 #include <mach/exception_types.h>
 #include <mach/machine/thread_status.h>
 #include <string.h>
+#include <os/atomic_private.h>
+#include <pexpert/arm64/board_config.h>
+#include <arm64/lancelot_sgi_observation.h>
 #include <vm/vm_map.h>
 #include <vm/vm_shared_region.h>
 
@@ -190,14 +196,18 @@ ustacks_say(const char *line)
 	}
 }
 
+struct ustacks_snapshot {
+	uint64_t tid, pc, lr, fp;
+	uint64_t syscall, a0, a1, a2, wait_event;
+	uint32_t compact_tid;
+	int state;
+	char name[64];          /* (bsd_getthreadname() copies MAXTHREADNAMESIZE, 64) */
+};
+
 static void
-ustacks_task(task_t task, struct proc *proc)
+ustacks_task_sample(task_t task, struct proc *proc, struct ustacks_snapshot *snap,
+    unsigned capacity, unsigned thread_limit, uint32_t wanted_owner)
 {
-	static struct {
-		uint64_t tid, pc, lr, fp;
-		int state;
-		char name[64];          /* (bsd_getthreadname() copies MAXTHREADNAMESIZE, 64) */
-	} snap[USTACKS_MAX_THREADS];
 	char line[512];
 	int at;
 	vm_shared_region_t region;
@@ -205,12 +215,19 @@ ustacks_task(task_t task, struct proc *proc)
 	thread_t thread;
 	uint32_t slide = 0;
 	unsigned count = 0;
+	struct { uint64_t tid, wait_event; uint32_t ctid; int state; bool user_regs; char name[64]; } owner = {0};
 
 	task_lock(task);
 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
 		const arm_saved_state_t *state = get_user_regs(thread);
+		if (wanted_owner != 0 && thread_get_ctid(thread) == wanted_owner) {
+			owner.tid = thread_tid(thread); owner.ctid = wanted_owner;
+			owner.state = thread->state; owner.wait_event = thread->wait_event;
+			owner.user_regs = state != NULL && is_saved_state64(state);
+			thread_get_thread_name(thread, owner.name); owner.name[63] = 0;
+		}
 
-		if (count == USTACKS_MAX_THREADS || count >= ustacks_threads || state == NULL || !is_saved_state64(state)) {
+		if (count == capacity || count >= thread_limit || state == NULL || !is_saved_state64(state)) {
 			continue;
 		}
 		snap[count].name[0] = 0;
@@ -223,10 +240,16 @@ ustacks_task(task_t task, struct proc *proc)
 			continue;
 		}
 		snap[count].tid = thread_tid(thread);
+		snap[count].compact_tid = thread_get_ctid(thread);
 		snap[count].state = thread->state;
 		snap[count].pc = get_saved_state_pc(state);
 		snap[count].lr = get_saved_state_lr(state);
 		snap[count].fp = get_saved_state_fp(state);
+		snap[count].syscall = get_saved_state_reg(state, 16);
+		snap[count].a0 = get_saved_state_reg(state, 0);
+		snap[count].a1 = get_saved_state_reg(state, 1);
+		snap[count].a2 = get_saved_state_reg(state, 2);
+		snap[count].wait_event = thread->wait_event;
 		count++;
 	}
 	map = task->map;
@@ -234,7 +257,18 @@ ustacks_task(task_t task, struct proc *proc)
 		vm_map_reference(map);
 	}
 	task_unlock(task);
+	if (owner.ctid != 0) {
+		snprintf(line, sizeof(line), "ustacks-owner: %s[%d] thread=0x%llx compact_tid=%u "
+		    "state=%#x wait_event=0x%llx user_regs=%d name=%s owner_may_change=1\n",
+		    proc_name_address(proc), proc_pid(proc), owner.tid, owner.ctid,
+		    owner.state, owner.wait_event, owner.user_regs, owner.name[0] ? owner.name : "(unnamed)");
+		ustacks_say(line);
+	}
 	if (map == VM_MAP_NULL) {
+		return;
+	}
+	if (count == 0) {
+		vm_map_deallocate(map);
 		return;
 	}
 	region = vm_shared_region_get(task);
@@ -275,9 +309,21 @@ ustacks_task(task_t task, struct proc *proc)
 		}
 		snprintf(line + at, sizeof(line) - at, "\n");
 		ustacks_say(line);
+		snprintf(line, sizeof(line), "ustacks-state: %s[%d] thread=0x%llx compact_tid=%u state=%#x "
+		    "syscall_raw=0x%llx a0=0x%llx a1=0x%llx a2=0x%llx wait_event=0x%llx\n",
+		    proc_name_address(proc), proc_pid(proc), snap[i].tid, snap[i].compact_tid, snap[i].state,
+		    snap[i].syscall, snap[i].a0, snap[i].a1, snap[i].a2, snap[i].wait_event);
+		ustacks_say(line);
 	}
 	vm_map_switch(old_map);
 	vm_map_deallocate(map);
+}
+
+static void
+ustacks_task(task_t task, struct proc *proc)
+{
+	static struct ustacks_snapshot snap[USTACKS_MAX_THREADS];
+	ustacks_task_sample(task, proc, snap, USTACKS_MAX_THREADS, ustacks_threads, 0);
 }
 
 /*
@@ -438,3 +484,207 @@ ustacks_init(void)
 	thread_call_enter_delayed(ustacks_call, deadline);
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, ustacks_init);
+
+/* One observation for the native data-volume bring-up. It uses the existing
+ * saved-user-state reader, leaves all CPUs and GPU policy running, and never
+ * schedules another pass. Explicit ustacks boot arguments retain their own
+ * observer and suppress this automatic diagnostic. */
+extern void lancelot_data_startup_diagnostics(void);
+extern uint32_t lancelot_data_current_mutex_state(void);
+uint32_t lancelot_mmc_mutex_state(const void *address);
+uint32_t
+lancelot_mmc_mutex_state(const void *address)
+{
+#if !LCK_MTX_USE_ARCH
+	const lck_mtx_t *lock = address;
+	return os_atomic_load(&lock->lck_mtx.data, relaxed);
+#else
+	(void)address;
+	return UINT32_MAX;
+#endif
+}
+
+extern uint64_t gic_v3_irq_peek_cpu(unsigned cpu);
+extern uint32_t loader_log_is_busy(void);
+size_t lancelot_mmc_format_irq(char *,size_t);
+size_t
+lancelot_mmc_format_irq(char *out,size_t capacity)
+{
+    struct cpu_irq_sample {
+        cpu_data_t *cpu;
+        thread_t active;
+        void *state;
+        uint64_t iar;
+        uint32_t ast,signal;
+        bool running;
+    } samples[8]={0};
+    uint32_t initial_mutex=lancelot_data_current_mutex_state();
+    uint32_t owner=initial_mutex==UINT32_MAX?0:initial_mutex&0x0fffffffu;
+    /* The unsafe lookup result is used only for pointer comparison. Never
+     * dereference a thread whose lifetime has not been pinned. */
+    thread_t candidate=owner?ctid_get_thread_unsafe((ctid_t)owner):THREAD_NULL;
+    unsigned owner_mask=0,irq_mask=0,chosen=0xff,flags=0;
+    for(unsigned i=0;i<8&&i<MAX_CPUS;i++) {
+        cpu_data_t *cpu=cpu_datap(i);
+        if(!cpu)continue;
+        samples[i].cpu=cpu;
+        samples[i].active=os_atomic_load(&cpu->cpu_active_thread,relaxed);
+        samples[i].state=os_atomic_load(&cpu->cpu_int_state,relaxed);
+        samples[i].ast=os_atomic_load(&cpu->cpu_pending_ast,relaxed);
+        samples[i].signal=os_atomic_load(&cpu->cpu_signal,relaxed);
+        samples[i].running=os_atomic_load(&cpu->cpu_running,relaxed);
+#if defined(GENERIC_GIC_V3_IRQ)
+        samples[i].iar=gic_v3_irq_peek_cpu(i);
+#endif
+        if(candidate&&samples[i].active==candidate)owner_mask|=1u<<i;
+        if(samples[i].state||(samples[i].iar&(1ull<<63)))irq_mask|=1u<<i;
+    }
+    for(unsigned i=0;i<8;i++)if(owner_mask&(1u<<i)){chosen=i;break;}
+    if(chosen==0xff)for(unsigned i=0;i<8;i++)if(irq_mask&(1u<<i)){chosen=i;flags|=0x10;break;}
+    uint64_t pc=0;uint32_t ast=0,signal=0,intid=0x3ff;
+    bool consistent=true;
+    if(chosen<8) {
+        struct cpu_irq_sample *sample=&samples[chosen];
+        ast=sample->ast;signal=sample->signal;
+        if(owner_mask&(1u<<chosen))flags|=8;
+        if(sample->running)flags|=0x20;
+        if(sample->iar&(1ull<<63)) {
+            flags|=1;intid=(uint32_t)(sample->iar&0xffffff);
+            if(intid>=1020)intid=0x3ff;
+        }
+        if(sample->state) {
+            flags|=2;arm_saved_state_t saved={0};
+            /* The saved interrupt frame can live on a thread's wired stack.
+             * A no-fault copy avoids following an unmapped or changed frame. */
+            if(ml_nofault_copy((vm_offset_t)sample->state,(vm_offset_t)&saved,sizeof(saved))==sizeof(saved)&&is_saved_state64(&saved)) {
+                pc=get_saved_state_pc(&saved);flags|=4;
+            }else flags|=0x80;
+        }
+        consistent=sample->active==os_atomic_load(&sample->cpu->cpu_active_thread,relaxed)&&
+            sample->state==os_atomic_load(&sample->cpu->cpu_int_state,relaxed);
+#if defined(GENERIC_GIC_V3_IRQ)
+        consistent=consistent&&sample->iar==gic_v3_irq_peek_cpu(chosen);
+#endif
+    }
+    consistent=consistent&&initial_mutex!=UINT32_MAX&&owner==(lancelot_data_current_mutex_state()&0x0fffffffu);
+    if(loader_log_is_busy())flags|=0x40;
+    /* Advisory boundary comparison, not an atomic CPU-wide stackshot. With
+     * 28-bit owners, eight CPUs, 32-bit AST/signals, a 64-bit PC and 10-bit
+     * interrupt IDs, all ten hexadecimal fields fit in 60 payload bytes. */
+    int n=snprintf(out,capacity,"%x,%x,%x,%x,%x,%x,%x,%llx,%x,%x",
+        consistent,owner,owner_mask,irq_mask,chosen,ast,signal,pc,intid,flags);
+    return n>0&&(size_t)n<capacity&&n<=60?(size_t)n:0;
+}
+
+size_t lancelot_mmc_format_sgi(unsigned,char *,size_t);
+extern _Atomic int debugger_cpu;
+extern debugger_op debugger_current_op;
+extern boolean_t debugger_allcpus_halted,debugger_safe_to_return;
+extern char *debug_buf_base,*debug_buf_ptr;
+extern unsigned int debug_buf_size;
+extern uint32_t loader_log_is_linear(void);
+size_t lancelot_debug_format(char *,size_t);
+size_t
+lancelot_debug_format(char *out,size_t capacity)
+{
+    if(!out||!capacity)return 0;
+    int cpu=os_atomic_load(&debugger_cpu,relaxed);
+    unsigned op=os_atomic_load(&debugger_current_op,relaxed);
+    unsigned entries=os_atomic_load(&kernel_debugger_entry_count,relaxed);
+    uintptr_t base=(uintptr_t)os_atomic_load(&debug_buf_base,relaxed);
+    uintptr_t end=(uintptr_t)os_atomic_load(&debug_buf_ptr,relaxed);
+    unsigned size=os_atomic_load(&debug_buf_size,relaxed),bytes=0;
+    unsigned flags=(panic_active()?1:0)|(os_atomic_load(&debugger_allcpus_halted,relaxed)?2:0)|
+        (os_atomic_load(&debugger_safe_to_return,relaxed)?4:0)|
+        (!os_atomic_load(&not_in_kdp,relaxed)?8:0)|(loader_log_is_linear()?16:0);
+    if(base&&end>=base&&size<=256*1024&&end-base<=size)bytes=(unsigned)(end-base);
+    else if(base||end||size)flags|=64;
+    int consistent=cpu==os_atomic_load(&debugger_cpu,relaxed)&&op==(unsigned)os_atomic_load(&debugger_current_op,relaxed)&&
+        entries==os_atomic_load(&kernel_debugger_entry_count,relaxed)&&
+        base==(uintptr_t)os_atomic_load(&debug_buf_base,relaxed)&&end==(uintptr_t)os_atomic_load(&debug_buf_ptr,relaxed);
+    unsigned bounded_cpu=cpu>=0&&cpu<8?(unsigned)cpu:255;
+    int n=snprintf(out,capacity,"%x,%x,%x,%x,%x,%x",consistent,bounded_cpu,op,entries,bytes,flags);
+    return n>0&&(size_t)n<capacity&&n<=60?(size_t)n:0;
+}
+size_t
+lancelot_mmc_format_sgi(unsigned cpu,char *out,size_t capacity)
+{
+#if defined(GENERIC_GIC_V3_IRQ)
+    struct lsg_sample v={0};
+    if(!out||!capacity||cpu>=8||!lancelot_sgi_read(cpu,&v))return 0;
+    uint64_t now=__builtin_arm_rsr64("CNTVCT_EL0"),freq=__builtin_arm_rsr64("CNTFRQ_EL0"),age=0;
+    if(v.depth) {
+        if(v.began&&now>=v.began&&freq>=1000000&&freq<=1000000000) {
+            uint64_t ticks=now-v.began;
+            age=(ticks/freq)*1000000+(ticks%freq)*1000000/freq;
+        }else v.consistent=0;
+    }
+    uint32_t bounded_age=age>UINT32_MAX?UINT32_MAX:(uint32_t)age;
+    /* Eight hexadecimal fields have a 60-byte maximum. Callback/argument
+     * are values only: the reader never follows either pointer. */
+    int n=snprintf(out,capacity,"%x,%x,%x,%x,%x,%llx,%llx,%x",
+        v.consistent,cpu,v.depth>15?15:v.depth,v.stage,v.signal,v.callback,v.argument,bounded_age);
+    return n>0&&(size_t)n<capacity&&n<=60?(size_t)n:0;
+#else
+    (void)cpu;(void)out;(void)capacity;return 0;
+#endif
+}
+
+static void
+lancelot_data_startup_stacks(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	static const char *const wanted[] = {
+		"SpringBoard", "backboardd", "runningboardd", "launchd", "logd", "logd_helper", "cfprefsd", "kernel_task"
+	};
+	task_t found[8], task;
+	unsigned count = 0;
+	printf("lancelot-startup-stacks: begin one_shot=1 maximum_tasks=8 maximum_threads_per_task=8\n");
+	lancelot_data_startup_diagnostics();
+	uint32_t owner_ctid = lancelot_data_current_mutex_state() & 0x0fffffffu;
+	ustacks_top();
+	lck_mtx_lock(&tasks_threads_lock);
+	queue_iterate(&tasks, task, task_t, tasks) {
+		struct proc *proc = get_bsdtask_info(task);
+		if (proc == NULL || count == 8) {
+			continue;
+		}
+		for (unsigned i = 0; i < sizeof(wanted) / sizeof(wanted[0]); i++) {
+			if (strcmp(proc_name_address(proc), wanted[i]) == 0) {
+				task_reference(task);
+				found[count++] = task;
+				break;
+			}
+		}
+	}
+	lck_mtx_unlock(&tasks_threads_lock);
+	struct ustacks_snapshot snap[8];
+	for (unsigned i = 0; i < count; i++) {
+		struct proc *proc = get_bsdtask_info(found[i]);
+		if (proc != NULL) {
+			ustacks_task_sample(found[i], proc, snap, 8, 8, owner_ctid);
+		}
+		task_deallocate(found[i]);
+	}
+	printf("lancelot-startup-stacks: end tasks=%u one_shot=1 reschedule=0\n", count);
+}
+
+static void
+lancelot_data_startup_stacks_init(void)
+{
+	uint32_t enabled = 0, profile = 0;
+	char explicit_name[32];
+	if (PE_parse_boot_argn("ustacks", explicit_name, sizeof(explicit_name)) ||
+	    !PE_parse_boot_argn("lancelot_data", &enabled, sizeof(enabled)) || enabled != 1 ||
+	    !PE_parse_boot_argn("lancelot_profile", &profile, sizeof(profile)) || profile != 2) {
+		return;
+	}
+	thread_call_t call = thread_call_allocate(lancelot_data_startup_stacks, NULL);
+	if (call == NULL) {
+		printf("lancelot-startup-stacks: unavailable allocation_failed=1 one_shot=1\n");
+		return;
+	}
+	uint64_t deadline;
+	clock_interval_to_deadline(20, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(call, deadline);
+}
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, lancelot_data_startup_stacks_init);

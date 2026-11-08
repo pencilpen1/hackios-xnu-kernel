@@ -18,6 +18,7 @@
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <pexpert/device_tree.h>
 #include <sys/redwood_input.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
@@ -27,6 +28,548 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_putc(char c);
 extern void redwood_tl(const char *format, ...) __printflike(1, 2);
 extern bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);
+#include "lancelot_cpufreq.h"
+#include "lancelot_cpufreq_thermal.h"
+#include "lancelot_cpufreq_sspm.h"
+#include "lancelot_mali_pmic.h"
+#include "lancelot_pwrap.h"
+#include "lancelot_storage.h"
+
+/* No CPU thermal backend exists here yet. Report this honestly; neither an
+ * inherited CPU-DVFS repository nor Android's calibration LOG is a live XNU
+ * thermal provider. A future provider supplies these three bounded callbacks. */
+__attribute__((weak)) int
+lancelot_cpu_thermal_start(uint64_t deadline_ns __unused)
+{
+	return -19; /* ENODEV; no MMIO/IPI/resource acquisition. */
+}
+
+__attribute__((weak)) int
+lancelot_cpu_thermal_read(struct lcf_thermal_reading *reading)
+{
+	bzero(reading, sizeof(*reading));
+	return -19;
+}
+
+__attribute__((weak)) void
+lancelot_cpu_thermal_stop(void)
+{
+}
+
+static vm_offset_t lcf_sram, lcf_pll, lcf_div;
+static uint32_t lcf_original[2], lcf_owned[2];
+static uint32_t lcf_pvt[3][16], lcf_method[3][16];
+static bool lcf_active;
+static bool lcf_once;
+static struct lcs_state lcf_startup;
+static vm_offset_t lcf_mailbox[LCS_BANKS], lcf_wrap;
+static struct lmp_pmic_state lcf_cpu_pmic;
+static uint32_t lcf_boot_backup[LCF_SRAM_SIZE/4];
+static struct lmp_cpu_rails lcf_last_rails;
+static uint64_t lcf_last_rails_ns;
+
+static uint64_t
+lcf_now_ns(void)
+{
+	uint64_t ns;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns;
+}
+
+static const char *
+lcf_thermal_name(enum lcf_thermal_policy policy)
+{
+	return policy == LCF_THERMAL_OPTIONAL_OFF ? "unavailable_optional" :
+	    policy == LCF_THERMAL_LIVE ? "live" : "limit_no_boost";
+}
+
+static enum lcf_thermal_policy
+lcf_thermal_eval(bool started, struct lcf_thermal_reading *reading, int *error)
+{
+	bzero(reading, sizeof(*reading));
+	*error = started ? lancelot_cpu_thermal_read(reading) : 0;
+	return lcf_thermal_classify(started, *error, reading, lcf_now_ns());
+}
+
+static bool
+lcf_thermal_begin(void)
+{
+	uint64_t now = lcf_now_ns(), deadline;
+	int error = -22;
+	if (now <= UINT64_MAX - LCF_THERMAL_START_NS) {
+		deadline = now + LCF_THERMAL_START_NS;
+		error = lancelot_cpu_thermal_start(deadline);
+		/* Do not publish late initialization as success, even if its provider
+		 * violated the deadline contract. The provider itself must bound waits. */
+		if (!error && lcf_now_ns() > deadline) error = -60;
+	}
+	if (error) lancelot_cpu_thermal_stop(); /* also release partial startup */
+	printf("lancelot-cpufreq-thermal: start_error=%d started=%u optional=1 blocks_cpufreq=0 startup_budget_ms=100\n",
+	    error, error == 0);
+	return error == 0;
+}
+
+static uint32_t
+lcf_read(unsigned offset)
+{
+	uint32_t value = *(volatile uint32_t *)(lcf_sram + offset);
+	__asm__ volatile("dsb sy" ::: "memory");
+	return value;
+}
+
+static void
+lcf_snapshot(struct lcf_snapshot *s)
+{
+	bzero(s, sizeof(*s));
+	for (unsigned i=0;i<4;i++) s->guard[i]=lcf_read(i*4);
+	s->guard[4]=lcf_read(0x2a0);
+	for (unsigned c=0;c<3;c++) {
+		for (unsigned i=0;i<16;i++) {
+			s->pvt[c][i]=lcf_read(0x10+c*0x90+i*4);
+			s->method[c][i]=lcf_read(0x50+c*0x90+i*4);
+		}
+		s->sentinel[c]=lcf_read(0x90+c*0x90);
+		s->current[c]=lcf_read(LCF_CURRENT+c*4);
+	}
+	for (unsigned c=0;c<2;c++) {
+		s->request[c]=lcf_read(LCF_REQUEST+c*4);
+		s->limit[c]=lcf_read(LCF_LIMIT+c*4);
+		s->sched[c]=lcf_read(0x3a4+c*4);
+	}
+	s->sched_disabled=lcf_read(0x2bc); s->stress=lcf_read(0x2c0); s->pause=lcf_read(0x11d8);
+	for (unsigned i=0;i<sizeof(s->cci)/sizeof(s->cci[0]);i++) s->cci[i]=lcf_read(LCF_CCI_MAP+i*4);
+	for (unsigned i=0;i<LCF_LOG_COUNT;i++) {
+		unsigned off=LCF_LOG+i*20;
+		uint32_t hi=lcf_read(off+4), lo=lcf_read(off);
+		if (hi!=lcf_read(off+4) || lo!=lcf_read(off)) continue;
+		uint64_t stamp=(uint64_t)hi<<32 | lo;
+		if (stamp>s->latest_log) s->latest_log=stamp;
+	}
+	for (unsigned i=0;i<4;i++) s->guard_end[i]=lcf_read(i*4);
+	s->guard_end[4]=lcf_read(0x2a0);
+}
+
+/* Accept only the live ARMPLL mux and explicitly defined dividers.
+ * Samples spanning an active firmware transition are retried, not interpreted
+ * as a frequency. The existing Mali observer continues the independent log. */
+static bool
+lcf_clock_registers(unsigned c, uint32_t raw[3])
+{
+	if (c>=3 || !raw) return false;
+	unsigned off=c==0?0x218:c==1?0x208:0x228;
+	unsigned divoff=c<2?0x2a0+4*c:0x2e0;
+	uint32_t con0=*(volatile uint32_t *)(lcf_pll+off);
+	uint32_t con1=*(volatile uint32_t *)(lcf_pll+off+4);
+	uint32_t cfg=*(volatile uint32_t *)(lcf_div+divoff);
+	__asm__ volatile("dsb sy" ::: "memory");
+	if (con0!=*(volatile uint32_t *)(lcf_pll+off) || con1!=*(volatile uint32_t *)(lcf_pll+off+4) ||
+	    cfg!=*(volatile uint32_t *)(lcf_div+divoff)) return false;
+	raw[0]=con0;raw[1]=con1;raw[2]=cfg;
+	return true;
+}
+
+static bool
+lcf_clock_observe(unsigned c, uint64_t *hz)
+{
+	uint32_t raw[3];
+	return lcf_clock_registers(c,raw) && lcf_clock_hz(raw[0],raw[1],raw[2],hz);
+}
+
+static bool
+lcf_clocks_match(const struct lcf_snapshot *s)
+{
+	for (unsigned c=0;c<3;c++) {
+		uint64_t hz;
+		if (s->current[c]>=16 || !lcf_clock_observe(c,&hz) ||
+		    lcf_read(LCF_CURRENT+c*4)!=s->current[c]) return false;
+		uint64_t want=(uint64_t)lcf_mhz[c][s->current[c]]*1000000;
+		if (hz+1000000<want || hz>want+1000000) return false;
+	}
+	return true;
+}
+
+static int
+lcf_mail_read(void *cookie __unused, enum lcs_bank bank, unsigned off, uint32_t *value)
+{
+	if (!value || !lcs_access(bank,off) || !lcf_mailbox[bank]) return LCS_EINVAL;
+	*value=*(volatile uint32_t *)(lcf_mailbox[bank]+off);
+	__asm__ volatile("dsb sy" ::: "memory");
+	return 0;
+}
+
+static int
+lcf_mail_write(void *cookie __unused, enum lcs_bank bank, unsigned off, uint32_t value)
+{
+	if (!lcs_access(bank,off) || !lcf_mailbox[bank]) return LCS_EINVAL;
+	/* The portable core enforces the narrower state/CPU-pin write allowlist. */
+	*(volatile uint32_t *)(lcf_mailbox[bank]+off)=value;
+	__asm__ volatile("dsb sy" ::: "memory");
+	return 0;
+}
+
+static uint64_t lcf_io_now(void *cookie __unused) {return lcf_now_ns();}
+static void lcf_io_wait(void *cookie __unused, unsigned us) {delay_for_interval(us,NSEC_PER_USEC);}
+static int
+lcf_wrap_read(void *cookie __unused, uint32_t off, uint32_t *value)
+{
+	if (!lcf_wrap || !value || off>0xffc || (off&3)) return LMP_EINVAL;
+	*value=*(volatile uint32_t *)(lcf_wrap+off);
+	__asm__ volatile("dsb sy" ::: "memory");
+	return 0;
+}
+static int
+lcf_wrap_write(void *cookie __unused, uint32_t off, uint32_t value)
+{
+	/* Read transactions require CMD and VLDCLR only; no PWRAP setup writes. */
+	if (!lcf_wrap || (off!=LMP_PMIC_WACS2_CMD && off!=LMP_PMIC_WACS2_VLDCLR) ||
+	    (off==LMP_PMIC_WACS2_CMD && (value&0x80000000u)) ||
+	    (off==LMP_PMIC_WACS2_VLDCLR && value!=1)) return LMP_EINVAL;
+	*(volatile uint32_t *)(lcf_wrap+off)=value;
+	__asm__ volatile("dsb sy" ::: "memory");
+	return 0;
+}
+static void lcf_wrap_poison(void *cookie __unused) {(void)lancelot_pwrap_poison();}
+
+static int
+lcf_rail_read(struct lmp_cpu_rails *rails)
+{
+	if (!lcf_wrap) return LMP_ENODEV;
+	if (!lcf_cpu_pmic.validated) {
+		struct lmp_pmic_registers regs;
+		lmp_pmic_mt6358_registers(&regs);
+		const struct lmp_pmic_io io={.read32=lcf_wrap_read,.write32=lcf_wrap_write,
+		    .now_ns=lcf_io_now,.delay_us=lcf_io_wait,.timeout_ns=LMP_PMIC_WACS_TIMEOUT_NS,
+		    .acquire=lancelot_pwrap_acquire,.release=lancelot_pwrap_release,.poison=lcf_wrap_poison};
+		int e=lmp_pmic_probe(&lcf_cpu_pmic,&io,&regs);
+		if (e) return e;
+	}
+	return lmp_pmic_cpu_rails(&lcf_cpu_pmic,rails);
+}
+
+static bool
+lcf_board_profile(void)
+{
+	/* The existing lancelot boot contract plus the audited CPU_LEVEL_6 profile
+	 * for this device. Not a guessed efuse MMIO address or bootarg voltage table. */
+	DTEntry chosen;const void *prop;unsigned bytes;struct lancelot_storage offer={0};
+	if (SecureDTLookupEntry(NULL,"/chosen",&chosen)!=kSuccess ||
+	    SecureDTGetProperty(chosen,"lancelot-emmc",&prop,&bytes)!=kSuccess ||
+	    (bytes!=LANCELOT_STORAGE_V1_SIZE && bytes!=sizeof(offer))) return false;
+	memcpy(&offer,prop,bytes);
+	if (offer.magic!=LANCELOT_STORAGE_MAGIC || offer.size!=bytes ||
+	    !((offer.version==1 && bytes==LANCELOT_STORAGE_V1_SIZE) || (offer.version==2 && bytes==sizeof(offer))) ||
+	    offer.mmio!=0x11230000 || offer.partition_bytes!=LANCELOT_UBUNTU_BYTES ||
+	    !offer.partition_offset || (offer.partition_offset&511) ||
+	    offer.partition_offset>=(UINT64_C(1)<<41)-LANCELOT_UBUNTU_BYTES) return false;
+	const ml_topology_info_t *t=ml_get_topology_info();unsigned seen=0;
+	if (t->num_cpus!=8) return false;
+	for (unsigned i=0;i<8;i++) {
+		unsigned p=t->cpus[i].phys_id;
+		if ((p&~0x700u) || (seen&(1u<<(p>>8)))) return false;
+		seen|=1u<<(p>>8);
+	}
+	return seen==255;
+}
+
+static bool
+lcf_voltage_matches(const struct lcf_snapshot *s)
+{
+	struct lmp_cpu_rails rails;
+	if (lcf_rail_read(&rails)) return false;
+	for (unsigned c=0;c<2;c++) {
+		if (s->current[c]>=16 || s->current[2]>=16) return false;
+		unsigned selector=s->pvt[c][s->current[c]]>>16;
+		/* CCI shares the LL(VPROC12) rail, not the large-core rail. */
+		if (!c && (s->pvt[2][s->current[2]]>>16)>selector) selector=s->pvt[2][s->current[2]]>>16;
+		if (selector>96 || rails.vproc_uv[c]<500000u+selector*6250u) return false;
+	}
+	if (!lcf_clocks_match(s)) return false; /* reject a transition spanning the rail read */
+	lcf_last_rails=rails;
+	lcf_last_rails_ns=lcf_now_ns();
+	return true;
+}
+
+static int
+lcf_bootstrap(void)
+{
+	if (!lcf_board_profile()) return LCS_EPROTO;
+	/* GPU init registers the existing shared AP WACS2 handoff after the CPU
+	 * thread is launched. Wait boundedly, without changing the user's input file. */
+	uint64_t begin=lcf_now_ns();
+	for (unsigned i=0;!lancelot_pwrap_available();i++) {
+		uint64_t now=lcf_now_ns();
+		if (i>=100 || now<begin || now-begin>=UINT64_C(5000000000)) return LCS_ETIMEDOUT;
+		delay_for_interval(50,NSEC_PER_MSEC);
+	}
+	lcf_wrap=ml_io_map(LMP_PMIC_WRAP_BASE_PHYS,0x1000);
+	struct lmp_cpu_rails rails;
+	int e=lcf_rail_read(&rails);
+	printf("lancelot-cpufreq-rails: probe=%d chip=%x routing=LL12_L11 read_transactions=1 CPU_rail_writes=0\n",e,lcf_cpu_pmic.chip_id);
+	if (e) return e;
+	printf("lancelot-cpufreq-rails: initial_vproc_uv=%u/%u vsram_uv=%u/%u\n",
+	    rails.vproc_uv[0],rails.vproc_uv[1],rails.vsram_uv[0],rails.vsram_uv[1]);
+	unsigned initial[2]={16,16};
+	for (unsigned c=0;c<2;c++) {
+		uint32_t raw[3]={0};bool frequency_known=false;
+		bool stable=lcf_clock_registers(c,raw);
+		bool valid=stable && lcf_initial_request(c,raw[0],raw[1],raw[2],&initial[c],&frequency_known);
+		printf("lancelot-cpufreq-initial: cluster=%u stable=%u con0=%x con1=%x cfg=%x divider=%u request=%u initial_frequency_known=%u valid=%u\n",
+		    c,stable,raw[0],raw[1],raw[2],(raw[2]>>17)&31,initial[c],frequency_known,valid);
+		if (!valid) return LCS_EPROTO;
+	}
+	/* Live FDT-confirmed v1 mailboxes. No cfg/reset/clock/MPU writes. */
+	static const uint64_t pa[LCS_BANKS]={LCF_SRAM_PA,0x10450000,0x10451000,0x10460000,0x10461000,0x10470000,0x10471000};
+	for (unsigned b=0;b<LCS_BANKS;b++) {
+		lcf_mailbox[b]=b==LCS_REPO?lcf_sram:ml_io_map(pa[b],b==LCS_CTRL0||b==LCS_CTRL1||b==LCS_CTRL2?8:128);
+		if (!lcf_mailbox[b]) return LCS_EIO;
+	}
+	lcf_startup.io=(struct lcs_io){.read32=lcf_mail_read,.write32=lcf_mail_write,.now_ns=lcf_io_now,.wait_us=lcf_io_wait};
+	e=lcs_cold_start(&lcf_startup,initial,lcf_boot_backup);
+	printf("lancelot-cpufreq-init: error=%d stage=%u commands=%u ack=%d poisoned=%u bad_mbox=%u slot=%u expected=%x got=%x profile=CPU_LEVEL_6 initial=%u/%u\n",
+	    e,lcf_startup.stage,lcf_startup.commands,lcf_startup.ack,lcf_startup.poisoned,
+	    lcf_startup.bad_bank,lcf_startup.bad_slot,lcf_startup.bad_expected,lcf_startup.bad_value,initial[0],initial[1]);
+	if (lcf_startup.backed_up) {
+		printf("lancelot-cpufreq-before: guard=%x/%x current=%x/%x/%x request=%x/%x bytes=%u\n",
+		    lcf_boot_backup[0],lcf_boot_backup[0x2a0/4],lcf_boot_backup[LCF_CURRENT/4],
+		    lcf_boot_backup[LCF_CURRENT/4+1],lcf_boot_backup[LCF_CURRENT/4+2],
+		    lcf_boot_backup[LCF_REQUEST/4],lcf_boot_backup[LCF_REQUEST/4+1],LCF_SRAM_SIZE);
+	}
+	if (e) return e;
+	/* Guard/table publication and four ACKs are not hardware admission. */
+	struct lcf_snapshot first, now;
+	lcf_snapshot(&first);begin=lcf_now_ns();
+	for (unsigned i=0;i<40;i++) {
+		delay_for_interval(50,NSEC_PER_MSEC);
+		if ((e=lcs_receive(&lcf_startup))) break;
+		lcf_snapshot(&now);
+		/* lcs_cold_start readback-proved a zero log before INIT. A new nonzero
+		 * record is sufficient at an unchanged OPP; it need not tick periodically. */
+		if (lcf_snapshot_valid(&now) && now.latest_log && now.latest_log>=first.latest_log &&
+		    now.request[0]==initial[0] && now.request[1]==initial[1] &&
+		    now.current[0]==initial[0] && now.current[1]==initial[1] &&
+		    !memcmp(first.pvt,now.pvt,sizeof(now.pvt)) && !memcmp(first.method,now.method,sizeof(now.method)) &&
+		    lcf_clocks_match(&now) && lcf_voltage_matches(&now)) {
+			lcf_startup.stage=7;
+			printf("lancelot-cpufreq-init: live_feedback=1 log=%llu current=%u/%u/%u rx=%u independent_PLL_and_rails=1\n",
+			    now.latest_log,now.current[0],now.current[1],now.current[2],lcf_startup.rx_count);
+			return 0;
+		}
+		uint64_t at=lcf_now_ns();if (at<begin || at-begin>=LCS_ACK_NS) break;
+	}
+	/* Preserve the actual failed feedback snapshot. The outer pre-init sample
+	 * must not be printed as if it were the firmware's post-command state. */
+	lcf_snapshot(&now);
+	struct lmp_cpu_rails failed_rails={0};int rail_error=lcf_rail_read(&failed_rails);
+	printf("lancelot-cpufreq-init-failure: error=%d reject=%x log=%llu/%llu current=%u/%u/%u request=%u/%u rail_error=%d vproc_uv=%u/%u vsram_uv=%u/%u\n",
+	    e?e:LCS_ETIMEDOUT,lcf_snapshot_reject(&now),first.latest_log,now.latest_log,
+	    now.current[0],now.current[1],now.current[2],now.request[0],now.request[1],rail_error,
+	    failed_rails.vproc_uv[0],failed_rails.vproc_uv[1],failed_rails.vsram_uv[0],failed_rails.vsram_uv[1]);
+	for (unsigned c=0;c<3;c++) {
+		uint32_t raw[3]={0};bool stable=lcf_clock_registers(c,raw);
+		printf("lancelot-cpufreq-failed-clock: cluster=%u stable=%u con0=%x con1=%x cfg=%x\n",c,stable,raw[0],raw[1],raw[2]);
+	}
+	lcf_startup.poisoned=true;
+	return e?e:LCS_ETIMEDOUT;
+}
+
+static bool
+lcf_write_request(unsigned c, uint32_t value)
+{
+	/* AP owns only these two request words. A changed owner or foreign writer
+	 * stops control; never overwrite a firmware table or a PPM constraint. */
+	if (c>=2 || !lcf_request_allowed(value,lcf_read(LCF_LIMIT+c*4)) ||
+	    lcf_read(LCF_REQUEST+c*4)!=lcf_owned[c]) return false;
+	if (value==lcf_owned[c]) return true; /* No repeated MMIO writes for an unchanged vote. */
+	*(volatile uint32_t *)(lcf_sram+LCF_REQUEST+c*4)=value;
+	__asm__ volatile("dsb sy" ::: "memory");
+	lcf_owned[c]=value;
+	return lcf_read(LCF_REQUEST+c*4)==value;
+}
+
+static void
+lcf_quiesce(void)
+{
+	if (!os_atomic_xchg(&lcf_active, false, acq_rel)) return;
+	if (lcf_startup.poisoned || !lcf_startup.claimed) return;
+	/* A firmware reset or table replacement revokes the old request contract.
+	 * In that case even restoration would write into unowned state. */
+	struct lcf_snapshot now;
+	lcf_snapshot(&now);
+	if (!lcf_snapshot_valid(&now)) return;
+	for (unsigned c=0;c<3;c++) for (unsigned i=0;i<16;i++)
+		if (now.pvt[c][i]!=lcf_pvt[c][i] || now.method[c][i]!=lcf_method[c][i]) return;
+	for (unsigned c=0;c<2;c++) (void)lcf_write_request(c, lcf_original[c]);
+}
+
+static void
+lcf_thread(void *arg __unused, wait_result_t wr __unused)
+{
+	struct lcf_snapshot first, now;
+	uint64_t previous[MAX_CPUS]={0}, then;
+	const ml_topology_info_t *topology=ml_get_topology_info();
+	/* Thermal failure never returns from this thread or changes CPU admission. */
+	bool thermal_started = lcf_thermal_begin();
+	struct lcf_thermal_reading thermal;
+	int thermal_error;
+	enum lcf_thermal_policy thermal_policy = lcf_thermal_eval(thermal_started, &thermal, &thermal_error);
+	printf("lancelot-cpufreq-thermal: policy=%s read_error=%d calibrated=%u at_ns=%llu max_mC=%d blocks_cpufreq=0\n",
+	    lcf_thermal_name(thermal_policy), thermal_error, thermal.calibrated,
+	    (unsigned long long)thermal.at_ns, thermal.max_mC);
+	lcf_snapshot(&first);
+	delay_for_interval(200, NSEC_PER_MSEC);
+	lcf_snapshot(&now);
+	/* Published SRAM is not proof that this boot owns its CPU command channel.
+	 * Do not vote through the former inherited path without mailbox/rail proof.
+	 * Fresh cold startup remains the only admitted owner, never reset a live repo. */
+	bool valid=false;
+	if (!(lcf_snapshot_reject(&first)&LCF_REJECT_GUARD) || !(lcf_snapshot_reject(&now)&LCF_REJECT_GUARD))
+		printf("lancelot-cpufreq: inherited_repository_refused ownership_unproved=1 no_votes=1\n");
+	int init_error=0;
+	if (!valid && (lcf_snapshot_reject(&first)&LCF_REJECT_GUARD) &&
+	    (lcf_snapshot_reject(&now)&LCF_REJECT_GUARD) &&
+	    !memcmp(first.guard,now.guard,sizeof(now.guard)) && first.latest_log==now.latest_log) {
+		init_error=lcf_bootstrap();
+		if (init_error) lcf_snapshot(&now);
+		if (!init_error) {
+			lcf_snapshot(&first);delay_for_interval(200,NSEC_PER_MSEC);
+			init_error=lcs_receive(&lcf_startup);
+			lcf_snapshot(&now);
+			valid=!init_error && lcf_snapshot_valid(&first) && lcf_snapshot_valid(&now) &&
+			    now.latest_log && now.latest_log>=first.latest_log && !memcmp(first.pvt,now.pvt,sizeof(now.pvt)) &&
+			    !memcmp(first.method,now.method,sizeof(now.method)) &&
+			    !memcmp(first.request,now.request,sizeof(now.request)) &&
+			    now.current[0]==now.request[0] && now.current[1]==now.request[1] &&
+			    lcf_clocks_match(&now) && lcf_voltage_matches(&now);
+		}
+	}
+	printf("lancelot-cpufreq: admission=%u guard=%x/%x current=%u/%u/%u request=%u/%u log=%llu/%llu backend=SSPM_WFI_index cap_MHz=1800/2000\n",
+	    valid,now.guard[0],now.guard[4],now.current[0],now.current[1],now.current[2],now.request[0],now.request[1],first.latest_log,now.latest_log);
+	printf("lancelot-cpufreq-contract: reject=%x/%x advancing=%u init_stage=%u init_error=%d SRAM_PA=%llx no_raw_PLL_or_CPU_rail_writes=1\n",
+	    lcf_snapshot_reject(&first),lcf_snapshot_reject(&now),now.latest_log>first.latest_log,
+	    lcf_startup.stage,init_error,(unsigned long long)LCF_SRAM_PA);
+	if (!valid) {
+		if (thermal_started) lancelot_cpu_thermal_stop();
+		return;
+	}
+	for (unsigned c=0;c<2;c++) lcf_original[c]=lcf_owned[c]=now.request[c];
+	memcpy(lcf_pvt,now.pvt,sizeof(lcf_pvt));
+	memcpy(lcf_method,now.method,sizeof(lcf_method));
+	os_atomic_store(&lcf_active,true,release);
+	for (unsigned i=0;i<topology->num_cpus&&i<MAX_CPUS;i++) (void)ml_cpu_idle_time(topology->cpus[i].cpu_id,&previous[i]);
+	then=mach_absolute_time(); /* Idle baselines and the first load window share the same origin. */
+	unsigned stale=0, pending=0, ticks=0;
+	unsigned stop_reason=0;
+	struct lcf_load_policy load_policy={0};
+	uint64_t vote_at=0,clock_bad_at=0;
+	uint64_t last_log=now.latest_log, vote_log=now.latest_log;
+	bool vote_pending=false;
+	uint32_t last_voltage_opp[3]={now.current[0],now.current[1],now.current[2]};
+	while (os_atomic_load(&lcf_active,acquire)) {
+		delay_for_interval(100,NSEC_PER_MSEC);
+		if (!os_atomic_load(&lcf_active,acquire)) break;
+		enum lcf_thermal_policy policy = lcf_thermal_eval(thermal_started, &thermal, &thermal_error);
+		if (policy != thermal_policy) {
+			printf("lancelot-cpufreq-thermal: policy=%s read_error=%d max_mC=%d blocks_cpufreq=0\n",
+			    lcf_thermal_name(policy), thermal_error, thermal.max_mC);
+			thermal_policy = policy;
+		}
+		uint64_t at=mach_absolute_time(),span=at-then;
+		unsigned busy[2]={0}; bool load_valid=span!=0;
+		for (unsigned i=0;i<topology->num_cpus&&i<MAX_CPUS;i++) {
+			uint64_t idle=0;unsigned phys=topology->cpus[i].phys_id;
+			if ((phys&~0x700u)||!ml_cpu_idle_time(topology->cpus[i].cpu_id,&idle)||idle<previous[i]) {load_valid=false;continue;}
+			uint64_t delta=idle-previous[i];previous[i]=idle;
+			unsigned use=span&&delta<span?(unsigned)((span-delta)*100/span):0,c=phys>=0x600;
+			if (use>busy[c]) busy[c]=use;
+		}
+		then=at;
+		if (lcf_startup.claimed && lcs_receive(&lcf_startup)) {stop_reason=1;break;}
+		lcf_snapshot(&now);
+		if (!lcf_snapshot_valid(&now)||memcmp(first.pvt,now.pvt,sizeof(now.pvt))||
+		    memcmp(first.method,now.method,sizeof(now.method))||!load_valid) {stop_reason=2;break;}
+		if (now.latest_log<last_log) {stop_reason=3;break;}
+		last_log=now.latest_log;
+		if (!lcf_clocks_match(&now)) {
+			uint64_t ns=lcf_now_ns();if (!clock_bad_at) clock_bad_at=ns;
+			if (++stale>=10 || ns<clock_bad_at || ns-clock_bad_at>=UINT64_C(1000000000)) {stop_reason=4;break;}
+			continue;
+		}
+		clock_bad_at=0;
+		stale=0;
+		/* A readable request word is not completion. Wait for the firmware's
+		 * current OPP and the independent PLL observation before another vote. */
+		if (now.current[0]!=lcf_owned[0] || now.current[1]!=lcf_owned[1] ||
+		    (vote_pending && now.latest_log<=vote_log)) {
+			uint64_t ns=lcf_now_ns();
+			if (++pending>=10 || (vote_pending && (ns<vote_at || ns-vote_at>=UINT64_C(1000000000)))) {stop_reason=5;break;}
+			continue;
+		}
+		pending=0;
+		if (vote_pending) printf("lancelot-cpufreq-complete: at_ns=%llu vote_ns=%llu current=%u/%u event=%llu\n",
+		    lcf_now_ns(),vote_at,now.current[0],now.current[1],now.latest_log);
+		vote_pending=false;
+		if (lcf_startup.claimed &&
+		    (memcmp(last_voltage_opp,now.current,sizeof(last_voltage_opp)) || ticks%10==0)) {
+			if (!lcf_voltage_matches(&now)) {stop_reason=6;break;}
+			memcpy(last_voltage_opp,now.current,sizeof(last_voltage_opp));
+		}
+		bool ok=true;
+		/* Decide both targets before issuing either vote. A conflicting PPM
+		 * floor in the second cluster must not leave a partial first vote. */
+		unsigned target[2];
+		for (unsigned c=0;c<2;c++) {
+			target[c]=lcf_policy_target(&load_policy,c,busy[c],now.current[c],now.limit[c],lcf_now_ns(),thermal_policy!=LCF_THERMAL_LIMIT);
+			if (target[c]>=16 || now.request[c]!=lcf_owned[c]) ok=false;
+			else if (thermal_policy == LCF_THERMAL_LIMIT) target[c] = now.limit[c] & 0xffff;
+		}
+		if (!ok) {stop_reason=7;break;}
+		/* A changed vote must produce NEW transition feedback before another
+		 * request. An unchanged vote needs neither an MMIO rewrite nor new log. */
+		vote_pending=target[0]!=lcf_owned[0] || target[1]!=lcf_owned[1];
+		if (vote_pending) {vote_log=now.latest_log;vote_at=lcf_now_ns();}
+		for (unsigned c=0;c<2;c++) {
+			if (!lcf_write_request(c,target[c])) {ok=false;break;}
+		}
+		if (!ok) {stop_reason=8;break;}
+		if (vote_pending || ticks%10==0) printf("lancelot-cpufreq-policy: at_ns=%llu span_ticks=%llu busy=%u/%u current=%u/%u request=%u/%u vote=%u hold_ns=%llu/%llu mode=load_steps_v2\n",
+		    lcf_now_ns(),span,busy[0],busy[1],now.current[0],now.current[1],target[0],target[1],vote_pending,load_policy.hold_until[0],load_policy.hold_until[1]);
+		if (++ticks%10==0) printf("lancelot-cpufreq: busy=%u/%u request=%u/%u current=%u/%u limit=%x/%x log=%llu\n",
+		    busy[0],busy[1],lcf_owned[0],lcf_owned[1],now.current[0],now.current[1],now.limit[0],now.limit[1],now.latest_log);
+		if (lcf_startup.claimed && ticks%10==0) printf("lancelot-cpufreq-feedback: current_MHz=%u/%u/%u vproc_uv=%u/%u vsram_uv=%u/%u rail_at_ns=%llu rx=%u stage=%u\n",
+		    lcf_mhz[0][now.current[0]],lcf_mhz[1][now.current[1]],lcf_mhz[2][now.current[2]],
+		    lcf_last_rails.vproc_uv[0],lcf_last_rails.vproc_uv[1],lcf_last_rails.vsram_uv[0],lcf_last_rails.vsram_uv[1],
+		    (unsigned long long)lcf_last_rails_ns,lcf_startup.rx_count,lcf_startup.stage);
+	}
+	lcf_quiesce();
+	if (thermal_started) lancelot_cpu_thermal_stop();
+	printf("lancelot-cpufreq: controller stopped reason=%u reject=%x poison=%u stage=%u bad_bank=%u slot=%u got=%x; restore only while full profile and ownership remain valid\n",
+	    stop_reason,lcf_snapshot_reject(&now),lcf_startup.poisoned,lcf_startup.stage,lcf_startup.bad_bank,lcf_startup.bad_slot,lcf_startup.bad_value);
+}
+
+static void
+lcf_init(void)
+{
+	uint32_t on=1;thread_t thread;
+	PE_parse_boot_argn("lancelot_cpufreq",&on,sizeof(on));
+	if (on!=1) {
+		printf("lancelot-cpufreq: disabled bootarg=%u\n", on);
+		return;
+	}
+	if (os_atomic_xchg(&lcf_once,true,acq_rel)) return; /* no duplicate/poisoned-boot retries */
+	lcf_sram=ml_io_map(LCF_SRAM_PA,LCF_SRAM_SIZE);
+	lcf_pll=ml_io_map(0x1000c000,0x1000);lcf_div=ml_io_map(0x0c53a000,0x1000);
+	if (!lcf_sram||!lcf_pll||!lcf_div) {
+		printf("lancelot-cpufreq: map_failed SRAM=%u PLL=%u divider=%u; no votes\n",
+		    lcf_sram != 0, lcf_pll != 0, lcf_div != 0);
+		return;
+	}
+	kern_return_t error = kernel_thread_start(lcf_thread,NULL,&thread);
+	if (error==KERN_SUCCESS) {
+		thread_set_thread_name(thread,"lancelot cpufreq");thread_deallocate(thread);
+	} else {
+		printf("lancelot-cpufreq: thread_start_failed error=%d; no votes\n", error);
+	}
+}
 
 /*
  * The loader's log as well: this runs early, and the kernel's own log of a run keeps only its end. With
@@ -542,6 +1085,7 @@ redwood_ddr_quiesce(void)
 	uint32_t address[2] = { ddr_mc0, ddr_sh0 };
 	uint32_t rest = DDR_REST, data[2];
 	bool done;
+	lcf_quiesce();
 
 	if (!ddr_voted) {
 		return;
@@ -557,6 +1101,10 @@ redwood_ddr_quiesce(void)
 void
 redwood_cpufreq_init(void)
 {
+	if (lancelot_touch_platform()) {
+		lcf_init();
+		return; /* No Qualcomm EPSS/RPMh access on MediaTek. */
+	}
 	const ml_topology_info_t *topology = ml_get_topology_info();
 	uint32_t enabled = 0, cores[EPSS_DOMAINS] = { 0 }, before, here;
 

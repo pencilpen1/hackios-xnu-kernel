@@ -59,6 +59,19 @@ static size_t snapshot(uint64_t cursor,uint64_t *start,uint8_t *out,size_t capac
 	for(size_t i=0;i<n;i++)out[i]=(uint8_t)(i+cursor);
 	return n;
 }
+static int io_mode,io_calls;
+static size_t io_snapshot(char *out,size_t capacity){
+    assert(capacity==61);io_calls++;
+    if(io_mode==1){memset(out,'a',60);out[60]=0;return 60;}
+    if(io_mode==2)return 61;
+    if(io_mode==3){out[0]='1';out[1]=0;return 2;}
+    const char *value="1,abc,1,1000,2000,3000,4000,2001092";
+    strcpy(out,value);return strlen(value);
+}
+static unsigned sgi_cpu;
+static size_t sgi_snapshot(unsigned cpu,char *out,size_t capacity){
+    assert(cpu<8);sgi_cpu=cpu;return io_snapshot(out,capacity);
+}
 static void init(struct lancelot_musb *u,struct model *m)
 {
 	memset(m,0,sizeof(*m));memset(u,0,sizeof(*u));u->ctx=m;
@@ -81,6 +94,39 @@ int main(void)
 {
 	struct lancelot_musb u;struct model m;
 	init(&u,&m);
+    command(&u,&m,"getvar:lancelot-io");assert(!memcmp(m.output,"FAIL",4));
+    u.io_snapshot=io_snapshot;
+    command(&u,&m,"getvar:lancelot-io");assert(!memcmp(m.output,"OKAY1,abc,1,",12)&&io_calls==1);
+    io_mode=1;command(&u,&m,"getvar:lancelot-io");assert(m.out_size==64&&!memcmp(m.output,"OKAY",4));
+    io_mode=2;command(&u,&m,"getvar:lancelot-io");assert(!memcmp(m.output,"FAIL",4));
+    io_mode=3;command(&u,&m,"getvar:lancelot-io");assert(!memcmp(m.output,"FAIL",4));
+    command(&u,&m,"getvar:lancelot-irq");assert(!memcmp(m.output,"FAIL",4));
+    u.irq_snapshot=io_snapshot;io_mode=0;
+    command(&u,&m,"getvar:lancelot-irq");assert(!memcmp(m.output,"OKAY",4));
+    io_mode=1;command(&u,&m,"getvar:lancelot-irq");assert(m.out_size==64&&!memcmp(m.output,"OKAY",4));
+    io_mode=2;command(&u,&m,"getvar:lancelot-irq");assert(!memcmp(m.output,"FAIL",4));
+    io_mode=3;command(&u,&m,"getvar:lancelot-irq");assert(!memcmp(m.output,"FAIL",4));
+    io_mode=0;command(&u,&m,"getvar:lancelot-sgi:0");assert(!memcmp(m.output,"FAIL",4));
+    u.sgi_snapshot=sgi_snapshot;
+    for(unsigned cpu=0;cpu<8;cpu++){
+        char cmd[32];snprintf(cmd,sizeof(cmd),"getvar:lancelot-sgi:%u",cpu);
+        command(&u,&m,cmd);assert(!memcmp(m.output,"OKAY",4)&&sgi_cpu==cpu);
+    }
+    int before=io_calls;
+    const char *bad[]={"getvar:lancelot-sgi:8","getvar:lancelot-sgi:ff","getvar:lancelot-sgi:","getvar:lancelot-sgi:0x0","getvar:lancelot-sgi:0 trailing"};
+    for(unsigned i=0;i<sizeof(bad)/sizeof(bad[0]);i++){
+        command(&u,&m,bad[i]);assert(!memcmp(m.output,"FAIL",4)&&io_calls==before);
+    }
+    io_mode=1;command(&u,&m,"getvar:lancelot-sgi:7");assert(m.out_size==64&&!memcmp(m.output,"OKAY",4));
+    io_mode=2;command(&u,&m,"getvar:lancelot-sgi:7");assert(!memcmp(m.output,"FAIL",4));
+    io_mode=3;command(&u,&m,"getvar:lancelot-sgi:7");assert(!memcmp(m.output,"FAIL",4));
+    command(&u,&m,"getvar:lancelot-debug");assert(!memcmp(m.output,"FAIL",4));
+    u.debug_snapshot=io_snapshot;io_mode=0;
+    command(&u,&m,"getvar:lancelot-debug");assert(!memcmp(m.output,"OKAY",4));
+    io_mode=1;command(&u,&m,"getvar:lancelot-debug");assert(m.out_size==64&&!memcmp(m.output,"OKAY",4));
+    io_mode=2;command(&u,&m,"getvar:lancelot-debug");assert(!memcmp(m.output,"FAIL",4));
+    io_mode=3;command(&u,&m,"getvar:lancelot-debug");assert(!memcmp(m.output,"FAIL",4));
+    io_mode=0;init(&u,&m);
 	/* SET_ADDRESS must wait for status ACK, including coalesced interrupts. */
 	u.configuration=0;
 	uint8_t setup[8]={0,5,9,0,0,0,0,0};lu_setup(&u,setup);
@@ -116,5 +162,5 @@ int main(void)
 	assert(!u.configuration&&u.reply==LU_NONE&&u.boot==123&&m.reg[LU_INTRUSB]==0);
 	/* Oversized OUT packet is flushed without touching the command buffer. */
 	u.configuration=1;m.count=65;m.rx=1;m.tx[1]=0;m.in_at=0;lu_poll(&u);assert(!m.in_at&&!m.rx);
-	puts("MUSB: EP0 sequencing, FS descriptors, immutable KLOG2/CRC, empty snapshot, backpressure, reset, malformed/oversize commands passed");
+    puts("MUSB: EP0, KLOG2/CRC, backpressure, reset, bounded read-only I/O, exact 64-byte response, missing/oversize/embedded-NUL response rejection passed");
 }

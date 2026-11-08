@@ -25,6 +25,12 @@ with tempfile.TemporaryDirectory(prefix='lancelot-mali-') as directory:
         ('smoke-build', cc + ['-I' + str(ROOT / 'xnu/files/bsd/dev'),
                              str(test / 'smoke_test.c'), '-o', str(out / 'smoke')]),
         ('smoke', [str(out / 'smoke')]),
+        ('profile-policy-build', cc + ['-I' + str(ROOT / 'xnu/files/bsd/dev'),
+                                      str(test / 'profile_policy_test.c'), '-o', str(out / 'profile-policy')]),
+        ('profile-policy', [str(out / 'profile-policy')]),
+        ('fault-policy-build', cc + ['-I' + str(ROOT / 'xnu/files/bsd/dev'),
+                                    str(test / 'fault_snapshot_test.c'), '-o', str(out / 'fault-policy')]),
+        ('fault-policy', [str(out / 'fault-policy')]),
         ('platform-build', cc + [str(test / 'platform_test.c'), '-o', str(out / 'platform')]),
         ('platform', [str(out / 'platform')]),
         ('core-build', cc + ['-DLM_HOST_TEST', '-I' + str(ROOT / 'xnu/files/bsd/dev'),
@@ -33,6 +39,25 @@ with tempfile.TemporaryDirectory(prefix='lancelot-mali-') as directory:
         ('core', [str(out / 'core')]),
         ('core-quarantine', [str(out / 'core'), 'quarantine']),
         ('core-mmio', [str(out / 'core'), 'mmio']),
+        ('cache-batch-build', cc + ['-DLM_HOST_TEST', '-I' + str(ROOT / 'xnu/files/bsd/dev'),
+                                  '-I' + str(ROOT / 'xnuloader'), str(test / 'cache_batch_test.c'),
+                                  str(ROOT / 'xnu/files/bsd/dev/lancelot_mali_core.c'), '-o', str(out / 'cache-batch')]),
+        ('cache-batch', [str(out / 'cache-batch')]),
+        ('cache-batch-recovery', [str(out / 'cache-batch'), 'recovery']),
+        ('cache-lines-build', cc + ['-DLM_HOST_TEST', '-I' + str(ROOT / 'xnu/files/bsd/dev'),
+                                  str(test / 'cache_lines_test.c'), '-o', str(out / 'cache-lines')]),
+        ('cache-lines', [str(out / 'cache-lines')]),
+        ('workset-build', cc + ['-DLM_HOST_TEST', '-I' + str(ROOT / 'xnu/files/bsd/dev'),
+                              '-I' + str(ROOT / 'xnuloader'), str(test / 'workset_test.c'),
+                              str(ROOT / 'xnu/files/bsd/dev/lancelot_mali_core.c'), '-o', str(out / 'workset')]),
+        ('workset', [str(out / 'workset')]),
+        ('workset-quarantine', [str(out / 'workset'), 'quarantine']),
+        ('ownership-build', cc + ['-DLM_HOST_TEST', '-I' + str(ROOT / 'xnu/files/bsd/dev'),
+                                '-I' + str(ROOT / 'xnu/files/iokit/Kernel'), '-I' + str(ROOT / 'xnuloader'),
+                                str(test / 'gpu_ownership_test.c'), str(ROOT / 'xnu/files/bsd/dev/lancelot_mali_core.c'),
+                                '-o', str(out / 'ownership')]),
+        ('ownership', [str(out / 'ownership')]),
+        ('ownership-quarantine', [str(out / 'ownership'), 'quarantine']),
         ('private-dma-quarantine', [str(out / 'core'), 'private-quarantine']),
         ('private-clear', [str(out / 'core'), 'private-clear']),
         ('client-build', ['cc', '-std=c11', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-pthread',
@@ -45,7 +70,7 @@ with tempfile.TemporaryDirectory(prefix='lancelot-mali-') as directory:
     ]
     for name, command in commands:
         env = os.environ.copy()
-        env['ASAN_OPTIONS'] = 'detect_leaks=0' if name in ['core-quarantine', 'core-mmio', 'private-dma-quarantine'] else 'detect_leaks=1'
+        env['ASAN_OPTIONS'] = 'detect_leaks=0' if name in ['core-quarantine', 'core-mmio', 'private-dma-quarantine', 'cache-batch-recovery', 'workset-quarantine', 'ownership-quarantine'] else 'detect_leaks=1'
         env['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1'
         print(name, flush=True)
         subprocess.run(command, cwd=ROOT, env=env, check=True)

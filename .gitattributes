@@ -1,0 +1,25 @@
+*.c text eol=lf
+*.h text eol=lf
+*.cpp text eol=lf
+*.m text eol=lf
+*.inc text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.patch text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.inf text eol=lf
+*.dec text eol=lf
+*.dsc text eol=lf
+*.fdf text eol=lf
+meson.build text eol=lf
+*.meson text eol=lf
+# These firmware dependency files retain their audited byte-level SHA pins.
+uefi/files/Mu_Basecore/** -text
+# Preserve imported HFS formatting and exact upstream patch context.
+xnu/files/bsd/hfs/** -whitespace
+xnu/files/bsd/hfs_encodings/** -whitespace
+xnu/files/bsd/hfs/hfs_inline_xattr.h whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+xnu/files/bsd/hfs/lancelot_* whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+tools/lancelot-data/tests/old_inline_xattr.inc -whitespace
+tools/mesa-lancelot/hakios-mtk-*.patch -whitespace

@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "device": "lancelot",
+  "soc": "MT6768",
+  "build": "20H392",
+  "cmdline": "ca_vbl=1 touch_lat=1 glslow=5000 glenv=OSMESA_REQUIRE_HARDWARE=1 cpus=8 small_cores=0 small_cores_after=0 lancelot_touch=3 gpu=0 wifi=0 adsp=0 root_apfs=lancelot_ios sbstartup=observe sbactivation=local lancelot_gpu_ao=1 lancelot_sspm_pmic=1 lancelot_gpu_power=1 lancelot_gpu_features=1 lancelot_gpu_dma=1 lancelot_mali_client=backboardd lancelot_mali=4 lancelot_profile=2 glenv=PAN_MESA_DEBUG=perf lancelot_gpu_lease=1 lancelot_gpu_dvfs=1 lancelot_hakios=1 mali_trace=1 mali_fastmap=1 lancelot_data=1 lancelot_data_map=5d4b811b13bbbdab00165ed9ce7de02c4a7b73a17ce3dd091e1cb4b2cefb90f4",
+  "gpu": {
+    "GPU_complete": true,
+    "round_acceptance": "passed",
+    "basis": "user_report",
+    "accepted_on": "2026-11-08",
+    "user_report": "GPU本轮验收通过",
+    "accepted_deployed_round": "P12 R14",
+    "runtime_backend": "20H392 EAGL bridge and native MTK Panfrost",
+    "full_CoreAnimation_Metal_path_verified": false,
+    "reference_kernel_repository": "oosexgang/hakios-mt6768",
+    "reference_userspace_repository": "oosexgang/hakios-xnu-kernel",
+    "reference_userspace_branch": "mtk",
+    "reference_userspace_commit": "3f31f3428528ca4435cdc4826ea97dc9415225b5"
+  },
+  "accepted_deployed_artifact_SHA256": {
+    "kernel": "6e9d68f82d27aa8bc79c41e85713b4e04c499b9f97f5bbb49d81e8b92fe11c90",
+    "root": "30f9823aa00e81a1e279de1c4d19717c5a3c3abfd89679740821292f1e6a21a3",
+    "loader": "1c04d58f03f0dde284cc8ef984f20f7d087f3d0771e3f27d9e2a0eebe33ac2ea",
+    "mu": "e4a105308f42f3b2742aa361a93cb24dcb8c732ec97e762353a68ac2cf0b774d",
+    "mesa_library": "dca62810d5fba0f987a324e20b9c8970cce66e23691b84f2b70cd1f1a96649e6",
+    "metal_plugin": "e82da0acc2ac83d402fdb506a133d54771e441ad458882335fb6c662a4e51bfe"
+  },
+  "storage": {
+    "data_bytes": 16734445568,
+    "logical_block_bytes": 4096,
+    "native_sector_bytes": 512,
+    "map_sha256": "5d4b811b13bbbdab00165ed9ce7de02c4a7b73a17ce3dd091e1cb4b2cefb90f4",
+    "revision": "R15",
+    "runtime_acceptance": "pending",
+    "deployed": false
+  },
+  "cpu": {
+    "cpus": 8,
+    "small_cores": 0,
+    "small_cores_after": 0,
+    "load_sample_period_ms": 250,
+    "load_and_clock_report_period_ms": 1000
+  }
+}

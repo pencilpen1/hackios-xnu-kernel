@@ -13,6 +13,7 @@
 #include <sys/dirent.h>
 #include <sys/errno.h>
 #include <sys/namei.h>
+#include <sys/proc.h>
 #include <sys/stat.h>
 #include <sys/systm.h>
 #include <sys/ubc.h>
@@ -715,6 +716,31 @@ apfs_vnop_read(struct vnop_read_args *ap)
  * compressed file has no block mapping at all, and a plain one is read out of the extents
  * just as cheaply here.
  */
+static void
+apfs_pagein_failure(struct vnop_pagein_args *ap, const char *stage,
+    int error, kern_return_t map_error, uint64_t failed_offset)
+{
+	static uint32_t reported;
+	if (os_atomic_inc_orig(&reported, relaxed) >= 8) {
+		return;
+	}
+	struct apfs_node *node = APFS_VP(ap->a_vp);
+	struct apfs_mount *am = APFS_VP_MOUNT(ap->a_vp);
+	char process[MAXCOMLEN + 1];
+	proc_selfname(process, sizeof(process));
+	const char *name = vnode_getname(ap->a_vp);
+	printf("apfs-pagein-error: process=%s pid=%d file=%s object=%llu device=%#x "
+	    "stage=%s error=%d map_error=%d offset=%lld failed_offset=%llu "
+	    "bytes=%d file_bytes=%llu upl_offset=%u flags=%#x\n",
+	    process, proc_selfpid(), name ? name : "(unnamed)", node->an_ino.obj_id,
+	    (unsigned)am->am_rdev, stage, error, map_error,
+	    (long long)ap->a_f_offset, failed_offset, ap->a_size, node->an_size,
+	    (unsigned)ap->a_pl_offset, (unsigned)ap->a_flags);
+	if (name != NULL) {
+		vnode_putname(name);
+	}
+}
+
 static int
 apfs_vnop_pagein(struct vnop_pagein_args *ap)
 {
@@ -730,8 +756,10 @@ apfs_vnop_pagein(struct vnop_pagein_args *ap)
 	struct apfs_lock_proc *lp = NULL;
 	off_t at, end;
 	int error = 0;
+	kern_return_t map_error = KERN_SUCCESS;
 
 	if (upl == NULL) {
+		apfs_pagein_failure(ap, "upl_missing", EINVAL, map_error, (uint64_t)offset);
 		return EINVAL;
 	}
 	if (offset < 0 || (offset & PAGE_MASK_64) || (ap->a_size & PAGE_MASK) ||
@@ -740,11 +768,14 @@ apfs_vnop_pagein(struct vnop_pagein_args *ap)
 	} else {
 		ino = APFS_VP(vp)->an_ino;
 		size = APFS_VP(vp)->an_size;
-		if (ubc_upl_map(upl, &address) != KERN_SUCCESS) {
+		map_error = ubc_upl_map(upl, &address);
+		if (map_error != KERN_SUCCESS) {
 			error = ENOMEM;
 		}
 	}
 	if (error) {
+		apfs_pagein_failure(ap, map_error ? "upl_map" : "alignment",
+		    error, map_error, (uint64_t)offset);
 		if (!(ap->a_flags & UPL_NOCOMMIT)) {
 			ubc_upl_abort_range(upl, upl_offset, (upl_size_t)ap->a_size,
 			    UPL_ABORT_FREE_ON_EMPTY | UPL_ABORT_ERROR);
@@ -804,6 +835,9 @@ apfs_vnop_pagein(struct vnop_pagein_args *ap)
 	}
 
 	ubc_upl_unmap(upl);
+	if (error) {
+		apfs_pagein_failure(ap, "file_read", error, map_error, (uint64_t)at);
+	}
 	/* (the counts: without the lock, which would be taken for nothing else) */
 	if (lp != NULL) {
 		os_atomic_add(&lp->pagein_ticks, apfs_ticks() - t0, relaxed);

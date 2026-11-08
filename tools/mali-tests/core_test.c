@@ -21,6 +21,13 @@ struct fake {
     bool done_current_busy;
     bool zero_thread_priority,drop_next_config;
     uint64_t fault_va_xor;uint32_t fault_status;
+    unsigned event,last_clean,last_barrier,bind_event,irq_event,trace_event;
+    unsigned cache_event,cache_event_at_next,next_event,launch_event;
+    unsigned cache_commands,cache_before_next,next_writes,launches,pre_job_calls;
+    unsigned cache_timeout_at,cache_fault_at,cache_ioerr_at;
+    uint64_t traced_jc;uint32_t traced_words[4];
+    bool record_as;unsigned as_count,as_fail_at;uint32_t as_ops[16];
+    bool check_gpu_share;unsigned expected_gpu_share;
     struct lm_page owned[2048];
 };
 static void *ma(void *o,size_t n) {struct fake*f=o;void*p=calloc(1,n);if(p)f->allocs++;return p;}
@@ -47,11 +54,21 @@ static void *physical(struct fake*f,uint64_t address) {
 }
 static void *gpu_address(struct fake*f,uint64_t va) {
     uint64_t root=(uint64_t)f->reg[0x2400/4]|(uint64_t)f->reg[0x2404/4]<<32;
-    for(unsigned level=0;level<4;level++) {
+    unsigned t0sz=(f->reg[0x2430/4]>>6)&63u;
+    assert(t0sz==0 || t0sz==20);
+    unsigned levels=t0sz==20?3u:4u;
+    for(unsigned level=0;level<levels;level++) {
         uint64_t *table=physical(f,root);assert(table);
-        uint64_t e=table[(va>>(39-9*level))&511];if((e&3)!=3)return NULL;
+        uint64_t e=table[(va>>(12+9*(levels-1-level)))&511];if((e&3)!=3)return NULL;
+        if(f->check_gpu_share) {
+            assert(((e>>8)&3)==(level==levels-1?f->expected_gpu_share:0));
+            if(level==levels-1) {
+                assert(((e>>2)&7)==0); /* the bound MEMATTR[0] policy */
+                assert(((e>>6)&3)==1 && (e&(UINT64_C(1)<<54)));
+            }
+        }
         root=e&UINT64_C(0x000000fffffff000);
-        if(level==3)return physical(f,root+(va&4095));
+        if(level==levels-1)return physical(f,root+(va&4095));
     }
     return NULL;
 }
@@ -165,9 +182,15 @@ static void fake_triangle(struct fake*f,uint64_t jc) {
     }
     f->jobs_run=3;
 }
-static void clean(void*o,void*p,size_t n) {assert(p&&n==4096);((struct fake*)o)->clean++;}
+static void clean(void*o,void*p,size_t n) {assert(p&&n==4096);struct fake*f=o;f->clean++;f->last_clean=++f->event;}
 static void inval(void*o,void*p,size_t n) {assert(p&&n==4096);((struct fake*)o)->invalidate++;}
-static void barrier(void*o) {(void)o;}
+static void barrier(void*o) {struct fake*f=o;f->last_barrier=++f->event;}
+static void pre_job(void*o,uint64_t jc,const uint32_t words[4]) {
+    struct fake*f=o;
+    assert(f->bind_event>f->last_clean&&f->irq_event>f->bind_event&&f->last_barrier>f->irq_event);
+    f->trace_event=++f->event;f->pre_job_calls++;f->traced_jc=jc;
+    memcpy(f->traced_words,words,sizeof(f->traced_words));
+}
 static uint64_t now(void*o) {return ((struct fake*)o)->time;}
 static void delay(void*o,uint32_t us) {((struct fake*)o)->time+=us*1000ull;}
 static uint32_t rr(void*o,uint32_t reg) {
@@ -187,6 +210,16 @@ static void wr(void*o,uint32_t r,uint32_t x) {
         if(f->drop_next_config)f->reg[r/4]^=1u<<8;
     }
     if(f->corrupt_bind_reg&&r==f->corrupt_bind_reg)f->reg[r/4]^=1;
+    if(r==0x2418&&f->record_as) {
+        assert(f->as_count<16);f->as_ops[f->as_count++]=x;
+        if(f->as_count==f->as_fail_at)f->reg[0x2428/4]=1;
+    }
+    if(r==0x2418&&x==1&&(f->reg[0x2400/4]||f->reg[0x2404/4]))f->bind_event=++f->event;
+    if(r==0x24&&x==0x81)f->irq_event=++f->event;
+    if(r==0x18c0||r==0x1840) {
+        f->next_writes++;f->next_event=++f->event;
+        f->cache_before_next=f->cache_commands;f->cache_event_at_next=f->cache_event;
+    }
     if(r==0x24)f->reg[0x20/4]&=~x;
     if(r==0x1004&&!f->stale_done)f->reg[0x1000/4]&=~x;
     if(r==0x1004)f->reg[0x1010/4]=f->run?(1u<<f->active_slot):0;
@@ -194,11 +227,17 @@ static void wr(void*o,uint32_t r,uint32_t x) {
     if(r==0x30 && x==1 && !f->reset_fail && !(f->reset_fail_after_submit&&f->submitted)) {
         f->reg[0x20/4]|=1u<<8;f->reg[0x1860/4]=f->reg[0x18e0/4]=0;f->run=false;
     }
-    if(r==0x30 && x==8){f->reg[0x20/4]|=1u<<17;if(f->fault==4)f->reg[0x2000/4]|=1;}
+    if(r==0x30 && x==8) {
+        f->cache_commands++;f->cache_event=++f->event;
+        if(f->cache_commands!=f->cache_timeout_at)f->reg[0x20/4]|=1u<<17;
+        if(f->fault==4||f->cache_commands==f->cache_fault_at)f->reg[0x2000/4]|=1;
+        if(f->cache_commands==f->cache_ioerr_at)f->ioerr=1;
+    }
     if(r==0x2418 && x==5 && f->fault==5)f->reg[0x20/4]|=1;
     if(r==0x1a0||r==0x1a4||r==0x190||r==0x194||r==0x180||r==0x184)f->reg[(r-0x40)/4]=x;
     if(r==0x1c0||r==0x1c4||r==0x1d0||r==0x1d4||r==0x1e0||r==0x1e4)f->reg[(r-0x80)/4]&=~x;
     if((r==0x1860||r==0x18e0)&&x==1) {
+        f->launches++;f->launch_event=++f->event;
         unsigned slot=r==0x1860?0:1;f->active_slot=slot;f->run=true;f->submitted=true;
         if(f->fault==1)f->reg[0x2000/4]|=1;
         else if(f->fault==2)f->reg[0x1000/4]|=1u<<(16+slot);
@@ -265,13 +304,19 @@ static void wr(void*o,uint32_t r,uint32_t x) {
     if(f->fail_write&&r==f->fail_write&&(!f->fail_after_done||f->submitted))f->ioerr=1;
 }
 static int ioerr(void*o){return ((struct fake*)o)->ioerr?LM_EIO:LM_OK;}
-static struct lm_core *bare_device(struct fake *f) {
+static struct lm_core *bare_device_mapping_policy(struct fake *f,bool preflush,bool dump,unsigned asflush,bool shared) {
     memset(f,0,sizeof(*f));f->pa=0x100000000ull;
     f->reg[0]=0x72121000;f->reg[0x100/4]=5;f->reg[0x110/4]=1;f->reg[0x120/4]=1;
     f->reg[0x18/4]=1;f->reg[0x1c/4]=3;f->reg[0x1a0/4]=768;
-    struct lm_ops ops={.cookie=f,.read32=rr,.write32=wr,.now_ns=now,.delay_us=delay,.alloc=ma,.free=mf,.page_alloc=pa,.page_free=pf,.for_device=clean,.for_cpu=inval,.barrier=barrier,.io_error=ioerr};
+    struct lm_ops ops={.cookie=f,.read32=rr,.write32=wr,.now_ns=now,.delay_us=delay,.alloc=ma,.free=mf,.page_alloc=pa,.page_free=pf,.for_device=clean,.for_cpu=inval,.barrier=barrier,.io_error=ioerr,
+        .pre_job_flush=preflush,.pre_job=dump?pre_job:NULL,.pre_as_flush=asflush,.gpu_shareable=shared};
     struct lm_core*d=lm_core_create(&ops);assert(d);return d;
 }
+static struct lm_core *bare_device_policy(struct fake *f,bool preflush,bool dump,unsigned asflush) {
+    return bare_device_mapping_policy(f,preflush,dump,asflush,false);
+}
+static struct lm_core *bare_device_options(struct fake *f,bool preflush,bool dump) {return bare_device_policy(f,preflush,dump,0);}
+static struct lm_core *bare_device(struct fake *f) {return bare_device_options(f,false,false);}
 static struct lm_core *device(struct fake *f) {
     struct lm_core*d=bare_device(f);assert(lm_core_start(d)==LM_OK);
     assert(f->reg[0xf04/4]&(1u<<17));assert(((f->reg[0xf00/4]>>16)&0x3f)==15);
@@ -285,6 +330,125 @@ static void destroy(struct fake*f,struct lm_core*d) {
     int shutdown_error=lm_core_destroy(d);
     assert(shutdown_error==0);assert(f->allocs==0&&f->pages==0);
     if(powered)assert(!(f->reg[0x140/4]&3)&&!(f->reg[0x150/4]&1)&&!(f->reg[0x160/4]&1));
+}
+static void preflush_ordering(void) {
+    for(unsigned flush=0;flush<2;flush++)for(unsigned dump=0;dump<2;dump++) {
+        struct fake f;struct lm_core*d=bare_device_options(&f,flush,dump);assert(!lm_core_start(d));
+        struct lm_vm*v=lm_core_vm_new(d);struct lm_page p[2];
+        assert(!pa(&f,p)&&!pa(&f,p+1));assert(p[1].pa!=p[0].pa+4096);
+        assert(!lm_core_vm_map(v,LM_VA_MIN,p,2,LM_MAP_WRITE));
+        /* Alternate GPU pages, including the final aligned header in page 1.
+         * Changing every word proves the probe reads the current allocation. */
+        for(unsigned i=0;i<34;i++) {
+            unsigned page=i&1,offset=page?4032:64;
+            uint64_t jc=LM_VA_MIN+4096*page+offset;
+            uint32_t words[4]={0x12340000+i,0x56780000+i,0x9abc0000+i,0xdef00000+i};
+            memcpy((char*)p[page].cpu+offset,words,sizeof(words));
+            struct lm_job_result r;
+            assert(!lm_core_submit_wait(v,jc,i&1,1000000,&r));
+            assert(r.sequence==i+1&&r.failed_stage==LM_JOB_NONE);
+            assert(f.cache_commands==(i+1)*(1+flush));
+            assert(f.cache_before_next==i*(1+flush)+flush);
+            assert(f.last_clean<f.bind_event&&f.bind_event<f.irq_event);
+            assert(f.irq_event<f.next_event&&f.next_event<f.launch_event&&f.launch_event<f.cache_event);
+            if(flush)assert(f.irq_event<f.cache_event_at_next&&f.cache_event_at_next<f.next_event);
+            assert(f.next_writes==i+1&&f.launches==i+1);
+            assert(f.pre_job_calls==(dump?(i<32?i+1:32):0));
+            if(dump&&i<32) {
+                assert(f.traced_jc==jc&&!memcmp(f.traced_words,words,sizeof(words)));
+                assert(f.irq_event<f.trace_event&&f.trace_event<f.next_event);
+                if(flush)assert(f.trace_event<f.cache_event_at_next);
+            }
+        }
+        assert(!lm_core_vm_destroy(v));pf(&f,p);pf(&f,p+1);destroy(&f,d);
+    }
+    puts("preflush: A/B x dump on/off, CPU-clean -> bind -> IRQ -> probe -> pre-cache -> NEXT -> launch -> post-cache; 32-snapshot limit and sparse-page offsets PASS");
+}
+static void preflush_failures(void) {
+    for(unsigned fault=0;fault<6;fault++) {
+        struct fake f;struct lm_core*d=bare_device_options(&f,true,true);assert(!lm_core_start(d));
+        struct lm_vm*v=lm_core_vm_new(d);struct lm_page p;assert(!pa(&f,&p));
+        assert(!lm_core_vm_map(v,LM_VA_MIN,&p,1,LM_MAP_WRITE));
+        if(fault<4) {
+            if(fault&1)f.cache_fault_at=1+fault/2;
+            else f.cache_timeout_at=1+fault/2;
+        } else if(fault==4)f.drop_bind_root=true;
+        else {f.stale_done=true;f.reg[0x1000/4]=2;}
+        struct lm_job_result r;
+        int e=lm_core_submit_wait(v,LM_VA_MIN,0,1000000,&r);
+        assert(e==(fault<4&&!(fault&1)?LM_ETIMEDOUT:LM_EIO));
+        assert(r.failed_stage==(fault<4?LM_JOB_CACHE:fault==4?LM_JOB_BIND:LM_JOB_IRQ_CLEAR));
+        assert(f.launches==(fault==2||fault==3?1u:0u)&&f.next_writes==f.launches);
+        assert(f.cache_commands==(fault<4?1+fault/2:0));
+        assert(f.pre_job_calls==(fault<4?1u:0u));
+        assert(r.reset_completed&&!r.quarantined&&!lm_core_ready(d));
+        assert(lm_core_vm_safe_to_free(v));assert(!lm_core_vm_destroy(v));pf(&f,&p);destroy(&f,d);
+    }
+    puts("preflush failures: pre-cache timeout/fault prevent NEXT and launch; post-cache retained; failed bind/IRQ skip both; reset-before-release PASS");
+}
+static void preflush_quarantine(void) {
+    for(unsigned transport=0;transport<2;transport++) {
+        struct fake f;struct lm_core*d=bare_device_options(&f,true,true);assert(!lm_core_start(d));
+        struct lm_vm*v=lm_core_vm_new(d);struct lm_page p;assert(!pa(&f,&p));
+        assert(!lm_core_vm_map(v,LM_VA_MIN,&p,1,LM_MAP_WRITE));
+        if(transport)f.cache_ioerr_at=1;
+        else {f.cache_timeout_at=1;f.reset_fail=1;}
+        struct lm_job_result r;
+        assert(lm_core_submit_wait(v,LM_VA_MIN,0,1000000,&r)<0);
+        assert(r.failed_stage==LM_JOB_CACHE&&!f.next_writes&&!f.launches);
+        assert(r.quarantined&&!r.reset_completed&&!lm_core_vm_safe_to_free(v));
+        assert(lm_core_vm_destroy(v)==LM_EBUSY&&lm_core_destroy(d)==LM_EBUSY);
+    }
+    puts("preflush quarantine: failed reset or cache-command transport retains backing without launch PASS");
+}
+static void preasflush(void) {
+    for(unsigned mode=0;mode<3;mode++) {
+        struct fake f;struct lm_core*d=bare_device_policy(&f,true,true,mode);assert(!lm_core_start(d));
+        struct lm_vm*v=lm_core_vm_new(d);struct lm_page p;assert(!pa(&f,&p));
+        assert(!lm_core_vm_map(v,LM_VA_MIN,&p,1,LM_MAP_WRITE));
+        f.record_as=true;struct lm_job_result r;
+        assert(!lm_core_submit_wait(v,LM_VA_MIN,0,1000000,&r));
+        const uint32_t legacy[]={1,2,5,1};
+        const uint32_t flushed[]={1,2,mode==1?5u:4u,1,2,5,1};
+        assert(f.as_count==(mode?7u:4u));
+        assert(!memcmp(f.as_ops,mode?flushed:legacy,f.as_count*sizeof(uint32_t)));
+        assert(f.launches==1&&f.pre_job_calls==1&&f.cache_commands==2);
+        assert(f.reg[0x2410/4]==31&&f.reg[0x2414/4]==0);
+        assert(!lm_core_vm_destroy(v));pf(&f,&p);destroy(&f,d);
+    }
+    for(unsigned mode=1;mode<3;mode++)for(unsigned fail=2;fail<=4;fail++) {
+        struct fake f;struct lm_core*d=bare_device_policy(&f,true,true,mode);assert(!lm_core_start(d));
+        struct lm_vm*v=lm_core_vm_new(d);struct lm_page p;assert(!pa(&f,&p));
+        assert(!lm_core_vm_map(v,LM_VA_MIN,&p,1,LM_MAP_WRITE));
+        f.record_as=true;f.as_fail_at=fail;struct lm_job_result r;
+        assert(lm_core_submit_wait(v,LM_VA_MIN,0,1000000,&r)==LM_ETIMEDOUT);
+        assert(r.failed_stage==LM_JOB_AS_FLUSH&&r.reset_completed&&!r.quarantined);
+        assert(!f.next_writes&&!f.launches&&!f.pre_job_calls&&!f.cache_commands);
+        assert(!lm_core_vm_destroy(v));pf(&f,&p);destroy(&f,d);
+    }
+    puts("preasflush: exclusive off/MEM/PT sequences after UPDATE; full-VA lock; lock/flush/re-UPDATE timeouts prevent launch and recover PASS");
+}
+static void gpu_sharing(void) {
+    for(unsigned shared=0;shared<2;shared++) {
+        struct fake f;struct lm_core*d=bare_device_mapping_policy(&f,true,true,0,shared!=0);
+        assert(!lm_core_start(d));
+        struct lm_vm*v=lm_core_vm_new(d);assert(v);
+        struct lm_page pages[2];assert(!pa(&f,pages)&&!pa(&f,pages+1));
+        assert(!lm_core_vm_map(v,LM_VA_MIN,pages,2,LM_MAP_WRITE));
+        f.emulate_value=true;f.check_gpu_share=true;f.expected_gpu_share=shared?3:0;
+        for(unsigned step=0;step<3;step++) {
+            uint32_t value=0x10203040u+step*0x01010101u;
+            lm_v7_dma_prepare(pages[0].cpu,pages[1].cpu,LM_VA_MIN+4096,value);
+            struct lm_job_result r;
+            assert(!lm_core_submit_wait(v,LM_VA_MIN,0,1000000,&r));
+            uint32_t bad=0;bool job=false;
+            assert(lm_v7_dma_validate(pages[0].cpu,pages[1].cpu,value,&bad,&job));
+            assert((f.reg[0x2408/4]&0xffu)==0x88u && f.reg[0x304/4]==31);
+        }
+        assert(f.launches==3 && f.invalidate==6);
+        assert(!lm_core_vm_destroy(v));pf(&f,pages);pf(&f,pages+1);destroy(&f,d);
+    }
+    puts("GPU mapping policy: legacy/inner-shared leaf walks, unchanged attr0/RW/NX, nonshared tables, explicit CPU maintenance, repeated DMA and teardown PASS; no hardware");
 }
 static void identity(void) {
     const uint32_t unsupported[]={0x06000000,0x72121120,0x72121001,0x72120010};
@@ -589,11 +753,54 @@ static void private_triangle_mismatch(void) {
     assert(s.cleaned&&!s.backing_retained&&!f.pages&&!f.allocs);
     puts("Private triangle negative: one wrong shader pixel is rejected with its exact offset/value while cleanup still succeeds; RAM ONLY");
 }
+static void descriptor_fault_snapshot(void) {
+    for(unsigned scenario=0;scenario<6;scenario++) {
+        struct fake f;struct lm_core *unused=bare_device(&f);assert(!lm_core_destroy(unused));
+        f.reg[0]=0x74021000;
+        struct lm_ops io={.cookie=&f,.read32=rr,.write32=wr,.now_ns=now,.delay_us=delay,
+            .alloc=ma,.free=mf,.page_alloc=pa,.page_free=pf,.for_device=clean,.for_cpu=inval,
+            .barrier=barrier,.io_error=ioerr,.capture_descriptors=scenario!=5,.submit_scope=true};
+        struct lm_core*d=lm_core_create(&io);assert(d&&!lm_core_start(d));
+        struct lm_vm*v=lm_core_vm_new(d);struct lm_page pages[3];
+        for(unsigned i=0;i<3;i++)assert(!pa(&f,&pages[i]));
+        for(unsigned i=0;i<3;i++)assert(!lm_core_vm_map(v,LM_VA_MIN+i*4096,&pages[i],1,LM_MAP_WRITE));
+        uint32_t *job=(uint32_t *)((char *)pages[0].cpu+4032);
+        for(unsigned i=0;i<16;i++)job[i]=0x10000+i;
+        job[4]=0x10013; /* G52 fragment, first job, 64-bit addresses. */
+        uint64_t fbd=scenario==1?0:scenario==2?LM_VA_MIN+16384:LM_VA_MIN+4096;
+        job[10]=(uint32_t)fbd|1;job[11]=0;
+        uint32_t *params=pages[1].cpu;
+        for(unsigned i=0;i<16;i++)params[i]=0x20000+i;
+        params[14]=scenario==4?0:(uint32_t)(LM_VA_MIN+8192);params[15]=0;
+        uint32_t *tiler=pages[2].cpu,*rt=(uint32_t *)((char *)pages[1].cpu+128);
+        for(unsigned i=0;i<16;i++){tiler[i]=0x30000+i;rt[i]=0x40000+i;}
+        struct lm_range ranges[3]={{LM_VA_MIN,1,0},{LM_VA_MIN+4096,1,LM_RANGE_READONLY},{LM_VA_MIN+8192,1,0}};
+        struct lm_job_result warm;
+        assert(!lm_core_submit_ranges(v,LM_VA_MIN+4032,1,1000000,&warm,ranges,scenario==3?1:3));
+        /* The scope's PA alias index is lazy. Warm it before measuring the
+         * diagnostic path so its allocation is not blamed on the snapshot. */
+        unsigned allocations=f.allocs,page_count=f.pages;
+        f.fault=1;f.reg[0x241c/4]=0xb002c2;f.reg[0x2420/4]=0;
+        struct lm_job_result r;
+        assert(lm_core_submit_ranges(v,LM_VA_MIN+4032,1,1000000,&r,ranges,scenario==3?1:3)==LM_EIO);
+        assert(r.reset_completed&&!r.quarantined&&!lm_core_ready(d));
+        const unsigned expected[]={15,1,1,1,11,0};
+        assert(r.descriptors.mask==expected[scenario]);
+        if(scenario!=5)assert(!memcmp(r.descriptors.words[0],job,64));
+        if(r.descriptors.mask&2u)assert(!memcmp(r.descriptors.words[1],params,64));
+        if(r.descriptors.mask&4u)assert(!memcmp(r.descriptors.words[2],tiler,64));
+        if(r.descriptors.mask&8u)assert(!memcmp(r.descriptors.words[3],rt,64));
+        assert(f.allocs==allocations&&f.pages==page_count);
+        assert(!lm_core_vm_destroy(v));for(unsigned i=0;i<3;i++)pf(&f,&pages[i]);destroy(&f,d);
+    }
+    puts("Descriptor fault snapshots: real core, last-page job header, valid FBD/tiler/RT, NULL/unmapped/hidden pointers, disabled control, reset retention, zero capture allocations PASS");
+}
 int main(int argc,char**argv) {
-    if(argc>1 && !strcmp(argv[1],"quarantine")){quarantine();return 0;}
+    if(argc>1 && !strcmp(argv[1],"descriptor-fault")){descriptor_fault_snapshot();return 0;}
+    if(argc>1 && !strcmp(argv[1],"quarantine")){quarantine();preflush_quarantine();return 0;}
     if(argc>1 && !strcmp(argv[1],"mmio")){io_failure();return 0;}
     if(argc>1 && !strcmp(argv[1],"private-quarantine")){private_dma_quarantine();return 0;}
     if(argc>1 && !strcmp(argv[1],"private-clear")){private_clear();private_clear_mismatch();private_clear_chain();private_clear_chain_mismatch();return 0;}
     if(argc>1 && !strcmp(argv[1],"private-triangle")){private_triangle();private_triangle_mismatch();return 0;}
-    identity();mapping();isolation();oom();reclaim();failures();posted_write_proofs();private_dma_transaction();private_mmu_fault();private_clear();private_clear_mismatch();private_clear_chain();private_clear_chain_mismatch();private_triangle();private_triangle_mismatch();return 0;
+    gpu_sharing();preasflush();preflush_ordering();preflush_failures();identity();mapping();isolation();oom();reclaim();failures();posted_write_proofs();private_dma_transaction();private_mmu_fault();private_clear();private_clear_mismatch();private_clear_chain();private_clear_chain_mismatch();private_triangle();private_triangle_mismatch();return 0;
 }

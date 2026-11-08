@@ -38,6 +38,7 @@
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
 #include <pexpert/arm64/board_config.h>
+#include <arm64/lancelot_sgi_observation.h>
 
 #if defined(GENERIC_GIC_V3_IRQ)
 
@@ -91,6 +92,8 @@ static vm_offset_t gicr_cpu_base[MAX_CPUS]; /* each processor's redistributor fr
  */
 #define GIC_IAR_TAKEN           (1ULL << 63)
 static uint64_t gic_active_iar[MAX_CPUS];
+static struct lsg_observer gic_sgi_observers[MAX_CPUS];
+_Atomic uint32_t lancelot_sgi_observation_enabled;
 uint64_t        gic_unhandled_count;
 uint32_t        gic_last_unhandled;
 
@@ -119,6 +122,35 @@ uint64_t gic_v3_spi_count(uint32_t intid);
 void gic_v3_irq_cpu_shutdown(void);
 void gic_v3_irq_signal(uint32_t phys_id);
 void gic_v3_irq_signal_stop(uint32_t phys_id);
+uint64_t gic_v3_irq_peek_cpu(unsigned cpu);
+
+/* Observe the saved acknowledge word. Reading ICC_IAR1_EL1 here would consume
+ * an interrupt, so the diagnostic never accesses the CPU interface. */
+uint64_t gic_v3_irq_peek_cpu(unsigned cpu)
+{
+    return cpu<MAX_CPUS?os_atomic_load(&gic_active_iar[cpu],relaxed):0;
+}
+
+void
+lancelot_sgi_enter(unsigned cpu, uint32_t stage, uint32_t signal,
+    uintptr_t callback, uintptr_t argument)
+{
+    if(cpu>=MAX_CPUS)return;
+    lsg_push(&gic_sgi_observers[cpu],stage,signal,callback,argument,
+        __builtin_arm_rsr64("CNTVCT_EL0"));
+}
+void
+lancelot_sgi_leave(unsigned cpu)
+{
+    if(cpu<MAX_CPUS)lsg_pop(&gic_sgi_observers[cpu]);
+}
+bool
+lancelot_sgi_read(unsigned cpu, struct lsg_sample *sample)
+{
+    if(!sample||cpu>=MAX_CPUS||!os_atomic_load(&lancelot_sgi_observation_enabled,acquire))return false;
+    *sample=lsg_snapshot(&gic_sgi_observers[cpu]);
+    return true;
+}
 
 static inline uint32_t
 gic_read32(vm_offset_t addr)
@@ -315,7 +347,9 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 			getCpuDatap()->cpu_decrementer = -1; /* Large */
 			rtclock_intr(TRUE);
 		} else if (intid == GIC_SGI_SIGNAL) {
+			LSG_ENTER(getCpuDatap(),LSG_HANDLER,os_atomic_load(&getCpuDatap()->cpu_signal,relaxed),cpu_signal_handler,0);
 			cpu_signal_handler();
+			LSG_LEAVE(getCpuDatap());
 		} else if (intid == GIC_SGI_STOP) {
 			/* comes back only if nobody has in fact asked for that */
 			psci_smp_stop_here();
@@ -424,6 +458,10 @@ gic_v3_irq_cpu_init(void)
 		DTEntry entry;
 		void const *prop;
 		unsigned int prop_size;
+		uint32_t data=0,profile=0;
+		if(PE_parse_boot_argn("lancelot_data",&data,sizeof(data))&&data==1&&
+		   PE_parse_boot_argn("lancelot_profile",&profile,sizeof(profile))&&profile==2)
+			os_atomic_store(&lancelot_sgi_observation_enabled,1,release);
 
 		if (SecureDTLookupEntry(NULL, "/arm-io/gic", &entry) != kSuccess ||
 		    SecureDTGetProperty(entry, "reg", &prop, &prop_size) != kSuccess ||

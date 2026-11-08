@@ -38,6 +38,14 @@ outputs to `$MESA_BUILD/out`. The source archive and venv are cached there.
   screen/BO hooks, a fixed 16 MiB tiler heap and the shared LMAL UAPI header
   from `xnu/files/iokit/Kernel/lancelot_mali_uapi.h`; changing any of those
   changes the build key.
+- **An IOSurface as a texture.** `glEGLImageTargetTexture2DOES` is given the
+  IOSurface's ID (there is no EGL here). The OSMesa frontend hook asks the
+  shim for the surface's geometry (`lancelot_surface_query()`, LMAL
+  `SURFACE_QUERY`) and hands Panfrost a `WINSYS_HANDLE_TYPE_FD` handle whose
+  "fd" is that ID; `panfrost_bo_import()` calls `drmPrimeFDToHandle()`, which
+  the shim maps to LMAL `SURFACE_IMPORT`. Only a single-plane 'BGRA' surface
+  is accepted, which is what CoreAnimation's drawables are. The kernel side is
+  `xnu/files/iokit/Kernel/LancelotMali.cpp` (surface_query/surface_import).
 - Mesa builds are not byte-reproducible; compare source trees, not hashes.
 - The library's install name is `/redwood/lib/libOSMesa.8.dylib`, matching the
   userland image layout.

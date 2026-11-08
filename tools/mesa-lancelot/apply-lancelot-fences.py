@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply LMAL v1's explicit synchronous-fence policy to Mesa Panfrost."""
+"""Preserve real Panfrost fences on Darwin using retained completion snapshots."""
 from pathlib import Path
 root=Path(__file__).resolve().parent
 src=Path(__import__('sys').argv[1]).resolve()
@@ -41,18 +41,13 @@ panfrost_fence_create(struct panfrost_context *ctx)
 #ifdef __APPLE__
    struct pipe_fence_handle *f = calloc(1, sizeof(*f));
    if (!f) return NULL;
-   if (drmSyncobjWait(panfrost_device_fd(dev), &ctx->syncobj, 1,
-                      INT64_MAX, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL) < 0) {
-      free(f);
-      return NULL;
-   }
-   if (drmSyncobjCreate(panfrost_device_fd(dev), DRM_SYNCOBJ_CREATE_SIGNALED,
-                        &f->syncobj) < 0) {
+   if (lancelot_drm_syncobj_snapshot(panfrost_device_fd(dev), ctx->syncobj,
+                                    &f->syncobj) < 0) {
       free(f);
       return NULL;
    }
    pipe_reference_init(&f->reference, 1);
-   f->signaled = true;
+   f->signaled = false;
    return f;
 #else''')
 change(Path('src/gallium/drivers/panfrost/pan_fence.c'),'''   close(fd);
@@ -82,4 +77,4 @@ change(Path('src/gallium/drivers/panfrost/pan_context.c'),'''   ret = drmSyncobj
    close(fd);
 #endif''')
 change(Path('src/gallium/drivers/panfrost/pan_screen.c'),'   caps->native_fence_fd = true;','   caps->native_fence_fd = false;')
-print('Applied LMAL v1 synchronous fence policy')
+print('Applied LMAL retained fence snapshots; completion stays in fence_finish')

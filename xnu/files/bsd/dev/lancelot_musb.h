@@ -24,6 +24,10 @@ struct lancelot_musb {
 	void (*w8)(void *, unsigned, uint8_t);
 	void (*w16)(void *, unsigned, uint16_t);
 	size_t (*snapshot)(uint64_t, uint64_t *, uint8_t *, size_t);
+	size_t (*io_snapshot)(char *, size_t); /* optional, read-only bounded status */
+	size_t (*irq_snapshot)(char *, size_t); /* optional, no-ack CPU/IRQ observation */
+	size_t (*sgi_snapshot)(unsigned, char *, size_t); /* callback values for CPU 0..7 */
+	size_t (*debug_snapshot)(char *, size_t); /* existing debugger/retained-log state */
 	uint64_t boot, cursor, start;
 	uint8_t address, configuration, control[128], bytes[LU_HEADER + LU_SNAPSHOT];
 	unsigned state, reply, length, offset, control_length, control_offset, ack_polls;
@@ -246,6 +250,26 @@ static void lu_command(struct lancelot_musb *u, const char *cmd, unsigned n)
 	else if (!strcmp(cmd,"getvar:serialno")) reply="OKAYlancelot-uefi";
 	else if (!strcmp(cmd,"getvar:version-bootloader")) reply="OKAYxnu-musb-log-1";
 	else if (!strcmp(cmd,"getvar:log-version")) reply="OKAYKLOG2";
+	else if ((!strcmp(cmd,"getvar:lancelot-io") && u->io_snapshot) ||
+             (!strcmp(cmd,"getvar:lancelot-irq") && u->irq_snapshot) ||
+             (!strcmp(cmd,"getvar:lancelot-debug") && u->debug_snapshot)) {
+		char status[65]={0};memcpy(status,"OKAY",4);
+        size_t (*snapshot)(char *,size_t)=!strcmp(cmd,"getvar:lancelot-io")?u->io_snapshot:
+            (!strcmp(cmd,"getvar:lancelot-irq")?u->irq_snapshot:u->debug_snapshot);
+		size_t count=snapshot(status+4,61);
+		if(count && count<=60 && status[4+count]==0 && !memchr(status+4,0,count)) {
+			lu_send(u,status,(unsigned)count+4);return;
+		}
+		reply="FAILI/O status unavailable";
+	}
+	else if(n==21&&!memcmp(cmd,"getvar:lancelot-sgi:",20)&&cmd[20]>='0'&&cmd[20]<='7'&&u->sgi_snapshot) {
+		char status[65]={0};memcpy(status,"OKAY",4);
+		size_t count=u->sgi_snapshot((unsigned)(cmd[20]-'0'),status+4,61);
+		if(count&&count<=60&&status[4+count]==0&&!memchr(status+4,0,count)) {
+			lu_send(u,status,(unsigned)count+4);return;
+		}
+		reply="FAILSGI status unavailable";
+	}
 	else if (!strcmp(cmd,"getvar:max-download-size")) reply="OKAY0x00000000";
 	lu_send(u,reply,(unsigned)strlen(reply));
 }

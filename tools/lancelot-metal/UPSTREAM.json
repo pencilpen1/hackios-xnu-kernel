@@ -1,0 +1,243 @@
+{
+  "repository": "oosexgang/hakios-xnu-kernel",
+  "branch": "mtk",
+  "commit": "3f31f3428528ca4435cdc4826ea97dc9415225b5",
+  "files": [
+    {
+      "source": "tools/mesa/air/air2nir.c",
+      "destination": "tools/mesa-lancelot/air/air2nir.c",
+      "sha256": "7ba1f0fa2d73ff28bbe43d95941e80ada0fb347950b56bccb294dda12e54a0ea"
+    },
+    {
+      "source": "tools/mesa/air/air_bitcode.c",
+      "destination": "tools/mesa-lancelot/air/air_bitcode.c",
+      "sha256": "1093a56e65d328268f0643425d737a85be6700389dd424f0c146fb9f1054d323"
+    },
+    {
+      "source": "tools/mesa/air/air_bitcode.h",
+      "destination": "tools/mesa-lancelot/air/air_bitcode.h",
+      "sha256": "f5f8249cad75e1424a306b93d2a884e04975564e8319bdb659e4df7abab8b6cb"
+    },
+    {
+      "source": "tools/mesa/air/air_intrinsics.c",
+      "destination": "tools/mesa-lancelot/air/air_intrinsics.c",
+      "sha256": "3ba245ec43eef19dab8b06144ba86b22231cfb42dd584d2f5ce1928862e2912a"
+    },
+    {
+      "source": "tools/mesa/air/air_layout.c",
+      "destination": "tools/mesa-lancelot/air/air_layout.c",
+      "sha256": "f831e70dd4c71cccd4f130509e3fe0f3db8aa77861270fb08705675a50fdb3b3"
+    },
+    {
+      "source": "tools/mesa/air/air_metal.c",
+      "destination": "tools/mesa-lancelot/air/air_metal.c",
+      "sha256": "38bcf831a519651f9027074576aa67a4060c173cd9ce2f31258bb6ec5eba72d3"
+    },
+    {
+      "source": "tools/mesa/air/air_metal.h",
+      "destination": "tools/mesa-lancelot/air/air_metal.h",
+      "sha256": "e6ca0a749feae266180417ccac1b56a4a48224ad4dbafa5a98facdcbee0f3761"
+    },
+    {
+      "source": "tools/mesa/air/air_metal_test.c",
+      "destination": "tools/mesa-lancelot/air/air_metal_test.c",
+      "sha256": "fe11df1f72ec6fda4529b5cdb451637a8d45bc74c673d127e952b658b81db86e"
+    },
+    {
+      "source": "tools/mesa/air/air_metallib.c",
+      "destination": "tools/mesa-lancelot/air/air_metallib.c",
+      "sha256": "49f4f8e38019cf0169955eca89537efffb9f2b5c6771d5ed4f9f0f10c07815a4"
+    },
+    {
+      "source": "tools/mesa/air/air_module.c",
+      "destination": "tools/mesa-lancelot/air/air_module.c",
+      "sha256": "fb537e9a0f301e327a5c67d2b66d3fa8c7b2022c33f1fe9d7acc3f73b2c175f1"
+    },
+    {
+      "source": "tools/mesa/air/air_module.h",
+      "destination": "tools/mesa-lancelot/air/air_module.h",
+      "sha256": "d16c17982938ed3bd7f99ea907023edd170a280685fc315a24ec5e29e39ddfd6"
+    },
+    {
+      "source": "tools/mesa/air/air_print.c",
+      "destination": "tools/mesa-lancelot/air/air_print.c",
+      "sha256": "01f5e96e5bbdfd73d43f7d28424ba7071a6956120f7bdd1051889628f8f5276a"
+    },
+    {
+      "source": "tools/mesa/air/air_private.h",
+      "destination": "tools/mesa-lancelot/air/air_private.h",
+      "sha256": "194dc875eba3f1c8207322eb223bd809d868552c5be86657bedd52f755c1722d"
+    },
+    {
+      "source": "tools/mesa/air/air_run.c",
+      "destination": "tools/mesa-lancelot/air/air_run.c",
+      "sha256": "e991e05d9c2a9ef31c2bda9545163fda5d27bc93e011e4aed74a4dc58c11ef2c"
+    },
+    {
+      "source": "tools/mesa/air/air_to_nir.c",
+      "destination": "tools/mesa-lancelot/air/air_to_nir.c",
+      "sha256": "d46c25fd45b9f44fd35d52f1b6f4566542a36dfbba9e659ebf27cbe186ce7094"
+    },
+    {
+      "source": "tools/mesa/air/meson.build",
+      "destination": "tools/mesa-lancelot/air/meson.build",
+      "sha256": "af839fbf7da29c6c19928b1a7b8826325d6800dba00cf81dc95e8a3633c07cd0"
+    },
+    {
+      "source": "tools/mesa/air/nir_air.h",
+      "destination": "tools/mesa-lancelot/air/nir_air.h",
+      "sha256": "fa8b2edf2fb96722a0e9f494b1d174dd7282f7db67c7c58fc52688d9bf524fe5"
+    },
+    {
+      "source": "tools/mesa/panfrost-redwood-perf.patch",
+      "destination": "tools/mesa-lancelot/hakios-mtk-perf.patch",
+      "sha256": "a6c92b98ac71db69352d170c33ba2009f21dac00335d883f979f8ced1c1bc6f3"
+    },
+    {
+      "source": "tools/mesa/panfrost-osmesa-air.patch",
+      "destination": "tools/mesa-lancelot/hakios-mtk-osmesa-air.patch",
+      "sha256": "cc10b5755b9360d19c5d990fd0f1a3415821a7742b0abe6546dd5bf732306592"
+    },
+    {
+      "source": "userland/src/metal/air.cpp",
+      "destination": "tools/lancelot-metal/src/metal/air.cpp",
+      "sha256": "13b764c99e0b5b91e80a02285ca4d86da04acbe83896b1137f5f139182299389"
+    },
+    {
+      "source": "userland/src/metal/argenc.cpp",
+      "destination": "tools/lancelot-metal/src/metal/argenc.cpp",
+      "sha256": "1df72b364169b46fb2fc9ec7f2f7b1b77f6ae7af305f2e9f86af03ee26d3029a"
+    },
+    {
+      "source": "userland/src/metal/blit.cpp",
+      "destination": "tools/lancelot-metal/src/metal/blit.cpp",
+      "sha256": "a3e0a9cd48fb08da6b25f130d09bce7b45e6b4692b590e7bd8d042d0dc54d694"
+    },
+    {
+      "source": "userland/src/metal/buffer.cpp",
+      "destination": "tools/lancelot-metal/src/metal/buffer.cpp",
+      "sha256": "5a6aebe537309be592336de51d20a4ee141c54913d27be16a9d2011536ff1846"
+    },
+    {
+      "source": "userland/src/metal/cmdbuf.cpp",
+      "destination": "tools/lancelot-metal/src/metal/cmdbuf.cpp",
+      "sha256": "a8176cc15f39802acee46016ed3779d0d3681d2508aa13485718e310b08b5e2a"
+    },
+    {
+      "source": "userland/src/metal/command.cpp",
+      "destination": "tools/lancelot-metal/src/metal/command.cpp",
+      "sha256": "cff00371b2e08a29bb7491c1d30fb1d5c7800ed891dbf10618aa2ab08a5d30fc"
+    },
+    {
+      "source": "userland/src/metal/compute.cpp",
+      "destination": "tools/lancelot-metal/src/metal/compute.cpp",
+      "sha256": "8ab9f33310738d51a07924aa659bbb82c8f0324bcf388834557cb8b481a8059e"
+    },
+    {
+      "source": "userland/src/metal/draw.cpp",
+      "destination": "tools/lancelot-metal/src/metal/draw.cpp",
+      "sha256": "b1f9a80c0ee2149a3b8f4a66079d9e0beb450ebc9b804b95098e2d41743c76b2"
+    },
+    {
+      "source": "userland/src/metal/drawable.cpp",
+      "destination": "tools/lancelot-metal/src/metal/drawable.cpp",
+      "sha256": "ad1a9a3dbf510dff6272a28bbf20bd9dcb953662ebc1732abfc8ba1eb2884891"
+    },
+    {
+      "source": "userland/src/metal/drawable.h",
+      "destination": "tools/lancelot-metal/src/metal/drawable.h",
+      "sha256": "304661ad3de6c0bcbb1feb65f6e01d00d9b808ad01e22c9485e8da5136b37571"
+    },
+    {
+      "source": "userland/src/metal/import.cpp",
+      "destination": "tools/lancelot-metal/src/metal/import.cpp",
+      "sha256": "3c0ee872ac56d12258e779f9b8e201286520dad8461bfc0e059c71aacbfb7c87"
+    },
+    {
+      "source": "userland/src/metal/log.cpp",
+      "destination": "tools/lancelot-metal/src/metal/log.cpp",
+      "sha256": "236b5d7abdefdf0f7134f4cf599cb08ad973358254aab33027158b822a9df42b"
+    },
+    {
+      "source": "userland/src/metal/perf.cpp",
+      "destination": "tools/lancelot-metal/src/metal/perf.cpp",
+      "sha256": "c3793a9a4ac5601e45205a7182c54735c49e3c230a5d9b8e907c9a11f7ce1a2b"
+    },
+    {
+      "source": "userland/src/metal/pipeline.cpp",
+      "destination": "tools/lancelot-metal/src/metal/pipeline.cpp",
+      "sha256": "3769c9b64ae124ed1d663131fce37800ec4df186261016e4993e22be203e9c4a"
+    },
+    {
+      "source": "userland/src/metal/plib.cpp",
+      "destination": "tools/lancelot-metal/src/metal/plib.cpp",
+      "sha256": "401426859e7d1116ff72f9e02f157c27192a9a0257127144734fde387a9d7186"
+    },
+    {
+      "source": "userland/src/metal/recipes.cpp",
+      "destination": "tools/lancelot-metal/src/metal/recipes.cpp",
+      "sha256": "ab5d5cb4f7dfc09f9482e413255da45e65ca05c8c7d95b53c013126e04de6ce0"
+    },
+    {
+      "source": "userland/src/metal/render.cpp",
+      "destination": "tools/lancelot-metal/src/metal/render.cpp",
+      "sha256": "7ccbb14e5cca0bed56cb578df67fe81ebdadb1b840e67c9f57488094ab7182de"
+    },
+    {
+      "source": "userland/src/metal/run.cpp",
+      "destination": "tools/lancelot-metal/src/metal/run.cpp",
+      "sha256": "015dec430badb176a0a0c1598a5c5f0c8fd2e9b35ff31dfd409f519abf84501d"
+    },
+    {
+      "source": "userland/src/metal/rwm.h",
+      "destination": "tools/lancelot-metal/src/metal/rwm.h",
+      "sha256": "782d66677b3d2b01bc6bcbb9503d1e743673957a7ff8ce32059c2a419573c316"
+    },
+    {
+      "source": "userland/src/metal/shape.cpp",
+      "destination": "tools/lancelot-metal/src/metal/shape.cpp",
+      "sha256": "485f8c4d3ed91c717476e03059da27f0636e2ddf27418e7c276f52406fc80bf9"
+    },
+    {
+      "source": "userland/src/metal/surfaces.cpp",
+      "destination": "tools/lancelot-metal/src/metal/surfaces.cpp",
+      "sha256": "111b05c0b8c4027762b3ce02fa651f6cff37851944c866da811953cec6f7c96f"
+    },
+    {
+      "source": "userland/src/metal/texture.cpp",
+      "destination": "tools/lancelot-metal/src/metal/texture.cpp",
+      "sha256": "fc1e83277014828527875c4dc87b64f4861f738f5769da3079eee66e344f758a"
+    },
+    {
+      "source": "userland/src/metal/worker.cpp",
+      "destination": "tools/lancelot-metal/src/metal/worker.cpp",
+      "sha256": "f5bc79973ca112a2abc9486365b418121b53f0fb8dc20542978cdad7862ce728"
+    },
+    {
+      "source": "userland/src/redwoodmetal.m",
+      "destination": "tools/lancelot-metal/src/redwoodmetal.m",
+      "sha256": "ebff8c0ed2cabb9227d443b86b5183fe03eabd6f2e20ff8d4d7fb43d8fea3543"
+    },
+    {
+      "source": "userland/src/metal_plugin.plist",
+      "destination": "tools/lancelot-metal/src/metal_plugin.plist",
+      "sha256": "ec59feb23a01ce22013a8f3457b8aa8e8aaf47831f3f952b06b5bc6ea85895e9"
+    },
+    {
+      "source": "userland/src/metal_props.c",
+      "destination": "tools/lancelot-metal/src/metal_props.c",
+      "sha256": "1fe04dbfd071393285e181607dabf931d8cd0abc172f9b50c7c91b8ab5d1d703"
+    },
+    {
+      "source": "userland/src/metal_drv_test.m",
+      "destination": "tools/lancelot-metal/src/metal_drv_test.m",
+      "sha256": "7e7a268261ef3ebacd34f3423c2543a8c94fb3e64f6dd7e2b301ac40c80816cd"
+    },
+    {
+      "source": "userland/src/inject.c",
+      "destination": "tools/lancelot-metal/src/inject-reference.c",
+      "sha256": "68223c5951f21258a6899e5b906e24744bdf1bfd58a34f7582a0a8987c79ffae"
+    }
+  ],
+  "license_note": "Original source notices retained; no relicensing."
+}

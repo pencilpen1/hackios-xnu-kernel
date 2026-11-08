@@ -18,7 +18,7 @@ BASE=c54f35ca767986246321eb901baf8f5ff7923f6a
 mkdir -p "$(dirname "$DIR")"
 DIR=$(cd "$(dirname "$DIR")" && pwd)/$(basename "$DIR")
 git init -q "$DIR"
-trap 'echo "apply.sh: failed; removing the incomplete $DIR" >&2; rm -rf "$DIR"' ERR
+trap 'echo "apply.sh: failed; preserving the incomplete $DIR for review" >&2' ERR
 cd "$DIR"
 git remote add origin "$URL"
 git fetch -q --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG"      # that one release, without the history
@@ -27,5 +27,10 @@ git checkout -q -b redwood "$TAG"
 echo 'BUILD/' >> .git/info/exclude
 git apply --whitespace=nowarn "$HERE/redwood.patch"
 [ ! -s "$HERE/lancelot.patch" ] || git apply --whitespace=nowarn "$HERE/lancelot.patch"
+python3 "$HERE/../tools/apply-lancelot-cpu-lease.py" "$DIR"
+python3 "$HERE/../tools/apply-lancelot-gpu-vm-lease.py" "$DIR"
 cp -a "$HERE/files/." .
+python3 "$HERE/../tools/apply-lancelot-data-hfs.py" "$DIR"
+python3 "$HERE/../tools/apply-lancelot-boot-log.py" "$DIR"
+python3 "$HERE/../tools/apply-lancelot-sgi-observation.py" "$DIR"
 echo "apply.sh: $DIR: $TAG + $(grep -c '^diff --git' "$HERE/redwood.patch") changed and $(find "$HERE/files" -type f | wc -l) new files"

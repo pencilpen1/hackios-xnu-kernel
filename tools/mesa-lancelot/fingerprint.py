@@ -8,6 +8,6 @@ paths=[]
 for folder in ['air','lancelot-drm']:
     paths.extend(p for p in (root/folder).rglob('*') if p.is_file())
 paths.extend(p for p in root.iterdir() if p.is_file() and p.suffix in ['.py','.meson','.patch','.sh'])
-paths.extend([repo/'xnu/files/iokit/Kernel/lancelot_mali_uapi.h'])
+paths.extend([repo/'xnu/files/iokit/Kernel/lancelot_mali_uapi.h', repo/'xnu/files/iokit/Kernel/lancelot_mali_queue_uapi.h'])
 for p in sorted(set(paths),key=lambda p:str(p.relative_to(repo))):
     print(hashlib.sha256(p.read_bytes()).hexdigest(),p.relative_to(repo).as_posix())

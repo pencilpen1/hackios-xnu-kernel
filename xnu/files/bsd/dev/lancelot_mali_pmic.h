@@ -105,7 +105,22 @@ int lmp_pmic_disable(struct lmp_pmic_state *state, enum lmp_rail rail);
 int lmp_pmic_get_voltage_uv(struct lmp_pmic_state *state, enum lmp_rail rail,
                             uint32_t *uv);
 int lmp_pmic_set_voltage_uv(struct lmp_pmic_state *state, enum lmp_rail rail,
-                            uint32_t uv);
+                             uint32_t uv);
+
+/* Two stable DA enable/voltage passes inside one global WACS2 acquisition.
+ * No CPU writes or changes to PWRAP arbitration/poison semantics. */
+int lmp_pmic_gpu_rails(struct lmp_pmic_state *state, struct lmp_gpu_rails *rails);
+/* Actual OP_EN readback: SW/AP enabled, no other enabled hardware source.
+ * Does not modify a control source or claim security/foreign-peer exclusion. */
+int lmp_pmic_native_ap_ready(struct lmp_pmic_state *state);
+
+/* Read-only CPU observation through the SAME WACS2 arbiter/poison protocol.
+ * Cluster0 (LL) shares VPROC12/VSRAM12 with CCI; cluster1 uses11.
+ * No CPU voltage/enable writes are exposed by this interface. */
+struct lmp_cpu_rails {
+    uint32_t vproc_uv[2], vsram_uv[2];
+};
+int lmp_pmic_cpu_rails(struct lmp_pmic_state *state, struct lmp_cpu_rails *rails);
 
 #ifdef __cplusplus
 }

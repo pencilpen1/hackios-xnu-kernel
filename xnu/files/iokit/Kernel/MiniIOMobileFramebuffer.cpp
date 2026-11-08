@@ -39,6 +39,7 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 #include <IOKit/IOBufferMemoryDescriptor.h>
 
 #include "MiniIOSurface.h"
+#include "LancelotMaliCpuLease.h"
 
 extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
 
@@ -305,6 +306,7 @@ public:
 	void reportFrameTimes(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
+	void drawAvailableRows(const struct RowJob * job, uint32_t * blendRow);
 	static void helperMain(void * self, wait_result_t result);
 	/* the scaling shared out (fb_threads): fThreads drawers, the presenter and fThreads - 1 helpers */
 	unsigned        fThreads;
@@ -312,6 +314,7 @@ public:
 	const struct RowJob * fHelperJob;
 	uint64_t        fHelperGeneration;
 	unsigned        fHelpersBusy, fHelpersStarted;
+	int32_t         fNextRow, fEndRow;
 	uint32_t *      fHelperBlend[7];
 	void record(MiniIOSurface * s);
 };
@@ -569,9 +572,29 @@ IOMobileFramebuffer::defaultSurface(void)
 static inline uint32_t
 blend(uint32_t a, uint32_t b, uint32_t w)
 {
-	uint32_t rb = ((a & 0xff00ff) * (256 - w) + (b & 0xff00ff) * w) >> 8 & 0xff00ff;
-	uint32_t ga = ((a >> 8 & 0xff00ff) * (256 - w) + (b >> 8 & 0xff00ff) * w) & 0xff00ff00;
+	/* The same unsigned32 interpolation modulo 2^32, with one multiply
+	 * per packed channel pair instead of two. Keep both rounding points,
+	 * alpha and the bilinear filter unchanged; no SIMD/FPU in the kernel. */
+	uint32_t ar = a & 0xff00ff, br = b & 0xff00ff;
+	uint32_t ag = a >> 8 & 0xff00ff, bg = b >> 8 & 0xff00ff;
+	uint32_t rb = ((ar << 8) + (br - ar) * w) >> 8 & 0xff00ff;
+	uint32_t ga = ((ag << 8) + (bg - ag) * w) & 0xff00ff00;
 
+	return rb | ga;
+}
+
+/* Two adjacent pixels, one vertical weight. Four independent 16-bit lanes
+ * hold the channel numerators; their maxima (255*256) cannot carry into the
+ * next lane. Unsigned arithmetic retains exactly blend()'s first rounding
+ * point and alpha. Integer registers only, including unaligned-safe loads. */
+static inline uint64_t
+blend_pair(uint64_t a, uint64_t b, uint32_t w)
+{
+	const uint64_t mask = UINT64_C(0x00ff00ff00ff00ff);
+	uint64_t ar = a & mask, br = b & mask;
+	uint64_t ag = (a >> 8) & mask, bg = (b >> 8) & mask;
+	uint64_t rb = ((ar << 8) + (br - ar) * w) >> 8 & mask;
+	uint64_t ga = ((ag << 8) + (bg - ag) * w) & (mask << 8);
 	return rb | ga;
 }
 
@@ -621,7 +644,7 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 			memcpy(to + px0, pixels + (size_t) (sy + y - py0) * stride + (size_t) sx * 4, (size_t) sw * 4);
 			continue;
 		}
-		if (filter) {
+	if (filter) {
 			int64_t at = sample_at(y - py0, sh, py1 - py0);
 			uint32_t row = (uint32_t) (at >> 8), weight = (uint32_t) (at & 255);
 			const uint32_t * upper = (const uint32_t *) (pixels + (size_t) (sy + row) * stride) + sx;
@@ -634,7 +657,17 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 
 				uint32_t * __restrict mixed = blendRow;
 
-				for (uint32_t c = first; c <= last; c++) {
+				uint32_t c = first;
+				for (; c < last; c += 2) {
+					uint64_t a, b, value;
+					memcpy(&a, upper + c, sizeof(a));
+					memcpy(&b, lower + c, sizeof(b));
+					value = a == b ? a : blend_pair(a, b, weight);
+					memcpy(mixed + c, &value, sizeof(value));
+				}
+				/* The paired loop leaves at most one source pixel. Spell this
+				 * out so the compiler cannot vectorize a fictitious long tail. */
+				if (c <= last) {
 					uint32_t a = upper[c], b = lower[c];
 
 					mixed[c] = a == b ? a : blend(a, b, weight);           /* (most of a screen is the same as next to it) */
@@ -650,11 +683,15 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 				    from[fColumn[x]];
 
 				if (to[x] != value) {
+					/* Keep optional bounds accounting scalar too: adjacent
+					 * min/max fields otherwise invite NEON SLP generation. */
+					volatile uint32_t &left = fDiffLeft, &right = fDiffRight;
+					volatile uint32_t &top = fDiffTop, &bottom = fDiffBottom;
 					fDiffPixels++;
-					fDiffLeft = (uint32_t) x < fDiffLeft ? (uint32_t) x : fDiffLeft;
-					fDiffRight = (uint32_t) x > fDiffRight ? (uint32_t) x : fDiffRight;
-					fDiffTop = (uint32_t) y < fDiffTop ? (uint32_t) y : fDiffTop;
-					fDiffBottom = (uint32_t) y > fDiffBottom ? (uint32_t) y : fDiffBottom;
+					left = (uint32_t) x < left ? (uint32_t) x : left;
+					right = (uint32_t) x > right ? (uint32_t) x : right;
+					top = (uint32_t) y < top ? (uint32_t) y : top;
+					bottom = (uint32_t) y > bottom ? (uint32_t) y : bottom;
 				}
 			}
 		}
@@ -663,7 +700,19 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 			const uint16_t * __restrict weights = fColumnWeight + cx0;
 			uint32_t * __restrict out = to + cx0;
 
-			for (uint32_t i = 0, n = (uint32_t) (cx1 - cx0); i < n; i++) {
+			uint32_t i = 0, n = (uint32_t) (cx1 - cx0);
+			/* Pair adjacent stores to the existing panel mapping. memcpy of a
+			 * fixed eight bytes allows unaligned normal-memory destinations and
+			 * strict aliasing without another pixel buffer or SIMD in the kernel. */
+			for (; i + 1 < n; i += 2) {
+				uint32_t c0 = column[i], w0 = weights[i], a0 = from[c0];
+				uint32_t c1 = column[i + 1], w1 = weights[i + 1], a1 = from[c1];
+				uint32_t p0 = w0 == 0 || a0 == from[c0 + 1] ? a0 : blend(a0, from[c0 + 1], w0);
+				uint32_t p1 = w1 == 0 || a1 == from[c1 + 1] ? a1 : blend(a1, from[c1 + 1], w1);
+				uint64_t pair = (uint64_t)p0 | (uint64_t)p1 << 32;
+				memcpy(out + i, &pair, sizeof(pair));
+			}
+			for (; i < n; i++) {
 				uint32_t c = column[i], w = weights[i], a = from[c];
 
 				out[i] = w == 0 || a == from[c + 1] ? a : blend(a, from[c + 1], w);
@@ -673,6 +722,26 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 				to[x] = from[fColumn[x]];
 			}
 		}
+	}
+}
+
+/* Claim disjoint, clipped stripes. A fast or promptly scheduled worker can
+ * consume more than one third of a layer instead of waiting for a slow core.
+ * The generation and final helper join still retain the stack RowJob and all
+ * source/column/blend storage until every worker has finished its last stripe. */
+void
+IOMobileFramebuffer::drawAvailableRows(const RowJob * job, uint32_t * blendRow)
+{
+	for (;;) {
+		IOLockLock(fHelperLock);
+		int32_t first = fNextRow;
+		int32_t end = fEndRow - first > 32 ? first + 32 : fEndRow;
+		fNextRow = end;
+		IOLockUnlock(fHelperLock);
+		if (first >= end) {
+			return;
+		}
+		drawRows(job, first, end, blendRow);
 	}
 }
 
@@ -689,7 +758,6 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
 	IOLockUnlock(fb->fHelperLock);
 	for (;;) {
 		const RowJob * job;
-		int32_t rows, y0, y1;
 		uint32_t * blend;
 
 		IOLockLock(fb->fHelperLock);
@@ -699,12 +767,8 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
 		done = fb->fHelperGeneration;
 		job = fb->fHelperJob;
 		IOLockUnlock(fb->fHelperLock);
-		/* share index + 1 of fThreads (the presenter takes share 0) */
-		rows = job->py1 - job->py0;
-		y0 = job->py0 + (int32_t) ((int64_t) rows * (index + 1) / fb->fThreads);
-		y1 = job->py0 + (int32_t) ((int64_t) rows * (index + 2) / fb->fThreads);
 		blend = fb->fHelperBlend[index];
-		fb->drawRows(job, y0, y1, blend);
+		fb->drawAvailableRows(job, blend);
 		IOLockLock(fb->fHelperLock);
 		fb->fHelpersBusy--;
 		if (fb->fHelpersBusy == 0) {
@@ -775,7 +839,10 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	filter = filter && fBlendRow != NULL;
 	/* which pixel of a source row each pixel of a panel row takes: worked out once, not 2.6 million times */
 	cx0 = px0 < 0 ? 0 : px0;
-	cx1 = (uint32_t) px1 > fPanelWidth ? (int32_t) fPanelWidth : px1;
+	cx1 = px1 > (int32_t) fPanelWidth ? (int32_t) fPanelWidth : px1;
+	if (cx0 >= cx1 || py1 <= 0 || py0 >= (int32_t) fPanelHeight) {
+		return;
+	}
 	for (int32_t x = cx0; x < cx1; x++) {
 		if (filter) {
 			int64_t at = sample_at(x - px0, sw, px1 - px0);
@@ -804,14 +871,17 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		drawRows(&job, py0, py1, fBlendRow);
 		return;
 	}
-	/* shared out: the helpers take their rows, this thread the first share, then waits for them */
+	/* shared out on demand; all helpers must join even if another worker has
+	 * already claimed the final stripe. */
 	IOLockLock(fHelperLock);
 	fHelperJob = &job;
+	fNextRow = py0 < 0 ? 0 : py0;
+	fEndRow = py1 > (int32_t) fPanelHeight ? (int32_t) fPanelHeight : py1;
 	fHelpersBusy = fThreads - 1;
 	fHelperGeneration++;
 	IOLockWakeup(fHelperLock, &fHelperGeneration, false);
 	IOLockUnlock(fHelperLock);
-	drawRows(&job, py0, py0 + (int32_t) ((int64_t) (py1 - py0) / fThreads), fBlendRow);
+	drawAvailableRows(&job, fBlendRow);
 	IOLockLock(fHelperLock);
 	while (fHelpersBusy != 0) {
 		IOLockSleep(fHelperLock, &fHelpersBusy, THREAD_UNINT);
@@ -936,14 +1006,41 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	uint32_t layers = 0;
 	MiniIOSurface * recorded = NULL;
 	bool report;
+	LancelotMaliReadGroup readers;
+	LancelotMaliQueueReadGroup queueReaders;
+	bool gpuReady = true;
 
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
-		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
-			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
+		if (surfaces[layer] != NULL && (!MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS) ||
+		    !MiniIOSurfaceMaliDrawn(surfaces[layer], SWAP_GPU_MS))) {
+			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; dropping swap\n",
 			    swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(layer)), SWAP_GPU_MS);
+			gpuReady = false;
 		}
 	}
+	/* Same root order as GPU lease acquisition. Hold reader ownership through
+	 * ALL draw/helper/record work; a later writer cannot enter after waitCpu. */
+	for (unsigned layer = 0; gpuReady && layer < SWAP_LAYERS; layer++) {
+		if (!queueReaders.add(surfaces[layer], (uint64_t)SWAP_GPU_MS * 1000000)) {
+			gpuReady = false;
+			break;
+		}
+		LancelotMaliCpuLease *lease = surfaces[layer] ? surfaces[layer]->maliCpuLease : NULL;
+		if (!readers.add(lease)) gpuReady = false;
+	}
+	if (gpuReady && readers.acquire((uint64_t)SWAP_GPU_MS * 1000000) != LMAL_OK)
+		gpuReady = false;
 	fStatWaiting += mach_absolute_time() - began;
+	if (!gpuReady) {
+		readers.releaseReaders();
+		IOLockLock(fSwapLock);
+		fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
+		fSwapsWaiting--;
+		fStatLost++;
+		IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
+		IOLockUnlock(fSwapLock);
+		return; /* no pixel algorithm, clearing, copying or record ran */
+	}
 	began = ready = mach_absolute_time();
 	if (gOnTheBeat) {
 		uint64_t period, aim, next;
@@ -1108,6 +1205,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		fStatSince = 0;
 	}
 	IOLockUnlock(fLock);
+	readers.releaseReaders();
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */

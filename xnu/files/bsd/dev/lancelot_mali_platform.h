@@ -17,6 +17,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "lancelot_mali_dvfs.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -68,6 +69,11 @@ enum lmp_rail {
     LMP_RAIL_COUNT = 2,
 };
 
+struct lmp_gpu_rails {
+    uint32_t uv[LMP_RAIL_COUNT];
+    bool enabled[LMP_RAIL_COUNT];
+};
+
 struct lmp_pmic_ops {
     void *cookie;
     /* Provider operations, not raw PMIC/I2C register access. */
@@ -76,6 +82,82 @@ struct lmp_pmic_ops {
     int (*disable)(void *cookie, enum lmp_rail rail);
     int (*set_voltage_uv)(void *cookie, enum lmp_rail rail, uint32_t uv);
     int (*get_voltage_uv)(void *cookie, enum lmp_rail rail, uint32_t *uv);
+    /* Stable pair under the SAME shared WACS2 arbiter. Required for DVFS. */
+    int (*read_rails)(void *cookie, struct lmp_gpu_rails *rails);
+};
+
+#define LMP_DVFS_LIMIT_THERMAL 1u
+#define LMP_DVFS_LIMIT_BATTERY 2u
+#define LMP_DVFS_LIMIT_POWER   4u
+#define LMP_DVFS_LIMIT_ALL     7u
+#define LMP_DVFS_OPTIONAL_MAX_HZ 850000000u
+struct lmp_dvfs_limits {
+    /* Started means operational/start of real reads, NOT mere registration
+     * or initialization still pending. Fill lifecycle BEFORE reads, even on
+     * an error return. Valid feedback also implies started. Once seen, started
+     * is sticky in DVFS:
+     * removal/read failure cannot masquerade as a never-started provider. */
+    uint32_t started_mask;
+    uint32_t valid_mask;
+    uint32_t fault_mask; /* Actual read/feedback failure, not ordinary absence. */
+    uint32_t thermal_max_hz, battery_max_hz, power_max_hz;
+    /* Common freshness interval must cover every valid component. Absent
+     * components have no invented sensor value/cap and are ignored. A VALID
+     * zero cap is a real shutdown request, not a missing-provider sentinel. */
+    uint64_t sampled_ns, valid_until_ns;
+};
+struct lmp_dvfs_ops {
+    void *cookie;
+    /* Policy0 retains the original peer-exclusive contract. Policy1 is the
+     * explicit native AP route: same XNU executor, live core/control-source
+     * checks and unchanged parking source, NOT a firmware/all-peer grant. */
+    uint32_t control_policy;
+    /* Mandatory, success ONLY while caller owns global mali_lock, AP owns
+     * MFGPLL/mfg_sel/GPU rails AND shared TOP CKGEN frequency-meter registers
+     * against ALL foreign writers (including firmware), MAINPLL/syspll_d3
+     * parking reference/rate is held stable for the entire transition (this
+     * backend never writes that shared PLL), core is healthy,
+     * no bound/quarantined/unknown-DMA VM, fresh ALL JS CURRENT/NEXT idle and
+     * ALL present AS roots disabled/detached. Lock/known busy => EBUSY (no
+     * mutation). Unknown ownership/completion => EIO (revoke). No cached bool.
+     * Lock and exclusivity MUST remain held until this API returns for policy0.
+     * Native policy1 checks local serialization and actual control state at
+     * every boundary; external-peer exclusivity remains explicitly unverified.
+     * Its final-return context requires frozen callers and independent AP-OFF. */
+    int (*guard)(void *cookie);
+    /* Mandatory: terminal-offline core/service and retain ALL backing, no
+     * reset, DMA, power or clock writes. Called under that same mali_lock. */
+    void (*revoke)(void *cookie, int error);
+    /* Optional real hardware-backed XNU caps, never Android snapshots/mock
+     * temperature. Any never-started/absent component limits the effective
+     * maximum to850MHz but DOES NOT disable load DVFS or boost below that cap.
+     * Every available valid lower cap still wins. All three started+valid allow
+     * rated950MHz. NULL/ENODEV/ENOTSUP mean ordinary startup absence ONLY when
+     * no previously/explicitly started component is lost or invalid; aggregate
+     * ENODEV/ENOTSUP may report partial valid feedback with other components
+     * absent. Other errors, fault_mask, stale feedback or loss after start are
+     * protective failures. Sample again before every resource write. */
+    int (*limits)(void *cookie, struct lmp_dvfs_limits *limits);
+};
+#define LMP_DVFS_PEER_EXCLUSIVE 0u
+#define LMP_DVFS_NATIVE_AP 1u
+struct lmp_dvfs_clock {
+    uint32_t top, mfg[3], main[3]; /* CON0,CON1,CON3 */
+    uint32_t hz, park_hz;
+};
+struct lmp_dvfs_state {
+    struct lmp_dvfs_ops ops;
+    struct lmp_dvfs_clock clock;
+    struct lmp_gpu_rails rails;
+    uint32_t current_opp, target_opp, stage, transitions;
+    uint32_t measured_hz, meter_count, meter_samples;
+    uint32_t provider_started_mask, provider_valid_mask, provider_missing_mask;
+    uint32_t provider_fault_mask, effective_max_hz;
+    uint64_t measured_ns;
+    uint64_t operation_start_ns;
+    int error, provider_error;
+    bool attached, transitioning, changed, meter_valid, limit_policy_valid;
+    bool operation_active;
 };
 
 struct lmp_io_ops {
@@ -144,6 +226,7 @@ struct lmp_state {
     bool clock_owned;
     bool reset_owned;
     bool bus_owned;
+    struct lmp_dvfs_state dvfs;
 };
 
 /* Validate the board/ops contract. OFF mode intentionally needs no callbacks. */
@@ -173,6 +256,34 @@ int lmp_gpu_write32(struct lmp_state *state, uint32_t offset, uint32_t value);
 /* Teardown writes only resources owned by this state and only if safe. */
 int lmp_teardown(struct lmp_state *state);
 
+/* Explicit opt-in direct AP GPU backend; never inferred from FULL mode or
+ * SSPM CPU handoff. Existing lifecycle/read-only CPU observers are unchanged.
+ * Attach never changes clocks/rails; it uses the source-pinned CKGEN5 meter
+ * (debug/counter registers only, restored after known completion). target is
+ * an OPP index, 0=950MHz,29=299MHz. A successful return always has actual
+ * stable PLL/mux, independent CKGEN output measurement and DA rail readback.
+ * Errors after uncertainty/write revoke GPU rights; NEVER blindly rollback. */
+/* Fresh caps / normal optional-provider850MHz ceiling clamp demand (including
+ * a same-OPP request). Read current_opp
+ * after success. The adapter must check the result before EVERY next job and
+ * also run periodic idle governor ticks; this layer creates no background
+ * worker and cannot enforce a cap if the caller never invokes it. */
+int lmp_dvfs_attach(struct lmp_state *state, const struct lmp_dvfs_ops *ops);
+int lmp_dvfs_target(struct lmp_state *state, uint32_t opp_index);
+/* Job admission: fresh power/PLL/rail/limit checks every call; an unchanged
+ * native-AP OPP may reuse a measured frequency for at most 10ms. Transitions,
+ * expiry and missing samples use the full target/measurement path. */
+int lmp_dvfs_admit(struct lmp_state *, uint32_t opp_index, uint64_t max_age_ns, bool *reused);
+struct lmp_dvfs_sample {
+    struct lmp_dvfs_clock clock;
+    struct lmp_gpu_rails rails;
+    uint32_t measured_hz;
+    uint64_t measured_ns;
+};
+/* Fresh clock/rails/output verification, no OPP/voltage changes or provider
+ * calls. Suitable only in the explicitly frozen singleton final context. */
+int lmp_dvfs_verify(struct lmp_state *, struct lmp_dvfs_sample *);
+
 /* Source-pinned offsets and masks are public for the XNU/core adapter/tests. */
 #define LMP_SPM_PWR_STATUS       0x180u
 #define LMP_SPM_PWR_STATUS_2ND   0x184u
@@ -188,12 +299,24 @@ int lmp_teardown(struct lmp_state *state);
 #define LMP_MFG_CG_SET            0x004u
 #define LMP_MFG_CG_CLR            0x008u
 #define LMP_TOP_CLK_CFG_1         0x050u
+#define LMP_TOP_CLK_CFG_1_SET     0x054u
+#define LMP_TOP_CLK_CFG_1_CLR     0x058u
+#define LMP_TOP_CLK_CFG_UPDATE    0x004u
+#define LMP_TOP_MFG_UPDATE        (1u << 4)
+#define LMP_TOP_MFG_GATE          (1u << 7)
+#define LMP_TOP_CLK_MISC_CFG_0    0x104u
+#define LMP_TOP_CLK_DBG_CFG       0x10cu
+#define LMP_TOP_CLK26CALI_0       0x220u
+#define LMP_TOP_CLK26CALI_1       0x224u
 #define LMP_TOP_MFG_SEL_SHIFT     0u
 #define LMP_TOP_MFG_SEL_MASK      0x3u
 #define LMP_APMIXED_MFGPLL_CON0   0x248u
+#define LMP_APMIXED_MFGPLL_CON1   0x24cu
 #define LMP_APMIXED_MFGPLL_CON3   0x254u
 #define LMP_APMIXED_MAINPLL_CON0  0x258u
 #define LMP_APMIXED_MAINPLL_CON3  0x264u
+#define LMP_APMIXED_FHCTL_HP_EN   0xe04u
+#define LMP_FHCTL_MFGPLL_HP_MASK  (1u << 3) /* vendor FH channel3, not CCF clock4 */
 #define LMP_APMIXED_UNIVPLL_CON0  0x238u
 #define LMP_APMIXED_UNIVPLL_CON3  0x244u
 #define LMP_PLL_EN                (1u << 0)

@@ -1547,10 +1547,36 @@ tex_coord_and_layer(struct air_ctx *c, const struct air_inst *in,
    return coord;
 }
 
+/* A texture that is not there: Metal 3's default-constructed texture2d<T>(), which newer
+ * compilers (AIR 2.8, the macOS QuartzCore's shaders) write as air.get_null_texture_* and pick
+ * against the real argument with a function constant. A pointer to a binding no texture has;
+ * the select that chooses between the two folds when its condition is a constant, so a pipeline
+ * whose constants pick the real texture never sees this one, and one that samples it is refused
+ * at the sample, where a binding of ~0u matches nothing.
+ */
+
+static bool
+null_texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n)
+{
+   if (!strncmp(n->part[0], "get_null_", 9)) {
+      struct air_ptr p = { .class = AIR_PTR_TEXTURE, .binding = AIR_NULL_TEXTURE_BINDING };
+      air_set(c, &in->base, air_val_ptr(c, p));
+      return true;
+   }
+   /* air.is_null_texture*: a constant, the binding being known while translating */
+   struct air_val *v = in->num_operands > 1 ? air_get(c, in->operands[1]) : NULL;
+   if (!v || v->kind != AIR_VAL_PTR)
+      return air_error(c, "intrinsic: air.%s of something that is not a texture", n->part[0]);
+   air_set(c, &in->base, air_val_ssa(c, nir_imm_bool(&c->b, v->ptr.binding == AIR_NULL_TEXTURE_BINDING)));
+   return true;
+}
+
 static bool
 texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n)
 {
    struct air_tex_name t;
+   if (!strncmp(n->part[0], "get_null_", 9) || !strncmp(n->part[0], "is_null_", 8))
+      return null_texture_op(c, in, n);
    if (!parse_tex_name(n->part[0], &t))
       return air_error(c, "intrinsic: air.%s (a texture name this cannot take apart)",
                        n->part[0]);
@@ -1581,6 +1607,9 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
    struct air_ptr tex;
    if (!tex_handle(c, in, 1, AIR_PTR_TEXTURE, &tex))
       return false;
+   if (tex.binding == AIR_NULL_TEXTURE_BINDING)
+      return air_error(c, "intrinsic: air.%s of a null texture (texture2d<T>()) that the "
+                          "pipeline's constants did not choose away", n->part[0]);
 
    unsigned arg = 2;   /* operands[0] is the callee, [1] the texture */
    struct air_ptr samp = { 0 };
@@ -1590,6 +1619,11 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       if (!tex_handle(c, in, arg, AIR_PTR_SAMPLER, &samp))
          return false;
       arg++;
+   } else if (!strcmp(t.op, "read") && in->num_operands > arg) {
+      /* AIR 2.8's read takes air.get_read_sampler() straight after the texture */
+      struct air_val *v = air_get(c, in->operands[arg]);
+      if (v && v->kind == AIR_VAL_PTR && v->ptr.class == AIR_PTR_SAMPLER)
+         arg++;
    }
 
    /* A depth texture takes a plane or aspect selector before the coordinate,
@@ -1929,6 +1963,14 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
       return atomic_op(c, in, &n);
    if (!strcmp(n.part[0], "discard_fragment"))
       return discard_op(c, in);
+   /* The sampler a read_texture_* of newer compilers (AIR 2.8) carries: a fetch by integer
+    * coordinate samples nothing, so it is a sampler pointer to no binding, which the read
+    * below steps over. */
+   if (!strcmp(n.part[0], "get_read_sampler")) {
+      struct air_ptr p = { .class = AIR_PTR_SAMPLER, .binding = ~0u };
+      air_set(c, &in->base, air_val_ptr(c, p));
+      return true;
+   }
 
    bool handled = false;
    /* before math_op, which resolves every argument as a number: these take a

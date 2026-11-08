@@ -66,6 +66,7 @@ with tempfile.TemporaryDirectory() as tmp:
 #define os_atomic_store(p,v,m) (*(p)=(v))
 static char loader_log[LOADER_LOG_SIZE];
 static uint64_t loader_log_written;
+static uint64_t loader_log_linear_gap;
 static uint32_t loader_log_len, loader_log_ring_at, loader_log_lock;
 static bool loader_log_linear, loader_log_wrapped;
 '''

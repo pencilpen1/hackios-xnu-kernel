@@ -44,6 +44,8 @@ extern void gic_v3_irq_cpu_shutdown(void);
 
 void loader_log_putc(char c);
 void loader_return(void);
+extern int lm_gpu_return_prepare(void);
+extern int lm_gpu_return_final(void);
 extern void redwood_adreno_quiesce(void);
 extern void redwood_adreno_stop(void);
 extern void redwood_adreno_minute(void);
@@ -72,6 +74,7 @@ static uint64_t loader_l2[512] __attribute__((aligned(4096)));
 static uint32_t loader_log_ring_at;      /* where the next character goes in the ring */
 static bool     loader_log_wrapped;
 static bool     loader_log_linear;       /* the pieces have been put in order: only appending from now on */
+static uint64_t loader_log_linear_gap;   /* logical bytes omitted between head and linear tail */
 static char     loader_log_scratch[LOADER_LOG_RING];
 
 /*
@@ -81,6 +84,10 @@ static char     loader_log_scratch[LOADER_LOG_RING];
  * inside this very function) goes ahead without it.
  */
 static uint32_t loader_log_lock;
+uint32_t loader_log_is_busy(void);
+uint32_t loader_log_is_busy(void) { return os_atomic_load(&loader_log_lock,relaxed)!=0; }
+uint32_t loader_log_is_linear(void);
+uint32_t loader_log_is_linear(void) { return os_atomic_load(&loader_log_linear,relaxed)!=0; }
 static uint64_t loader_log_written;
 
 static void loader_log_put_locked(char c);
@@ -137,6 +144,7 @@ loader_log_line(const char *line)
 static void
 loader_log_put_locked(char c)
 {
+	if (loader_log_linear && loader_log_len >= LOADER_LOG_SIZE) return;
 	if (loader_log_written != UINT64_MAX) loader_log_written++;
 	if (loader_log_linear || loader_log_len < LOADER_LOG_HEAD) {
 		if (loader_log_len < LOADER_LOG_SIZE) {
@@ -168,13 +176,25 @@ loader_log_snapshot(uint64_t cursor, uint64_t *start, uint8_t *out, size_t capac
 		__builtin_arm_wsr64("DAIF", daif);
 		return 0;
 	}
-	uint64_t total = loader_log_written, oldest = total > LOADER_LOG_HEAD + LOADER_LOG_RING ? total - LOADER_LOG_RING : LOADER_LOG_HEAD;
+	uint64_t total = loader_log_written;
+	if (loader_log_linear) {
+		/* Panic/SAFE messages append after the retained ring. Keep the old
+		 * logical cursor domain while exposing the entire linear buffer. */
+		total = loader_log_linear_gap > UINT64_MAX - loader_log_len ? UINT64_MAX :
+		    loader_log_linear_gap + loader_log_len;
+	}
+	uint64_t oldest = loader_log_linear ? LOADER_LOG_HEAD + loader_log_linear_gap :
+	    (total > LOADER_LOG_HEAD + LOADER_LOG_RING ? total - LOADER_LOG_RING : LOADER_LOG_HEAD);
 	if (cursor > total) cursor = 0;
 	if (cursor >= LOADER_LOG_HEAD && cursor < oldest) cursor = oldest;
 	uint64_t end = cursor < LOADER_LOG_HEAD && total > LOADER_LOG_HEAD ? LOADER_LOG_HEAD : total;
 	size_t count = end - cursor < capacity ? (size_t)(end - cursor) : capacity;
 	*start = cursor;
-	if (cursor < LOADER_LOG_HEAD) __builtin_memcpy(out, loader_log + cursor, count);
+	if (loader_log_linear) {
+		size_t at = (size_t)(cursor < LOADER_LOG_HEAD ? cursor : cursor - loader_log_linear_gap);
+		__builtin_memcpy(out, loader_log + at, count);
+	}
+	else if (cursor < LOADER_LOG_HEAD) __builtin_memcpy(out, loader_log + cursor, count);
 	else {
 		size_t at = (size_t)((cursor - LOADER_LOG_HEAD) % LOADER_LOG_RING);
 		size_t first = count < LOADER_LOG_RING - at ? count : LOADER_LOG_RING - at;
@@ -204,8 +224,10 @@ loader_log_linearize(void)
 	if (loader_log_linear) {
 		return;
 	}
-	loader_log_linear = true;
+	loader_log_linear_gap = loader_log_written > LOADER_LOG_HEAD + LOADER_LOG_RING ?
+	    loader_log_written - (LOADER_LOG_HEAD + LOADER_LOG_RING) : 0;
 	if (!loader_log_wrapped) {
+		loader_log_linear = true;
 		return;
 	}
 	__builtin_memcpy(loader_log_scratch, loader_log + LOADER_LOG_HEAD + loader_log_ring_at, older);
@@ -215,6 +237,7 @@ loader_log_linearize(void)
 	n += sizeof(note) - 1;
 	__builtin_memcpy(loader_log + n, loader_log_scratch + sizeof(note) - 1, LOADER_LOG_RING - (sizeof(note) - 1));
 	loader_log_len = LOADER_LOG_HEAD + LOADER_LOG_RING;
+	loader_log_linear = true;
 }
 
 /* Patched by the loader: { magic, PA of its return stub, checkpoint to stop at, PA - VA }. See start.s. */
@@ -288,7 +311,14 @@ loader_jump(uint64_t reason, uint64_t code)
 	}
 	loader_return_entered = true;
 	extern void lancelot_usb_stop(void);
-	lancelot_usb_stop();
+    extern void lancelot_usb_fatal_log(void) __attribute__((noreturn));
+    if(lm_gpu_return_final()) {
+        const char *message="\nMali SAFE proof unavailable; EFI resume refused, backing retained\n";
+        for(const char *c=message;*c;c++)loader_log_putc(*c);
+        __builtin_arm_wsr("DAIFSet",DAIFSC_ALL);
+        lancelot_usb_fatal_log();
+    }
+    lancelot_usb_stop();
 #if defined(GENERIC_GIC_V3_IRQ)
 	gic_v3_irq_quiesce();
 	/*
@@ -408,6 +438,8 @@ loader_log_append_msgbuf(void)
 void
 loader_return(void)
 {
+    /* Drain before stopping CPUs; IRQ/panic paths cannot manufacture it. */
+    (void)lm_gpu_return_prepare();
 #if defined(GENERIC_PSCI_SMP)
 	/*
 	 * With more than one processor: the others switch themselves off first, and the rest of
@@ -431,15 +463,17 @@ loader_return(void)
 	 * never happens. Append the buffer so the loader gets it either way.
 	 */
 	loader_log_linearize();
-	if (!loader_return_entered) {
-		loader_log_append_msgbuf();
-	}
 	if (!loader_return_entered && debug_buf_base != NULL && debug_buf_ptr > debug_buf_base &&
 	    (size_t)(debug_buf_ptr - debug_buf_base) < 256 * 1024) {
 		loader_log_puts("\n--- panic buffer ---\n");
 		for (const char *c = debug_buf_base; c < debug_buf_ptr; c++) {
 			loader_log_putc(*c);
 		}
+	}
+	/* Preserve the failure reason before the optional message-buffer copy can
+	 * use the bounded append space. */
+	if (!loader_return_entered) {
+		loader_log_append_msgbuf();
 	}
 	loader_jump(0, 0);
 }
@@ -482,6 +516,7 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 		loader_log_putc(*c);
 	}
 	PE_parse_boot_argn("return_panic", &as_panic, sizeof(as_panic));
+    if(!as_panic)(void)lm_gpu_return_prepare();
 	if (!as_panic) {
 		redwood_var_save_on_return();   /* the data volume kept, while the system is still whole */
 		redwood_adreno_stop();          /* a GPU kept for the system is given back while there is a thread to wait in */
@@ -525,6 +560,7 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 	uint64_t deadline;
 
 	if (loader_live.stop) {
+        (void)lm_gpu_return_prepare();
 		static const char banner[] = "\n--- the host asked for the end of the run: back to the loader ---\n";
 		for (const char *c = banner; *c; c++) {
 			loader_log_putc(*c);

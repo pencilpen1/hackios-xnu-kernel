@@ -1,13 +1,16 @@
-/* Read-only MT6768 eMMC access to /hackios/20H392/ios-containers.img on Ubuntu.
+/* Read-only MT6768 eMMC system access to /hackios/20H392/ios-containers.img on Ubuntu.
  * Firmware hands over partition geometry and a superblock digest, not callbacks.
  * Counted CMD18 PIO reads execute on the XNU CPU, serialized by a mutex. SDR
- * width/clock negotiation is verified before use. No media writes or other CPU.
+ * width/clock negotiation is verified before use. Persistent data writes are
+ * separately opt-in and restricted by lancelot_data_disk.inc; no other CPU.
  */
 #include <kern/locks.h>
 #include <kern/kalloc.h>
 #include <libkern/libkern.h>
 #include <machine/machine_routines.h>
+#include <arm64/proc_reg.h>
 #include <miscfs/devfs/devfs.h>
+#include <os/atomic_private.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
 #include <sys/buf.h>
@@ -22,6 +25,7 @@
 #include "lancelot_storage.h"
 #include "lancelot_msdc.h"
 #include "lancelot_mmc_mode.h"
+#include "lancelot_mmc_observation.h"
 #define XNULOADER_NO_LIBC
 #include "lancelot_ext4.h"
 #include "lancelot_sha256.h"
@@ -43,6 +47,17 @@ static int block_major = -1;
 static uint64_t counter_frequency, sector_reads, io_errors, logical_reads, logical_bytes;
 static uint64_t pio_us, file_read_us, lock_wait_us, initial_cfg, bus_width;
 static uint64_t max_read_blocks = 1, active_clock_hz, mode_fallbacks;
+static uint32_t image_read_diagnostics;
+static struct lmd_observer mmc_observer;
+/* Immutable after the first transport failure; publish without console I/O
+ * inside the controller mutex. The outer request reports it after unlocking. */
+static struct {
+    uint64_t lba;
+    uint32_t count, command, stage, interrupt, response;
+    int status, recovery;
+} mmc_native_failure;
+static _Atomic uint32_t mmc_native_failure_ready, mmc_native_failure_reported;
+extern uint32_t lancelot_mmc_mutex_state(const void *);
 
 SYSCTL_DECL(_kern_redwood);
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, lancelot_mmc_sectors, CTLFLAG_RD | CTLFLAG_LOCKED, &sector_reads, "successful 512-byte native reads, including ext4 metadata");
@@ -73,6 +88,36 @@ static uint64_t elapsed_us(uint64_t start, uint64_t end)
 	uint64_t ticks = end - start;
 	return (ticks / counter_frequency) * 1000000 + (ticks % counter_frequency) * 1000000 / counter_frequency;
 }
+static void mmc_observe_begin(unsigned operation,uint64_t offset,uint64_t bytes) {
+    lmd_begin(&mmc_observer,lancelot_mmc_mutex_state(&lancelot_mmc_lock)&0x0fffffffu,
+        operation,offset,bytes,__builtin_arm_rsr64("CNTVCT_EL0"));
+}
+static void mmc_observe_end(void){lmd_end(&mmc_observer);}
+static void mmc_observe_transfer(uint64_t bytes){os_atomic_add(&mmc_observer.transport_bytes,bytes,relaxed);}
+void lancelot_mmc_dump_active_io(void);
+size_t lancelot_mmc_format_io(char *,size_t);
+size_t lancelot_mmc_format_io(char *out,size_t capacity) {
+    struct lmd_observation v=lmd_snapshot(&mmc_observer);
+    uint32_t owner=lancelot_mmc_mutex_state(&lancelot_mmc_lock)&0x0fffffffu;
+    uint64_t now=__builtin_arm_rsr64("CNTVCT_EL0"),hold=0;
+    if(v.operation&&v.began&&now>=v.began&&counter_frequency)hold=elapsed_us(v.began,now);
+    uint32_t bounded_hold=hold>UINT32_MAX?UINT32_MAX:(uint32_t)hold;
+    int consistent=v.consistent&&(!v.operation||owner==v.owner);
+    /* Nine hexadecimal fields, <=60 bytes: coherence, owner, operation,
+     * offset, request length, native transfer bytes, hold us, last command, phase.
+     * Fastboot responses include a four-byte status within a 64-byte limit. */
+    int n=snprintf(out,capacity,"%x,%x,%llx,%llx,%llx,%llx,%x,%llx,%llx",
+        consistent,owner,v.operation,v.offset,v.bytes,v.transport_bytes,bounded_hold,v.command,v.phase);
+    return n>0&&(size_t)n<capacity&&n<=60?(size_t)n:0;
+}
+void lancelot_mmc_dump_active_io(void) {
+    struct lmd_observation v=lmd_snapshot(&mmc_observer);
+    uint64_t now=__builtin_arm_rsr64("CNTVCT_EL0"),hold=0;
+    if(v.operation&&v.began&&now>=v.began&&counter_frequency)hold=elapsed_us(v.began,now);
+    printf("lancelot-mmc-active-io: consistent=%d owner_compact_tid=%llu operation=%llu "
+        "offset=%llu request_bytes=%llu native_bytes=%llu hold_us=%llu raw_command=%#llx epoch=%llu one_shot=1\n",
+        v.consistent,v.owner,v.operation,v.offset,v.bytes,v.transport_bytes,hold,v.command,v.epoch);
+}
 
 static uint32_t
 mmc_read_register(__unused void *ctx, uint32_t offset)
@@ -82,6 +127,7 @@ mmc_read_register(__unused void *ctx, uint32_t offset)
 static void
 mmc_write_register(__unused void *ctx, uint32_t offset, uint32_t value)
 {
+	if(offset==LM_CMD)os_atomic_store(&mmc_observer.command,value,relaxed);
 	*(volatile uint32_t *)(registers + offset) = value;
 	__asm__ volatile ("dsb sy" ::: "memory");
 }
@@ -90,8 +136,29 @@ mmc_ticks(__unused void *ctx)
 {
 	return __builtin_arm_rsr64("CNTVCT_EL0");
 }
-static uint64_t mmc_enter(__unused void *ctx) { return ml_set_interrupts_enabled(FALSE); }
-static void mmc_leave(__unused void *ctx, uint64_t state) { ml_set_interrupts_enabled((boolean_t)state); }
+static uint64_t mmc_enter(__unused void *ctx) {
+    os_atomic_store(&mmc_observer.phase,LMD_PHASE_MASK_IRQ,relaxed);
+    uint64_t state=__builtin_arm_rsr64("DAIF");
+    __builtin_arm_wsr("DAIFSet",DAIFSC_IRQF|DAIFSC_FIQF);
+    os_atomic_store(&mmc_observer.phase,LMD_PHASE_PIO,relaxed);
+    return state;
+}
+static void mmc_leave(__unused void *ctx, uint64_t state) {
+    os_atomic_store(&mmc_observer.phase,LMD_PHASE_RESTORE_IRQ,relaxed);
+    /* ml_set_interrupts_enabled(TRUE) can run ast_taken_kernel() before
+     * enabling IRQs. Restore the full caller state without entering that
+     * scheduler path while the native controller mutex is still held. */
+    __builtin_arm_wsr64("DAIF",state);
+    os_atomic_store(&mmc_observer.phase,LMD_PHASE_IRQ_RESTORED,relaxed);
+}
+static void mmc_report_native_failure(void) {
+    if(!os_atomic_load(&mmc_native_failure_ready,acquire) ||
+       !os_atomic_cmpxchg(&mmc_native_failure_reported,0,1,acq_rel))return;
+    printf("lancelot-emmc: read failed LBA=%llu count=%u status=%d cmd=%u stage=%u int=%x response=%x recovery=%d\n",
+        mmc_native_failure.lba,mmc_native_failure.count,mmc_native_failure.status,
+        mmc_native_failure.command,mmc_native_failure.stage,mmc_native_failure.interrupt,
+        mmc_native_failure.response,mmc_native_failure.recovery);
+}
 static void
 mmc_fifo_words(__unused void *ctx, uint8_t *out, unsigned words)
 {
@@ -108,6 +175,19 @@ mmc_fifo_words(__unused void *ctx, uint8_t *out, unsigned words)
 			for (unsigned j = 0; j < 4; j++) out[i * 4 + j] = (uint8_t)(value >> (j * 8));
 		}
 	}
+}
+static void
+mmc_fifo_write_words(__unused void *ctx,const uint8_t *in,unsigned words)
+{
+	volatile uint32_t *fifo=(volatile uint32_t *)(registers+LM_TX);
+	for(unsigned i=0;i<words;i++) {
+		uint32_t value;
+		__builtin_memcpy(&value,in+i*4,sizeof(value));
+		*fifo=value;
+	}
+	/* Device writes within one bounded FIFO burst are ordered together. The
+	 * control-register adapter retains its barrier for every control write. */
+	__asm__ volatile ("dsb sy" ::: "memory");
 }
 /* Probe reads do not poison the device on a rejected mode: negotiation must
  * restore and verify a known configuration before it is allowed to fall back. */
@@ -147,13 +227,16 @@ partition_read(__unused void *ctx, uint64_t offset, size_t size, void *out)
 		pio_us += elapsed_us(start, finish);
 		if (status != LM_OK) {
 			io_errors++;
-			failed = true;
-			printf("lancelot-emmc: read failed LBA=%llu count=%u status=%d cmd=%u stage=%u int=%x response=%x recovery=%d\n",
-			    absolute >> 9, count, status, controller.last_command, controller.last_stage,
-			    controller.last_int, controller.last_response, controller.recovery_status);
+            mmc_native_failure.lba=absolute>>9;mmc_native_failure.count=count;
+            mmc_native_failure.status=status;mmc_native_failure.command=controller.last_command;
+            mmc_native_failure.stage=controller.last_stage;mmc_native_failure.interrupt=controller.last_int;
+            mmc_native_failure.response=controller.last_response;mmc_native_failure.recovery=controller.recovery_status;
+            os_atomic_store(&mmc_native_failure_ready,1,release);
+            failed = true;
 			return 0;
 		}
 		sector_reads += count;
+		mmc_observe_transfer((uint64_t)count*512);
 		if (target != p) memcpy(p, sector_buffer + within, n);
 		p += n; offset += n; size -= n;
 	}
@@ -163,15 +246,40 @@ partition_read(__unused void *ctx, uint64_t offset, size_t size, void *out)
 static int
 image_read(uint64_t offset, size_t size, void *out)
 {
+    if(!size)return 0;
+    /* The device advertises 128 KiB, and APFS/native character reads honor it.
+     * Allocate resident delivery storage before taking the controller mutex:
+     * PIO runs with IRQs masked and must not fault on the caller's mapping. */
+    if(!out || size>128*1024)return EINVAL;
+    uint8_t *staging=kalloc_data(size,Z_WAITOK);
+    if(!staging)return ENOMEM;
 	uint64_t start = mmc_ticks(NULL);
 	lck_mtx_lock(&lancelot_mmc_lock);
 	uint64_t acquired = mmc_ticks(NULL);
 	lock_wait_us += elapsed_us(start, acquired);
 	logical_reads++;
-	int ok = ready && !failed && ext4_read_file(&filesystem, &ios, offset, size, out);
+	mmc_observe_begin(LMD_IO_SYSTEM_READ,offset,size);
+	int ok = ready && !failed && ext4_read_file(&filesystem, &ios, offset, size, staging);
+    os_atomic_store(&mmc_observer.phase,LMD_PHASE_FILE_DONE,relaxed);
 	file_read_us += elapsed_us(acquired, mmc_ticks(NULL));
 	if (ok) logical_bytes += size;
+	bool report = !ok && os_atomic_inc_orig(&image_read_diagnostics, relaxed) < 8;
+	bool native_failed = failed;
+	uint32_t command = controller.last_command, stage = controller.last_stage;
+	uint32_t irq = controller.last_int, response = controller.last_response;
+	mmc_observe_end();
 	lck_mtx_unlock(&lancelot_mmc_lock);
+    /* Delivery may touch a pageable caller address. It is outside both the
+     * PIO IRQ mask and the mutex needed by another fault's storage request. */
+    if(ok)memcpy(out,staging,size);
+    kfree_data(staging,size);
+    mmc_report_native_failure();
+	if (report) {
+		printf("lancelot-emmc-image-error: offset=%llu bytes=%llu file_bytes=%llu ready=%d "
+		    "native_failed=%d command=%u stage=%u irq=%#x response=%#x\n",
+		    offset, (uint64_t)size, ios.size, ready, native_failed,
+		    command, stage, irq, response);
+	}
 	return ok ? 0 : EIO;
 }
 static int
@@ -249,6 +357,8 @@ mmc_cwrite(__unused dev_t dev, __unused struct uio *uio, __unused int flags)
 {
 	return EROFS;
 }
+/* The separate data device is enabled only by its explicit boot argument. */
+#include "lancelot_data_disk.inc"
 static const struct bdevsw mmc_bdev = {
 	.d_open = mmc_open, .d_close = mmc_close, .d_strategy = mmc_strategy,
 	.d_ioctl = mmc_ioctl, .d_dump = eno_dump, .d_psize = mmc_size, .d_type = D_DISK,
@@ -286,7 +396,8 @@ lancelot_emmc_init(void)
 	if (!registers) return;
 	controller.ctx = NULL; controller.read = mmc_read_register; controller.write = mmc_write_register;
 	controller.ticks = mmc_ticks; controller.timeout = frequency / 2; /* 500 ms maximum per phase */
-	controller.read_fifo = mmc_fifo_words; controller.critical_enter = mmc_enter; controller.critical_exit = mmc_leave;
+	controller.read_fifo = mmc_fifo_words; controller.write_fifo = mmc_fifo_write_words;
+	controller.critical_enter = mmc_enter; controller.critical_exit = mmc_leave;
 	controller.rca = offer.rca;
 	initial_cfg = mmc_read_register(NULL, LM_CFG);
 	uint32_t width = (mmc_read_register(NULL, LM_BUS_CFG) >> 16) & 3;
@@ -341,4 +452,5 @@ lancelot_emmc_init(void)
 	block_major = bmajor;
 	ready = true;
 	printf("lancelot-emmc: /dev/lancelot_ios ready, %llu bytes; native superblock SHA256 matched\n", ios.size);
+    lancelot_data_init();
 }

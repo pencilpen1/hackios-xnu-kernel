@@ -624,6 +624,7 @@ reboot(void)
  * The EL1 physical timer (CNTP_*) is deliberately left alone: the Qualcomm
  * hypervisor traps it. The CTX_CNTP_* slots are unused.
  */
+#include "lancelot_gpu_lease.h"
 enum {
 	CTX_TTBR0, CTX_TCR, CTX_MAIR, CTX_SCTLR, CTX_VBAR, CTX_CPACR, CTX_SP, CTX_SPSEL, CTX_DAIF,
 	CTX_CNTV_CTL, CTX_CNTV_CVAL, CTX_CNTP_CTL, CTX_CNTP_CVAL, CTX_CNTKCTL,
@@ -709,6 +710,25 @@ __asm__ (
         "  mrs x11, ttbr1_el1\n     str x11, [x9, #24]\n"
         "  mrs x11, vbar_el1\n      str x11, [x9, #32]\n"
         "  mrs x11, mair_el1\n      str x11, [x9, #40]\n"
+        /* Before EFI context resurrection, validate same-boot GPU/AP return.
+         * A failure stays MMU-off, IRQ-masked and retains all backing. */
+        "  adrp x9, loader_gpu_lease_armed\n"
+        "  ldr w9, [x9, :lo12:loader_gpu_lease_armed]\n"
+        "  cbz w9, 91f\n" /* no lease: preserve the original return path */
+        "  adrp x12, loader_gpu_return_args\n"
+        "  add x12, x12, :lo12:loader_gpu_return_args\n"
+        "  stp x0, x1, [x12, #0]\n  stp x2, x3, [x12, #16]\n"
+        "  stp x4, x5, [x12, #32]\n stp x6, x7, [x12, #48]\n"
+        "  ldr x9, [x10, #48]\n mov sp, x9\n"
+        "  bl lancelot_fwlease_return_check\n"
+        "  cbnz x0, 90f\n"
+        "89: msr daifset, #0xf\n wfi\n b 89b\n"
+        "90: adrp x12, loader_gpu_return_args\n"
+        "  add x12, x12, :lo12:loader_gpu_return_args\n"
+        "  ldp x0, x1, [x12, #0]\n ldp x2, x3, [x12, #16]\n"
+        "  ldp x4, x5, [x12, #32]\n ldp x6, x7, [x12, #48]\n"
+        "  adrp x10, loader_ctx\n add x10, x10, :lo12:loader_ctx\n"
+        "91:\n"
         "  ldr x9, [x10, #0]\n   msr ttbr0_el1, x9\n"
         "  ldr x9, [x10, #8]\n   msr tcr_el1, x9\n"
         "  ldr x9, [x10, #16]\n  msr mair_el1, x9\n"
@@ -2551,6 +2571,7 @@ install_exception_hook(void)
 
 struct payload_info {
 	const uint8_t *kernel;
+	uint32_t kernel_size;
 	const uint8_t *ramdisk;
 	uint32_t ramdisk_size;
 	const uint8_t *bootdisk;        /* optional small md0; ramdisk then becomes md1 */
@@ -2624,6 +2645,7 @@ parse_payload(struct payload_info *pi, int verbose)
 			pi->bootdisk_size = e->size;
 		} else if (str_eq(e->name, "kernel")) {
 			pi->kernel = p + sizeof(*e);
+			pi->kernel_size = e->size;
 		} else if (str_eq(e->name, "cmdline")) {
 			pi->cmdline = text;
 		} else if (str_eq(e->name, "physbase")) {
@@ -2819,6 +2841,10 @@ choose_window(const struct payload_info *pi)
  */
 static int starts_with(const char *s, const char *prefix);
 static void lancelot_mmu_report(uint64_t entry_pa, uint64_t entry_va);
+static int lancelot_fwlease_locate(const char *,const void *,uint32_t,struct lgh_slot_region *);
+static int lancelot_fwlease_prepare(const char *,uint32_t,uint32_t,uint64_t);
+static int lancelot_fwlease_seal(void);
+static int lancelot_fwlease_finish(void);
 
 static int
 run_kernel(int have_checkpoint, uint64_t checkpoint)
@@ -2836,6 +2862,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		checkpoint = pi.checkpoint;
 	}
 	const uint8_t *kernel = pi.kernel;
+	struct lgh_slot_region gpu_slot_region = {0};
+	if (PLAT == &platform_lancelot &&
+	    !lancelot_fwlease_locate(pi.cmdline,kernel,pi.kernel_size,&gpu_slot_region)) {
+		print("lancelot-gpu-lease: kernel slot/previous lifetime rejected; no preparation or kernel overwrite\n");
+		return 0;
+	}
 	const struct mach_header_64 *mh = (const struct mach_header_64 *)kernel;
 	if (mh->magic != MH_MAGIC_64) {
 		print("kernel is not a 64-bit Mach-O\n");
@@ -2999,6 +3031,21 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			}
 		}
 	}
+	if (PLAT == &platform_lancelot && gpu_slot_region.virtual_address) {
+		uint64_t slot_pa = 0;
+		if (lgh_slot_physical(&gpu_slot_region,KERNEL_VIRT_BASE,win_base,win_size,&slot_pa) ||
+		    !lgh_range_inside(slot_pa,sizeof(struct lgh_kernel_slot),kern_lo,kern_hi-kern_lo)) {
+			print("lancelot-gpu-lease: kernel slot outside loaded RAM; no preparation\n");
+			return 0;
+		}
+		loader_gpu_kernel_slot = (struct lgh_kernel_slot *)(uintptr_t)slot_pa;
+		if (!lgh_slot_template_valid(loader_gpu_kernel_slot)) {
+			loader_gpu_kernel_slot = NULL;
+			print("lancelot-gpu-lease: loaded slot template mismatch; no preparation\n");
+			return 0;
+		}
+	}
+	if (PLAT == &platform_lancelot && !lancelot_fwlease_prepare(pi.cmdline,(uint32_t)this_mpidr,smp_offer.off_mask,checkpoint)) return 0;
 	if (battery_requested) {
 		charger_start();
 	}
@@ -3181,6 +3228,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		dt_prop(&w, "lancelot-emmc", &mtk_storage_info, sizeof(mtk_storage_info));
 	if (PLAT == &platform_lancelot && mtk_gpu_receipt_ready)
 		dt_prop(&w, "lancelot-gpu-receipt", &mtk_gpu_receipt, sizeof(mtk_gpu_receipt));
+	if (PLAT == &platform_lancelot && loader_gpu_lease)
+		dt_prop(&w, "lancelot-gpu-handoff", &(struct lgh_locator){LGH_LOCATOR_MAGIC,(uint64_t)(uintptr_t)&loader_gpu_kernel_slot->bundle,sizeof(loader_gpu_kernel_slot->bundle),loader_gpu_bundle.offer.boot_id}, sizeof(struct lgh_locator));
 	dt_prop(&w, "random-seed", seed, sizeof(seed));
 	dt_prop_u64(&w, "dram-base", phys_base);
 	dt_prop_u64(&w, "dram-size", win_size);
@@ -3472,11 +3521,17 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 				    (uint64_t)(uintptr_t)&loader_return_stub);
 				BS->stall(5000000);
 			}
+			if (PLAT == &platform_lancelot && !lancelot_fwlease_seal()) {
+				print("lancelot: GPU lease seal refused; no kernel grant\n");for (;;) BS->stall(100000);
+			}
 			jump_to_kernel(entry_va + slide, ba_pa);
 		}
 	}
 
 	/* --- the kernel came back ------------------------------------------- */
+	if (PLAT == &platform_lancelot && !lancelot_fwlease_finish()) {
+		print("lancelot: GPU return lease unknown; protected EFI writers remain denied\n");for (;;) BS->stall(100000);
+	}
 	if (PLAT == &platform_lancelot) lancelot_usb_resume();
 	wdt_set_ms(WDT_BITE_MS);
 	hc_take_back("the kernel came back");   /* before anything here touches the storage */

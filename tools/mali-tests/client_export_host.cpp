@@ -2,6 +2,13 @@
  * VM/RPC machinery is NOT emulated: kernel runtime validation remains pending. */
 #include <cstdio>
 #include "../../xnu/files/iokit/Kernel/LancelotMaliExport.h"
+/* This legacy fixture never installs a CPU lease. Resolve ONLY that null
+ * dependency; a non-null lease is a test error, not an invented alias proof.
+ * Real lease methods/VM proof/nonnull export hooks have separate fixtures. */
+extern "C" void lmal_cpu_lease_retain(void *p) { assert(p == nullptr); }
+extern "C" void lmal_cpu_lease_release(void *p) { assert(p == nullptr); }
+extern "C" int lmal_cpu_lease_map_lock(void *p, int) { assert(p == nullptr); return LMAL_OK; }
+extern "C" void lmal_cpu_lease_map_unlock(void *p) { assert(p == nullptr); }
 static unsigned checks;
 #define CHECK(x) do { ++checks; assert(x); } while(0)
 static IOMemoryMap *map(LancelotMaliExport *e, IOOptionBits options=0,
@@ -21,6 +28,13 @@ int main() {
     auto *lookup=map(e,kIOMapReference);
     CHECK(lookup==m && e->mapCount()==1 && parent->creates==1 && parent->references==1);
     CHECK(!(parent->last_options&kIOMapUnique)); /* unmap must FIND, not create */
+    /* A cache override must fail before XNU can retag the backing pages.
+     * Preserve the already-exported map and reference lookup on every failure. */
+    for(IOOptionBits cache=0x100;cache<=kIOMapCacheMask;cache+=0x100) {
+        CHECK(map(e,cache)==nullptr && e->mapCount()==1 && IOMemoryMap::live==1);
+        CHECK(map(e,cache|kIOMapReference)==nullptr && e->mapCount()==1);
+        CHECK(parent->creates==1 && parent->references==1 && m->references()==3);
+    }
     m->release(); lookup->release(); /* transport Unmap drops only transport refs */
     CHECK(e->mapCount()==1 && m->references()==1 && m->unmaps==0);
     CHECK(e->revoke(false)==LMAL_OK && e->mapCount()==0 && IOMemoryMap::live==0);
@@ -67,5 +81,5 @@ int main() {
         CHECK(e->revoke(true)==LMAL_OK);
         e->release(); parent->release(); CHECK(host_task_refs==0);
     }
-    std::printf("PASS production Export.h: %u checks (unique/reference, exact retains, transport-Unmap/ACK, close escape, task restriction, 16-map bound, kernel4K/16K export lengths)\n",checks);
+    std::printf("PASS production Export.h: %u checks (cache-override rejection preserves live maps, unique/reference, exact retains, transport-Unmap/ACK, close escape, task restriction, 16-map bound, kernel4K/16K export lengths)\n",checks);
 }

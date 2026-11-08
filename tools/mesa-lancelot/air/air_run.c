@@ -41,28 +41,15 @@
 #include "null/null_sw_winsys.h"
 #ifdef GALLIUM_PANFROST
 #include "panfrost/drm/panfrost_drm_public.h"
+#include "util/driconf.h"
+#include "util/xmlconfig.h"
 #include <xf86drm.h>
-#ifdef __APPLE__
-static int hardware_proof_fd = -1;
-static struct lancelot_job_stats hardware_before;
-static void hardware_proof_finish(void)
-{
-   if (hardware_proof_fd < 0) return;
-   struct lancelot_job_stats after = {0};
-   bool ok = !lancelot_drm_job_stats(hardware_proof_fd, &after) &&
-             after.submitted > hardware_before.submitted &&
-             after.completed > hardware_before.completed &&
-             after.faults == hardware_before.faults;
-   printf("air_run: LMAL_JOBS submitted=%llu completed=%llu faults=%llu before=%llu/%llu/%llu proof=%s\n",
-          (unsigned long long)after.submitted, (unsigned long long)after.completed,
-          (unsigned long long)after.faults, (unsigned long long)hardware_before.submitted,
-          (unsigned long long)hardware_before.completed, (unsigned long long)hardware_before.faults,
-          ok ? "PASS" : "FAIL");
-   drmClose(hardware_proof_fd);
-   fflush(stdout);
-   if (!ok) _Exit(1);
-}
 #endif
+#ifdef GALLIUM_FREEDRENO
+#include "freedreno/drm/freedreno_drm_public.h"
+#include "util/driconf.h"
+#include "util/xmlconfig.h"
+#include <xf86drm.h>
 #endif
 #include "util/format/u_format.h"
 #include "util/half_float.h"
@@ -416,6 +403,14 @@ type_size_vec4(const struct glsl_type *type, bool bindless)
    return glsl_count_attribute_slots(type, false);
 }
 
+/* A driver that takes shader I/O as variables and lowers it itself: panfrost. */
+static bool
+screen_lowers_io(struct pipe_screen *screen)
+{
+   const char *name = screen->get_name(screen);
+   return name && strstr(name, "Panfrost") != NULL;
+}
+
 static void
 finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
 {
@@ -480,8 +475,22 @@ finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
     * (tools/mesa/air-ir3.patch): the tool was lowering correctly while the two harnesses
     * that actually draw were not.
     */
-   NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
-            type_size_vec4, nir_lower_io_use_interpolated_input_intrinsics);
+   /* panfrost lowers I/O itself, as it is handed it by Mesa's GL state tracker:
+    * bifrost_preprocess_nir runs nir_lower_viewport_transform on the vertex
+    * shader's position VARIABLE before its own nir_lower_io, so I/O already
+    * lowered here leaves the position untransformed -- clip space taken as
+    * pixels, a quad that covers the pixels around (0, 0) and nothing else.
+    * On the Mali only target 0 at pixel (0, 0) ever drew (tools/mesa/air-panfrost.patch).
+    */
+   if (!screen_lowers_io(screen))
+      NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
+               type_size_vec4, nir_lower_io_use_interpolated_input_intrinsics);
+   /* What the shader reads and writes, in nir->info. softpipe and ir3 work it
+    * out for themselves; panfrost takes inputs_read and outputs_written as they
+    * come (pan_shader.c), and with them zero the vertex shader fetched no
+    * position and nothing reached a pixel on the Mali (tools/mesa/air-panfrost.patch).
+    */
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 }
 
 /* -- compute ---------------------------------------------------------------
@@ -1362,7 +1371,7 @@ main(int argc, char **argv)
    while (argc > 1 && argv[1][0] == '-') {
       if (!strcmp(argv[1], "--disasm")) {
          want_disasm = true;
-         setenv("BIFROST_MESA_DEBUG", "shaders", 1);
+         setenv("IR3_SHADER_DEBUG", "disasm", 1);
          argv++;
          argc--;
       } else if (!strcmp(argv[1], "--zero")) {
@@ -1450,38 +1459,75 @@ main(int argc, char **argv)
       name = lib.functions[pick].name;
    }
 
-   /* Hardware is mandatory unless software was explicitly requested. */
+   /* The screen: the GPU's where the kernel has one to drive, softpipe
+    * otherwise. The same source therefore runs on this machine (no msm
+    * device, so it falls back and draws in software) and on the phone, where
+    * it opens the Adreno exactly as the port's own Mesa does
+    * (osmesa_create_gpu_screen in tools/mesa/freedreno-darwin.patch).
+    * AIR_RUN_SOFTWARE=1 forces software even where a GPU is present.
+    */
    struct pipe_screen *screen = NULL;
-   const char *how = "explicit softpipe";
-   bool software = debug_get_bool_option("AIR_RUN_SOFTWARE", false);
-#ifdef GALLIUM_PANFROST
-   if (!software) {
-      int fd = drmOpenWithType("panfrost", NULL, DRM_NODE_RENDER);
+   const char *how = "software";
+#ifdef GALLIUM_FREEDRENO
+   if (!debug_get_bool_option("AIR_RUN_SOFTWARE", false)) {
+      int fd = drmOpenWithType("msm", NULL, DRM_NODE_RENDER);
       if (fd >= 0) {
-         struct pipe_screen_config config = {0};
-         screen = panfrost_drm_screen_create(fd, &config);
-#ifdef __APPLE__
-         if (screen) {
-            hardware_proof_fd = lancelot_drm_dup(fd);
-            if (hardware_proof_fd < 0 ||
-                lancelot_drm_job_stats(hardware_proof_fd, &hardware_before)) {
-               fprintf(stderr, "air_run: LMAL completion counters unavailable\n");
-               drmClose(fd);
-               return 1;
-            }
-            atexit(hardware_proof_finish);
-         }
-#endif
-         drmClose(fd);
-         how = "LancelotMali v1 / Panfrost Bifrost";
+         /* The driver option cache has to be real, not a zeroed struct:
+          * fd_screen_create passes it straight to driParseConfigFiles, which
+          * dereferences it. A zeroed one died at address 0x10 on the phone --
+          * the first thing this program ever did on a machine that has a GPU,
+          * and invisible on any machine that has not. This is the sequence
+          * osmesa_create_gpu_screen() uses in tools/mesa/freedreno-darwin.patch,
+          * which is the one CoreAnimation goes through on this device daily.
+          */
+         static const driOptionDescription freedreno_options[] = {
+#include "freedreno/driinfo_freedreno.h"
+         };
+         static driOptionCache info, cache;
+         static struct pipe_screen_config config;
+
+         driParseOptionInfo(&info, freedreno_options, ARRAY_SIZE(freedreno_options));
+         driParseConfigFiles(&cache, &info, 0, "msm", NULL, NULL, NULL, 0, NULL, 0);
+         config.options = &cache;
+         config.options_info = &info;
+
+         screen = fd_drm_screen_create_renderonly(fd, NULL, &config);
+         if (screen)
+            how = "the GPU, through the kernel's msm device";
+         else
+            fprintf(stderr, "air_run: the msm device opened but gave no screen\n");
       }
    }
 #endif
-   if (!screen && !software) {
-      fprintf(stderr, "air_run: hardware required; LancelotMali/Panfrost unavailable\n");
-      return 1;
+#ifdef GALLIUM_PANFROST
+   /* The Infinix's Mali (Bifrost v7), opened as osmesa_create_gpu_screen()
+    * opens it in tools/mesa/panfrost-darwin.patch: the kernel's RedwoodMali
+    * service behind the "panfrost" device of tools/mesa/redwood-drm.
+    */
+   if (!screen && !debug_get_bool_option("AIR_RUN_SOFTWARE", false)) {
+      int fd = drmOpenWithType("panfrost", NULL, DRM_NODE_RENDER);
+      if (fd >= 0) {
+         static const driOptionDescription panfrost_options[] = {
+#include "panfrost/driinfo_panfrost.h"
+         };
+         static driOptionCache info, cache;
+         static struct pipe_screen_config config;
+
+         driParseOptionInfo(&info, panfrost_options, ARRAY_SIZE(panfrost_options));
+         driParseConfigFiles(&cache, &info, 0, "panfrost", NULL, NULL, NULL, 0, NULL, 0);
+         config.options = &cache;
+         config.options_info = &info;
+
+         screen = panfrost_drm_screen_create(fd, &config);
+         if (screen)
+            how = "the Mali, through the kernel's RedwoodMali service";
+         else
+            fprintf(stderr, "air_run: the panfrost device opened but gave no screen\n");
+      }
    }
-   if (software) screen = sw_screen_create(null_sw_create());
+#endif
+   if (!screen)
+      screen = sw_screen_create(null_sw_create());
    if (!screen) {
       fprintf(stderr, "air_run: no gallium screen\n");
       return 1;
@@ -1543,7 +1589,14 @@ main(int argc, char **argv)
           * both this and tools/air/cpuref.py print the bits unsigned and the
           * two can be compared
           */
-         rt_format = PIPE_FORMAT_R32G32B32A32_UINT;
+         /* ... but the TARGET takes the output's own signedness: an int4 written
+          * into a UINT target is a conversion the Mali does not make (I32 into
+          * RGBA32UI stored 0, register format I32 in panfrost's blend descriptor),
+          * and Metal as GL requires the two to agree. The bits read back are the
+          * same either way, and printed unsigned as before.
+          */
+         rt_format = base == GLSL_TYPE_INT ? PIPE_FORMAT_R32G32B32A32_SINT
+                                           : PIPE_FORMAT_R32G32B32A32_UINT;
          rt_is_float = false;
       } else if (base == GLSL_TYPE_FLOAT16) {
          /* A half return needs a half target. Through a 32-bit one the half is
@@ -1748,9 +1801,15 @@ main(int argc, char **argv)
       .translate = { WIDTH / 2.0f, HEIGHT / 2.0f, 0.0f },
    });
 
-   void *blend = pipe->create_blend_state(pipe, &(struct pipe_blend_state){
-      .rt[0].colormask = PIPE_MASK_RGBA,
-   });
+   /* rt[0] copied to every target, as Mesa's GL state tracker does: panfrost reads
+    * rt[c] for each target even with independent blending off, and rt[1..] left
+    * zero were a write mask of 0 -- on the Mali only target 0 was ever written.
+    */
+   struct pipe_blend_state blend_templ = { .rt[0].colormask = PIPE_MASK_RGBA };
+   for (unsigned i = 1; i < PIPE_MAX_COLOR_BUFS; i++)
+      blend_templ.rt[i] = blend_templ.rt[0];
+   blend_templ.max_rt = PIPE_MAX_COLOR_BUFS - 1;   /* panfrost: rt_count = max_rt + 1 */
+   void *blend = pipe->create_blend_state(pipe, &blend_templ);
    pipe->bind_blend_state(pipe, blend);
    void *dsa = pipe->create_depth_stencil_alpha_state(pipe,
       &(struct pipe_depth_stencil_alpha_state){ 0 });
@@ -2027,6 +2086,11 @@ main(int argc, char **argv)
       .type = PIPE_SHADER_IR_NIR, .ir.nir = vs,
    });
    pipe->bind_vs_state(pipe, vs_cso);
+   /* AIR_RUN_PRINT_NIR=1: the fragment shader as the driver is handed it, on
+    * stdout, for a driver that draws some targets and not others (the Mali).
+    */
+   if (getenv("AIR_RUN_PRINT_NIR"))
+      nir_print_shader(fs, stdout);
    void *fs_cso = pipe->create_fs_state(pipe, &(struct pipe_shader_state){
       .type = PIPE_SHADER_IR_NIR, .ir.nir = fs,
    });

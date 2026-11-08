@@ -116,6 +116,10 @@ struct air_resource {
                       * EXCEPT for an argument-buffer member, where it is the
                       * index this frontend allocated: see argbuf_set below */
    unsigned size;    /* air.buffer_size when given, else 0 */
+   bool unused;      /* a buffer the compiled shader never reads after all: specialized
+                      * away (note_constant_reads), so nothing has to be bound there */
+   unsigned reads;   /* the most bytes the compiled shader reads from it (a constant buffer,
+                      * set by the runtime from the final NIR), else 0: not known */
    bool read, write;
    unsigned param;   /* the entry point's parameter; ~0u for an inline sampler */
    const char *name; /* air.arg_name */

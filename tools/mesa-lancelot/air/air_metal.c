@@ -27,10 +27,13 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
+#pragma GCC visibility push(default)   /* the contract, out of libOSMesa (tools/mesa/air-osmesa.patch) */
 #include "air_metal.h"
+#pragma GCC visibility pop
 
 #include "nir.h"
 #include "nir_builder.h"
@@ -40,17 +43,36 @@
 #include "pipe/p_defines.h"
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
-#include "drm-uapi/drm_fourcc.h"
 #include "util/blend.h"
 #include "target-helpers/inline_sw_helper.h"
 #include "null/null_sw_winsys.h"
 #ifdef GALLIUM_PANFROST
 #include "panfrost/drm/panfrost_drm_public.h"
+#include "frontend/winsys_handle.h"     /* rwa_texture_from_surface, as for freedreno below */
+#include "drm-uapi/drm_fourcc.h"
+#include "util/driconf.h"
+#include "util/xmlconfig.h"
+#include <xf86drm.h>
+#endif
+#ifdef GALLIUM_FREEDRENO
+#include "freedreno/drm/freedreno_drm_public.h"
+/* for rwa_texture_from_surface: a resource over memory somebody else allocated is a
+ * winsys_handle, and the one modifier an IOSurface of this port's kernel can carry is
+ * linear (MINISURF has no tiling and no compression at all). */
+#include "frontend/winsys_handle.h"
+#include "drm-uapi/drm_fourcc.h"
+#include "util/driconf.h"
+#include "util/xmlconfig.h"
 #include <xf86drm.h>
 #endif
 #include "util/format/u_format.h"
 #include "util/half_float.h"
+#include "util/os_time.h"
 #include "util/u_inlines.h"
+#include "util/u_gen_mipmap.h"
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include "util/u_sampler.h"
 #include "util/u_debug.h"
 
@@ -87,6 +109,16 @@ struct rwa_device {
     * sampler, but softpipe dereferences the state of every unit a shader touches.
     */
    void *default_sampler;
+
+   /* Zero textures for the slots a shader samples and the caller left empty, one per
+    * target and per depth-ness, made when first wanted (blank_view). CoreAnimation's
+    * uber shaders declare and sample up to sixteen textures behind branches its uniforms
+    * keep from running, and bind four: Apple's GPU reads zeros from an empty slot, so a
+    * draw refused for it is a layer missing from the screen -- the black rectangles of
+    * 25 October -- where Metal would have drawn it.
+    */
+   struct pipe_resource *blank_res[PIPE_MAX_TEXTURE_TYPES][2];
+   struct pipe_sampler_view *blank_view[PIPE_MAX_TEXTURE_TYPES][2];
 
    /* Whether this is the rasterizer in plain C rather than the Adreno. Kept because one
     * refusal has to name it: a software screen HAS a resource_from_handle, and it is the
@@ -191,6 +223,13 @@ struct rwa_texture {
     * lenient one.
     */
    bool shader_read, shader_write;
+
+   /* its render surface, made at its first draw and kept for its lifetime: the Mali
+    * folds draws into one pass only for the SAME surface pointers (panfrost_get_batch
+    * keys on them), and a surface made per draw gave every draw a pass of its own --
+    * the whole picture loaded into the tiles and written back out, dozens of times a
+    * frame */
+   struct pipe_surface *rt;
 };
 
 /* A sampler is a Gallium state object and nothing more. The state it was built from is
@@ -352,6 +391,14 @@ type_size_vec4(const struct glsl_type *type, bool bindless)
    return glsl_count_attribute_slots(type, false);
 }
 
+/* A driver that takes shader I/O as variables and lowers it itself: panfrost. */
+static bool
+screen_lowers_io(struct pipe_screen *screen)
+{
+   const char *name = screen->get_name(screen);
+   return name && strstr(name, "Panfrost") != NULL;
+}
+
 static void
 finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
 {
@@ -407,13 +454,53 @@ finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
     * every vertex the same texture coordinate (RWA_TEX_* below), and over a constant
     * flat and smooth are the same number.
     */
-   NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
-            type_size_vec4, nir_lower_io_use_interpolated_input_intrinsics);
+   /* panfrost lowers I/O itself, as it is handed it by Mesa's GL state tracker:
+    * bifrost_preprocess_nir runs nir_lower_viewport_transform on the vertex
+    * shader's position VARIABLE before its own nir_lower_io, so I/O already
+    * lowered here leaves the position untransformed -- clip space taken as
+    * pixels, a quad that covers the pixels around (0, 0) and nothing else.
+    * On the Mali only target 0 at pixel (0, 0) ever drew (tools/mesa/air-panfrost.patch).
+    */
+   if (!screen_lowers_io(screen))
+      NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
+               type_size_vec4, nir_lower_io_use_interpolated_input_intrinsics);
+   /* What the shader reads and writes, in nir->info. softpipe and ir3 work it
+    * out for themselves; panfrost takes inputs_read and outputs_written as they
+    * come (pan_shader.c), and with them zero the vertex shader fetched no
+    * position and nothing reached a pixel on the Mali (tools/mesa/air-panfrost.patch).
+    */
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 }
+
+/*
+ * One caller at a time, whatever its thread. A Gallium context is not to be used from two threads
+ * at once, and the window server does: CoreAnimation builds pipelines on dispatch's workers while
+ * its render thread draws, and lets go of textures and pipelines on whichever thread it is on. Two
+ * of them in the context at once ended it in panfrost_update_shader_state and jm_launch_draw,
+ * opening and leaving applications above all, where most pipelines are built (24 October). Every
+ * entry point holds this lock until it returns; it is recursive because some call others.
+ */
+#include <pthread.h>
+
+static pthread_mutex_t rwa_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+
+static inline void
+rwa_unlock_at_return(int *held)
+{
+   (void)held;
+   pthread_mutex_unlock(&rwa_lock);
+}
+
+/* pipelines made, and their time in AIR -> NIR and in the driver's compiler ("rwm pipelines") */
+static uint64_t rwa_pipelines_made, rwa_pipelines_translate_ns, rwa_pipelines_compile_ns;
+
+#define RWA_GUARD() \
+   int rwa_held __attribute__((cleanup(rwa_unlock_at_return), unused)) = pthread_mutex_lock(&rwa_lock)
 
 struct rwa_device *
 rwa_device_open(char *why, size_t why_size)
 {
+   RWA_GUARD();
    struct rwa_device *device = calloc(1, sizeof(*device));
    if (!device) {
       say(why, why_size, "out of memory making a device");
@@ -436,18 +523,83 @@ rwa_device_open(char *why, size_t why_size)
    bool software = debug_get_bool_option("RWA_SOFTWARE", false);
    device->software = software;
 
-#ifdef GALLIUM_PANFROST
+#ifdef GALLIUM_FREEDRENO
+   if (!software) {
+      int fd = drmOpenWithType("msm", NULL, DRM_NODE_RENDER);
+      if (fd < 0) {
+         /* The ordinary case on this port, and not an error anybody should be
+          * surprised by: without gpu=1 the kernel starts no RedwoodGPU service, so
+          * there is no msm device for the shim to open (tools/mesa/redwood-drm).
+          */
+         say(why, why_size, "there is no GPU here: no msm device to open, which is what "
+                            "a kernel booted without gpu=1 looks like");
+         goto fail;
+      }
+
+      /* The driver option cache has to be real, not a zeroed struct: fd_screen_create
+       * passes it straight to driParseConfigFiles, which dereferences it. A zeroed one
+       * died at address 0x10 on the phone -- the first thing air_run ever did on a
+       * machine that has a GPU, and invisible on any machine that has not. This is the
+       * sequence osmesa_create_gpu_screen() uses in tools/mesa/freedreno-darwin.patch,
+       * which is the one CoreAnimation goes through on this device daily.
+       *
+       * static, because fd_screen keeps the cache it was given rather than copying it.
+       * One screen per process is what a Metal device amounts to; a second device would
+       * share these, which is why the parse below is done once.
+       */
+      static const driOptionDescription freedreno_options[] = {
+#include "freedreno/driinfo_freedreno.h"
+      };
+      static driOptionCache info, cache;
+      static struct pipe_screen_config config;
+      static bool options_parsed = false;
+
+      if (!options_parsed) {
+         driParseOptionInfo(&info, freedreno_options, ARRAY_SIZE(freedreno_options));
+         driParseConfigFiles(&cache, &info, 0, "msm", NULL, NULL, NULL, 0, NULL, 0);
+         config.options = &cache;
+         config.options_info = &info;
+         options_parsed = true;
+      }
+
+      device->screen = fd_drm_screen_create_renderonly(fd, NULL, &config);
+      if (!device->screen) {
+         say(why, why_size, "the kernel's msm device opened but freedreno made no screen "
+                            "for it, so this GPU is present and unusable");
+         goto fail;
+      }
+   }
+#elif defined(GALLIUM_PANFROST)
+   /* The Infinix's Mali (Bifrost v7): the kernel's RedwoodMali service behind the
+    * "panfrost" device of tools/mesa/redwood-drm, opened as osmesa_create_gpu_screen()
+    * opens it in tools/mesa/panfrost-darwin.patch. Its option cache is static for the
+    * reason freedreno's is above.
+    */
    if (!software) {
       int fd = drmOpenWithType("panfrost", NULL, DRM_NODE_RENDER);
       if (fd < 0) {
-         say(why, why_size, "LancelotMali v1 service unavailable: %s", strerror(errno));
+         say(why, why_size, "there is no GPU here: no panfrost device to open, which is "
+                            "what a kernel booted without mali=1 looks like");
          goto fail;
       }
-      struct pipe_screen_config config = {0};
+      static bool options_parsed = false;
+      static const driOptionDescription panfrost_options[] = {
+#include "panfrost/driinfo_panfrost.h"
+      };
+      static driOptionCache info, cache;
+      static struct pipe_screen_config config;
+
+      if (!options_parsed) {
+         driParseOptionInfo(&info, panfrost_options, ARRAY_SIZE(panfrost_options));
+         driParseConfigFiles(&cache, &info, 0, "panfrost", NULL, NULL, NULL, 0, NULL, 0);
+         config.options = &cache;
+         config.options_info = &info;
+         options_parsed = true;
+      }
       device->screen = panfrost_drm_screen_create(fd, &config);
-      drmClose(fd);
       if (!device->screen) {
-         say(why, why_size, "LancelotMali opened but Panfrost screen initialization failed");
+         say(why, why_size, "the kernel's panfrost device opened but panfrost made no "
+                            "screen for it, so this GPU is present and unusable");
          goto fail;
       }
    }
@@ -534,10 +686,17 @@ fail:
 void
 rwa_device_close(struct rwa_device *device)
 {
+   RWA_GUARD();
    if (!device)
       return;
    if (device->default_sampler)
       device->pipe->delete_sampler_state(device->pipe, device->default_sampler);
+   for (unsigned t = 0; t < PIPE_MAX_TEXTURE_TYPES; t++) {
+      for (unsigned d = 0; d < 2; d++) {
+         pipe_sampler_view_reference(&device->blank_view[t][d], NULL);
+         pipe_resource_reference(&device->blank_res[t][d], NULL);
+      }
+   }
    device->pipe->destroy(device->pipe);
    device->screen->destroy(device->screen);
    free(device);
@@ -547,6 +706,7 @@ rwa_device_close(struct rwa_device *device)
 const char *
 rwa_device_name(struct rwa_device *device)
 {
+   RWA_GUARD();
    /* Mesa's own name for the chip it opened ("Adreno 7c+ Gen 3"), which is where
     * -[RedwoodMetalDevice name] gets the half it does not read out of the kernel.
     */
@@ -557,6 +717,7 @@ rwa_device_name(struct rwa_device *device)
 struct rwa_buffer *
 rwa_buffer_create(struct rwa_device *device, size_t size, char *why, size_t why_size)
 {
+   RWA_GUARD();
    if (size == 0 || size > UINT32_MAX) {
       say(why, why_size, "a buffer of %zu bytes: Gallium sizes a buffer in 32 bits and "
                          "zero is not a buffer", size);
@@ -625,18 +786,21 @@ rwa_buffer_create(struct rwa_device *device, size_t size, char *why, size_t why_
 void *
 rwa_buffer_map(struct rwa_buffer *buffer)
 {
+   RWA_GUARD();
    return buffer->map;
 }
 
 size_t
 rwa_buffer_size(struct rwa_buffer *buffer)
 {
+   RWA_GUARD();
    return buffer->size;
 }
 
 void
 rwa_buffer_destroy(struct rwa_buffer *buffer)
 {
+   RWA_GUARD();
    if (!buffer)
       return;
    /* Out of every argument-buffer record that named it, and then its own records go:
@@ -1422,10 +1586,26 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
    return texture;
 }
 
+/* Where a draw's time goes (rwa_render_draw): validation and the index scan, the binding
+ * checks, the framebuffer and fixed state, the stages' resources, draw_vbo, the unbinding;
+ * and the count. Read and cleared by rwa_draw_profile. */
+static uint64_t rwa_draw_ns[7];
+
+void
+rwa_draw_profile(uint64_t out[7])
+{
+   RWA_GUARD();
+   memcpy(out, rwa_draw_ns, sizeof(rwa_draw_ns));
+   memset(rwa_draw_ns, 0, sizeof(rwa_draw_ns));
+}
+
 struct rwa_texture *
 rwa_texture_create(struct rwa_device *device, const struct rwa_texture_shape *shape,
                    char *why, size_t why_size)
 {
+   /* Without the lock (26 October): texture_of_shape asks only the screen, which Gallium has
+    * thread-safe, and a texture made took ~5 ms that the draws of the worker waited for -- 14 to
+    * 20 times every five seconds (run 200, "rwm lock waits"). */
    return texture_of_shape(device, shape, NULL, why, why_size);
 }
 
@@ -1434,6 +1614,7 @@ rwa_texture_from_surface(struct rwa_device *device, const struct rwa_texture_sha
                          int surface_id, unsigned offset, unsigned row_bytes, char *why,
                          size_t why_size)
 {
+   /* (no lock, as rwa_texture_create: the screen's resource_from_handle alone) */
    /*
     * A surface ID of zero is not a surface. IOSurfaceGetID answers 0 for one that was
     * never made shareable, and the kernel's table has nothing at 0 either, so this would
@@ -1455,6 +1636,7 @@ rwa_texture_from_surface(struct rwa_device *device, const struct rwa_texture_sha
 void
 rwa_texture_destroy(struct rwa_texture *texture)
 {
+   RWA_GUARD();
    if (!texture)
       return;
    argbuf_scrub(texture->device, NULL, texture, NULL);
@@ -1466,6 +1648,8 @@ rwa_texture_destroy(struct rwa_texture *texture)
     */
    if (texture->view)
       texture->device->pipe->sampler_view_destroy(texture->device->pipe, texture->view);
+   /* by reference and not surface_destroy: a pass not yet sent still holds it */
+   pipe_surface_reference(&texture->rt, NULL);
    pipe_resource_reference(&texture->res, NULL);
    free(texture);
 }
@@ -1562,6 +1746,7 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
                   const unsigned origin[3], const unsigned size[3], const void *bytes,
                   size_t stride, char *why, size_t why_size)
 {
+   RWA_GUARD();
    struct pipe_box box;
    size_t row;
 
@@ -1628,11 +1813,185 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
    return 0;
 }
 
+/*
+ * MTLBlitCommandEncoder, which this driver did not have until 26 October: -blitCommandEncoder
+ * answered nil, and every copy CoreAnimation made through one was not made -- above all the
+ * snapshot of an application, a copy of the frame into a surface SpringBoard reads, which came
+ * out black (or, before surface locks waited for the GPU, whatever the memory held: the parts of
+ * other frames over the closing Settings in the user's video). A texture is copied by the GPU
+ * (pipe->blit), and where its format cannot be drawn into, by resource_copy_region.
+ */
+int
+rwa_texture_copy(struct rwa_texture *dst, unsigned dst_level, unsigned dst_slice,
+                 const unsigned dst_origin[3], struct rwa_texture *src, unsigned src_level,
+                 unsigned src_slice, const unsigned src_origin[3], const unsigned size[3],
+                 char *why, size_t why_size)
+{
+   RWA_GUARD();
+   if (!dst || !src || !dst->res || !src->res) {
+      say(why, why_size, "a texture copy without two textures");
+      return -1;
+   }
+   struct pipe_context *pipe = dst->device->pipe;
+   struct pipe_screen *screen = dst->device->screen;
+   unsigned depth = MAX2(size[2], 1);
+   struct pipe_box from;
+
+   u_box_3d(src_origin[0], src_origin[1], src_slice + src_origin[2], size[0], size[1], depth, &from);
+   bool drawable = screen->is_format_supported(screen, dst->res->format, dst->res->target,
+                                               dst->res->nr_samples, dst->res->nr_storage_samples,
+                                               util_format_is_depth_or_stencil(dst->res->format)
+                                                  ? PIPE_BIND_DEPTH_STENCIL : PIPE_BIND_RENDER_TARGET);
+   if (drawable && src->res->nr_samples <= 1) {
+      struct pipe_blit_info blit = { 0 };
+
+      blit.dst.resource = dst->res;
+      blit.dst.level = dst_level;
+      blit.dst.format = dst->res->format;
+      u_box_3d(dst_origin[0], dst_origin[1], dst_slice + dst_origin[2], size[0], size[1], depth, &blit.dst.box);
+      blit.src.resource = src->res;
+      blit.src.level = src_level;
+      blit.src.format = src->res->format;
+      blit.src.box = from;
+      blit.mask = util_format_get_mask(dst->res->format);
+      blit.filter = PIPE_TEX_FILTER_NEAREST;
+      pipe->blit(pipe, &blit);
+      return 0;
+   }
+   if (util_format_get_blocksize(dst->res->format) != util_format_get_blocksize(src->res->format)) {
+      say(why, why_size, "a copy from %s into %s: texels of different sizes", src->format_name,
+          dst->format_name);
+      return -1;
+   }
+   pipe->resource_copy_region(pipe, dst->res, dst_level, dst_origin[0], dst_origin[1],
+                              dst_slice + dst_origin[2], src->res, src_level, &from);
+   return 0;
+}
+
+/*
+ * A render pass that clears its attachments and draws nothing (26 October: such a pass did
+ * nothing at all -- the clear was a property of a draw, and there was none). The attachments
+ * become the framebuffer, are cleared, and stay bound for whatever comes next.
+ */
+int
+rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color, unsigned color_count,
+                 const float *clear_color, struct rwa_texture *depth, const float *clear_depth,
+                 const unsigned *clear_stencil, char *why, size_t why_size)
+{
+   RWA_GUARD();
+   struct pipe_context *pipe = device->pipe;
+   struct pipe_framebuffer_state fb = { 0 };
+   unsigned mask = 0;
+   union pipe_color_union clear = { 0 };
+
+   for (unsigned i = 0; i < color_count && i < PIPE_MAX_COLOR_BUFS; i++) {
+      struct rwa_texture *t = color[i];
+
+      if (!t || !t->res)
+         continue;
+      if (!t->rt)
+         t->rt = pipe->create_surface(pipe, t->res, &(struct pipe_surface){ .format = t->res->format });
+      if (!t->rt) {
+         say(why, why_size, "no render surface of colour attachment %u to clear", i);
+         return -1;
+      }
+      fb.cbufs[i] = t->rt;
+      fb.nr_cbufs = i + 1;
+      fb.width = t->res->width0;
+      fb.height = t->res->height0;
+   }
+   if (depth && depth->res) {
+      if (!depth->rt)
+         depth->rt = pipe->create_surface(pipe, depth->res, &(struct pipe_surface){ .format = depth->res->format });
+      fb.zsbuf = depth->rt;
+      if (!fb.width) {
+         fb.width = depth->res->width0;
+         fb.height = depth->res->height0;
+      }
+   }
+   if (!fb.width)
+      return 0;
+   if (clear_color && fb.nr_cbufs) {
+      mask |= PIPE_CLEAR_COLOR;
+      for (unsigned c = 0; c < 4; c++)
+         clear.f[c] = clear_color[c];
+   }
+   if (clear_depth && fb.zsbuf && format_has_depth(depth->res->format))
+      mask |= PIPE_CLEAR_DEPTH;
+   if (clear_stencil && fb.zsbuf && format_has_stencil(depth->res->format))
+      mask |= PIPE_CLEAR_STENCIL;
+   pipe->set_framebuffer_state(pipe, &fb);
+   if (mask)
+      pipe->clear(pipe, mask, NULL, &clear, clear_depth ? (double)*clear_depth : 0.0,
+                  clear_stencil ? *clear_stencil & 0xff : 0);
+   return 0;
+}
+
+int
+rwa_buffer_copy(struct rwa_buffer *dst, size_t dst_offset, struct rwa_buffer *src,
+                size_t src_offset, size_t size, char *why, size_t why_size)
+{
+   RWA_GUARD();
+   if (!dst || !src || dst_offset + size > dst->size || src_offset + size > src->size) {
+      say(why, why_size, "a buffer copy of %zu bytes outside its buffers", size);
+      return -1;
+   }
+   struct pipe_box from;
+
+   u_box_1d((int)src_offset, (int)size, &from);
+   dst->device->pipe->resource_copy_region(dst->device->pipe, dst->res, 0, (unsigned)dst_offset, 0, 0,
+                                           src->res, 0, &from);
+   return 0;
+}
+
+int
+rwa_buffer_fill(struct rwa_buffer *buffer, size_t offset, size_t size, uint8_t value, char *why,
+                size_t why_size)
+{
+   RWA_GUARD();
+   if (!buffer || offset + size > buffer->size) {
+      say(why, why_size, "a fill of %zu bytes outside its buffer", size);
+      return -1;
+   }
+   buffer->device->pipe->clear_buffer(buffer->device->pipe, buffer->res, (unsigned)offset, (unsigned)size,
+                                      &value, 1);
+   return 0;
+}
+
+/*
+ * -generateMipmapsForTexture:, every level below the base made from the one above it by the
+ * GPU's own filtering (util_gen_mipmap: pipe->blit, one level at a time, linear). Until 27
+ * October nothing was done, and CoreAnimation, which asks it of the window server's textures,
+ * sampled levels nobody had written: black or the last frame's, wherever a layer was drawn
+ * smaller than it is (run 226).
+ */
+int
+rwa_texture_mipmaps(struct rwa_texture *texture, char *why, size_t why_size)
+{
+   RWA_GUARD();
+   struct pipe_resource *res = texture ? texture->res : NULL;
+
+   if (!res) {
+      say(why, why_size, "mipmaps for no texture");
+      return -1;
+   }
+   if (res->last_level == 0)
+      return 0;
+   unsigned last_layer = res->target == PIPE_TEXTURE_3D ? 0 : util_max_layer(res, 0);
+   if (!util_gen_mipmap(texture->device->pipe, res, res->format, 0, res->last_level, 0, last_layer,
+                        PIPE_TEX_FILTER_LINEAR)) {
+      say(why, why_size, "the driver made no mipmaps for a %s texture", texture->format_name);
+      return -1;
+   }
+   return 0;
+}
+
 int
 rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,
                  const unsigned origin[3], const unsigned size[3], void *bytes,
                  size_t stride, char *why, size_t why_size)
 {
+   RWA_GUARD();
    struct pipe_context *pipe = texture->device->pipe;
    struct pipe_box box;
    size_t row;
@@ -1716,6 +2075,7 @@ rwa_depth_read(struct rwa_texture *texture, unsigned level, unsigned layer,
                const unsigned origin[3], const unsigned size[3], float *depth,
                uint8_t *stencil, char *why, size_t why_size)
 {
+   RWA_GUARD();
    struct pipe_context *pipe = texture->device->pipe;
    enum pipe_format format = texture->res->format;
    struct pipe_box box;
@@ -2101,6 +2461,7 @@ struct rwa_sampler *
 rwa_sampler_create(struct rwa_device *device, const struct rwa_sampler_state *state,
                    char *why, size_t why_size)
 {
+   RWA_GUARD();
    if (!state) {
       say(why, why_size, "a sampler with no state");
       return NULL;
@@ -2140,6 +2501,7 @@ rwa_sampler_create(struct rwa_device *device, const struct rwa_sampler_state *st
 void
 rwa_sampler_destroy(struct rwa_sampler *sampler)
 {
+   RWA_GUARD();
    if (!sampler)
       return;
    /* Nothing is unbound here: rwa_dispatch binds the samplers it needs and unbinds
@@ -2264,6 +2626,7 @@ rwa_argbuf_encode_buffer(struct rwa_buffer *dest, size_t dest_offset, unsigned i
                          struct rwa_buffer *buffer, size_t offset, char *why,
                          size_t why_size)
 {
+   RWA_GUARD();
    struct rwa_argbuf_encoding *e =
       argbuf_begin_member(dest, dest_offset, id, "a buffer", why, why_size);
 
@@ -2295,6 +2658,7 @@ int
 rwa_argbuf_encode_texture(struct rwa_buffer *dest, size_t dest_offset, unsigned id,
                           struct rwa_texture *texture, char *why, size_t why_size)
 {
+   RWA_GUARD();
    struct rwa_argbuf_encoding *e =
       argbuf_begin_member(dest, dest_offset, id, "a texture", why, why_size);
 
@@ -2320,6 +2684,7 @@ int
 rwa_argbuf_encode_sampler(struct rwa_buffer *dest, size_t dest_offset, unsigned id,
                           struct rwa_sampler *sampler, char *why, size_t why_size)
 {
+   RWA_GUARD();
    struct rwa_argbuf_encoding *e =
       argbuf_begin_member(dest, dest_offset, id, "a sampler", why, why_size);
 
@@ -2344,6 +2709,7 @@ rwa_argbuf_encode_sampler(struct rwa_buffer *dest, size_t dest_offset, unsigned 
 unsigned
 rwa_argbuf_encoded_members(const struct rwa_buffer *dest, size_t dest_offset)
 {
+   RWA_GUARD();
    const struct rwa_argbuf_encoding *e = argbuf_find(dest, dest_offset);
 
    return e ? e->members : 0;
@@ -2757,6 +3123,7 @@ rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
                    const char *entry, struct rwa_compute_info *info,
                    char *why, size_t why_size)
 {
+   RWA_GUARD();
    if (!bitcode || size < 4) {
       say(why, why_size, "%zu bytes is not a shader module", size);
       return NULL;
@@ -2932,6 +3299,7 @@ delete_compute_state(struct rwa_device *device, void *cso)
 void
 rwa_compute_destroy(struct rwa_compute *compute)
 {
+   RWA_GUARD();
    if (!compute)
       return;
    if (compute->cso)
@@ -3359,6 +3727,9 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
    for (unsigned i = 0; i < info->num_resources; i++) {
       const struct air_resource *r = &info->resources[i];
 
+      if (r->unused)
+         continue;      /* specialized away: nothing need be bound (note_constant_reads) */
+
       /*
        * A MEMBER OF AN ARGUMENT BUFFER comes from the encoder's record and not from the
        * caller's arrays, and everything below this point is the same for both: the
@@ -3428,6 +3799,9 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
                                "library fills", name, r->index, RWA_MAX_TEXTURES);
             return -1;
          }
+         if (!member && !stored && (r->index >= bindings->texture_count ||
+                                    !bindings->textures[r->index]))
+            break;      /* sampled from zeros: blank_view */
          if (!member && (r->index >= bindings->texture_count ||
                          !bindings->textures[r->index])) {
             say(why, why_size, "%s %s texture %u and %u texture%s bound", name,
@@ -3473,12 +3847,9 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
           */
          if (member)
             break;
-         if (r->index >= bindings->sampler_count || !bindings->samplers[r->index]) {
-            say(why, why_size, "%s takes sampler %u from the API and %u sampler%s bound",
-                name, r->index, bindings->sampler_count,
-                bindings->sampler_count == 1 ? " was" : "s were");
-            return -1;
-         }
+         /* an empty slot gets default_sampler in bind_stage, as Apple's GPU reads
+          * something rather than fails; it goes with a texture that is not there either
+          */
          break;
 
       case AIR_RESOURCE_THREADGROUP_BUFFER:
@@ -3498,6 +3869,58 @@ struct rwa_bound {
    unsigned num_ssbo, num_views, num_images, num_samplers;
 };
 
+/* A sampled slot nothing was bound to: a view of a 1x1 texture of zeros, of the target
+ * the shader's instructions declare (a 2D one where they declare nothing) -- see
+ * rwa_device.blank_view.
+ */
+static struct pipe_sampler_view *
+blank_view(struct rwa_device *device, const struct rwa_slot *s)
+{
+   enum pipe_texture_target target = PIPE_TEXTURE_2D;
+   bool depth = s && s->shape_known && s->shadow;
+
+   if (s && s->shape_known) {
+      switch (s->dim) {
+      case GLSL_SAMPLER_DIM_1D:
+         target = s->is_array ? PIPE_TEXTURE_1D_ARRAY : PIPE_TEXTURE_1D;
+         break;
+      case GLSL_SAMPLER_DIM_3D:
+         target = PIPE_TEXTURE_3D;
+         break;
+      case GLSL_SAMPLER_DIM_CUBE:
+         target = s->is_array ? PIPE_TEXTURE_CUBE_ARRAY : PIPE_TEXTURE_CUBE;
+         break;
+      default:
+         target = s->is_array ? PIPE_TEXTURE_2D_ARRAY : PIPE_TEXTURE_2D;
+         break;
+      }
+   }
+   if (device->blank_view[target][depth])
+      return device->blank_view[target][depth];
+
+   struct pipe_context *pipe = device->pipe;
+   unsigned layers = target == PIPE_TEXTURE_CUBE ? 6 : target == PIPE_TEXTURE_CUBE_ARRAY ? 6 : 1;
+   struct pipe_resource tmpl = {
+      .target = target,
+      .format = depth ? PIPE_FORMAT_Z32_FLOAT : PIPE_FORMAT_R8G8B8A8_UNORM,
+      .width0 = 1, .height0 = 1, .depth0 = 1, .array_size = layers,
+      .bind = PIPE_BIND_SAMPLER_VIEW,
+      .usage = PIPE_USAGE_DEFAULT,
+   };
+   struct pipe_resource *res = device->screen->resource_create(device->screen, &tmpl);
+   if (!res)
+      return NULL;
+   static const uint32_t zeros[6] = { 0 };
+   pipe->texture_subdata(pipe, res, 0, PIPE_MAP_WRITE,
+                         &(struct pipe_box){ .width = 1, .height = 1, .depth = layers },
+                         zeros, 4, 4);
+   struct pipe_sampler_view vt = { 0 };
+   u_sampler_view_default_template(&vt, res, res->format);
+   device->blank_view[target][depth] = pipe->create_sampler_view(pipe, res, &vt);
+   device->blank_res[target][depth] = res;
+   return device->blank_view[target][depth];
+}
+
 /*
  * Bind one stage's resources, each as the kind its own instructions ask for, and record
  * what was bound. This is air_run's compute binding with the shader stage lifted out of
@@ -3513,7 +3936,8 @@ struct rwa_bound {
  */
 static int
 bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
-           const struct air_shader_info *info, void **own_sampler,
+           const struct air_shader_info *info, const struct rwa_slot *slots,
+           void **own_sampler,
            const bool *compare_sampler,
            const struct rwa_bindings *bindings, const struct rwa_buffer_bind *table,
            unsigned table_count, const char *name, struct rwa_bound *bound, char *why,
@@ -3547,6 +3971,9 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
       struct rwa_sampler *sm = NULL;
       size_t boffset = 0;
 
+      if (r->unused)
+         continue;
+
       /* A member of an argument buffer comes from the encoder's record; everything
        * below binds it exactly as a direct argument, at the index the frontend gave it.
        * check_bindings has already resolved every member once and refused what could
@@ -3570,10 +3997,10 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
             break;
          case AIR_RESOURCE_TEXTURE:
          case AIR_RESOURCE_IMAGE:
-            t = bindings->textures[r->index];
+            t = r->index < bindings->texture_count ? bindings->textures[r->index] : NULL;
             break;
          case AIR_RESOURCE_SAMPLER:
-            if (!r->inline_sampler)
+            if (!r->inline_sampler && r->index < bindings->sampler_count)
                sm = bindings->samplers[r->index];
             break;
          default:
@@ -3632,10 +4059,20 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
             .buffer_offset = (unsigned)boffset,
             .buffer_size = (unsigned)left,
          };
-         if (boffset % device->ubo_offset_align == 0) {
+         /*
+          * Always the mapping since 26 October, aligned or not: panfrost pushes a uniform it can
+          * read on the processor (a user buffer's) into the shader's own registers, and loads any
+          * other from memory for every pixel -- CoreAnimation's uniforms are in buffers 1 and up,
+          * and its passes did up to 17 such loads a pixel, 12 to 17 ms of the Mali a pass
+          * (pan_shader.c pushable_ubos). A buffer without a mapping still goes as itself.
+          */
+         if (b->map == NULL) {
             cb.buffer = b->res;
          } else {
             size_t want = r->size && r->size <= left ? r->size : left;
+            /* and no more than the compiled shader reads (note_constant_reads) */
+            if (r->reads && r->reads < want)
+               want = r->reads;
 
             cb.user_buffer = (const char *)b->map + boffset;
             cb.buffer_offset = 0;
@@ -3646,6 +4083,17 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
       }
 
       case AIR_RESOURCE_TEXTURE:
+         if (!t) {
+            /* check_bindings let an empty sampled slot through: zeros, as on Apple's GPU */
+            views[r->index] = blank_view(device, slots ? &slots[r->index] : NULL);
+            if (!views[r->index]) {
+               say(why, why_size, "%s would not make a blank texture for slot %u",
+                   rwa_device_name(device), r->index);
+               return -1;
+            }
+            num_views = MAX2(num_views, r->index + 1);
+            break;
+         }
          /* The view is made once and kept with the texture: a device has one context,
           * so a view of this texture is a view for every pipeline that will sample it.
           */
@@ -3733,6 +4181,8 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
             /* Metal's sampler, and the instruction's choice of which of its two state
              * objects: struct rwa_sampler.
              */
+            if (!sm)
+               break;   /* left empty: default_sampler, below */
             samplers[r->index] = (compare_sampler && compare_sampler[r->index])
                                     ? sm->cso_compare : sm->cso;
          }
@@ -3801,6 +4251,7 @@ rwa_dispatch(struct rwa_compute *compute, const struct rwa_bindings *bindings,
              const unsigned groups[3], const unsigned group_size[3],
              char *why, size_t why_size)
 {
+   RWA_GUARD();
    /* No argument buffers, which is what every caller written before they existed means.
     * A kernel that declares one is refused by argbuf_member, naming the Metal buffer
     * index it wanted a set at and that nothing was given.
@@ -3815,6 +4266,7 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
                      const unsigned groups[3], const unsigned group_size[3],
                      char *why, size_t why_size)
 {
+   RWA_GUARD();
    struct rwa_device *device = compute->device;
    struct pipe_context *pipe = device->pipe;
    const char *name = compute->info.entry_point ? compute->info.entry_point : "the shader";
@@ -3875,7 +4327,8 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
     * the next dispatch or dropped at delete, as before.
     */
    struct rwa_bound bound = { 0 };
-   if (bind_stage(device, PIPE_SHADER_COMPUTE, &compute->info, compute->own_sampler,
+   if (bind_stage(device, PIPE_SHADER_COMPUTE, &compute->info, compute->slots,
+                  compute->own_sampler,
                   compute->compare_sampler,
                   bindings, table, table_count, name, &bound, why, why_size) != 0)
       return -1;
@@ -3898,9 +4351,79 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
    return rc;
 }
 
+/*
+ * The work so far sent off, not waited for: the number of the last job it made (0 without the
+ * Mali's job queue), for rwa_wait_seq -- a command buffer of the window server's waits no longer,
+ * its completion handlers do and the display does (MiniIOSurfaceDrawn).
+ */
+extern uint64_t lancelot_drm_last_seq(void) __attribute__((weak_import));
+extern int lancelot_drm_wait_seq(uint64_t seq, int64_t relative_ns) __attribute__((weak_import));
+
+/* panfrost's batch submissions since the last call: count and nanoseconds */
+extern uint64_t redwood_pan_submit_ns, redwood_pan_submits, redwood_pan_blend_compiles __attribute__((weak_import));
+extern uint64_t redwood_pan_variant_compiles, redwood_pan_variant_ns __attribute__((weak_import));
+
+void
+rwa_submit_profile(uint64_t out[5])
+{
+   {
+      char line[200];
+
+      if (rwa_pipelines_made) {
+         snprintf(line, sizeof(line), "!rwm pipelines: %llu made, %llu ms translating, %llu ms compiling",
+                  (unsigned long long)rwa_pipelines_made, (unsigned long long)(rwa_pipelines_translate_ns / 1000000),
+                  (unsigned long long)(rwa_pipelines_compile_ns / 1000000));
+         sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+         rwa_pipelines_made = rwa_pipelines_translate_ns = rwa_pipelines_compile_ns = 0;
+      }
+   }
+   out[3] = &redwood_pan_variant_compiles ? redwood_pan_variant_compiles : 0;
+   out[4] = &redwood_pan_variant_ns ? redwood_pan_variant_ns : 0;
+   if (&redwood_pan_variant_compiles) {
+      redwood_pan_variant_compiles = 0;
+      redwood_pan_variant_ns = 0;
+   }
+   out[0] = &redwood_pan_submits ? redwood_pan_submits : 0;
+   out[1] = &redwood_pan_submit_ns ? redwood_pan_submit_ns : 0;
+   out[2] = &redwood_pan_blend_compiles ? redwood_pan_blend_compiles : 0;
+   if (&redwood_pan_submits) {
+      redwood_pan_submits = 0;
+      redwood_pan_submit_ns = 0;
+      redwood_pan_blend_compiles = 0;
+   }
+}
+
+uint64_t
+rwa_flush_seq(struct rwa_device *device)
+{
+   RWA_GUARD();
+   if (!lancelot_drm_last_seq)
+      return 0;
+   device->pipe->flush(device->pipe, NULL, 0);
+   return lancelot_drm_last_seq();
+}
+
+extern int lancelot_drm_surface_seq(uint32_t surface, uint64_t seq) __attribute__((weak_import));
+
+/* a surface's last job for the display, or ~0 for "drawn on another thread, not yet sent" */
+int
+rwa_surface_seq(uint32_t surface, uint64_t seq)
+{
+   return lancelot_drm_surface_seq ? lancelot_drm_surface_seq(surface, seq) : ENOTSUP;
+}
+
+/* (no lock: it is a wait in the kernel, and nothing of the Gallium context is touched) */
+int
+rwa_wait_seq(uint64_t seq, int64_t timeout_ns)
+{
+   return lancelot_drm_wait_seq ? lancelot_drm_wait_seq(seq, timeout_ns) : (seq == 0 ? 0 : ENOTSUP);
+}
+
+
 int
 rwa_finish(struct rwa_device *device, char *why, size_t why_size)
 {
+   RWA_GUARD();
    return finish_or_say_why(device, false, "work", why, why_size);
 }
 
@@ -4143,6 +4666,7 @@ rwa_module_textures(struct rwa_device *device, const void *bitcode, size_t size,
                     const char *entry, struct rwa_texture_decl *out, unsigned max,
                     unsigned *count, char *why, size_t why_size)
 {
+   RWA_GUARD();
    if (count)
       *count = 0;
    if (!device) {
@@ -4290,6 +4814,7 @@ rwa_module_argbufs(struct rwa_device *device, const void *bitcode, size_t size,
                    const char *entry, struct rwa_argbuf_layout *out, unsigned max,
                    unsigned *count, char *why, size_t why_size)
 {
+   RWA_GUARD();
    if (count)
       *count = 0;
    if (!device) {
@@ -4576,6 +5101,7 @@ rwa_depth_stencil_create(struct rwa_device *device,
                          const struct rwa_depth_stencil_state *state, char *why,
                          size_t why_size)
 {
+   RWA_GUARD();
    if (!state) {
       say(why, why_size, "a depth/stencil state with no descriptor");
       return NULL;
@@ -4633,6 +5159,7 @@ rwa_depth_stencil_create(struct rwa_device *device,
 void
 rwa_depth_stencil_destroy(struct rwa_depth_stencil *state)
 {
+   RWA_GUARD();
    if (!state)
       return;
    /* Unbound before deleted, unlike a sampler and like a pipeline's own states: a draw
@@ -5088,7 +5615,7 @@ struct rwa_render {
     * compute state there is no threadgroup size to recompile for
     */
    void *vs_cso, *fs_cso;
-   void *blend, *dsa, *rast, *velem;
+   void *blend, *dsa, *rast, *rast_scissor, *velem;   /* (rast_scissor: the same with the scissor test on) */
    struct pipe_resource *vbuf;        /* the full-screen quad, for the generated stage */
 
    /* What the vertex descriptor was turned into, empty for a stage that fetches no
@@ -5104,8 +5631,119 @@ struct rwa_render {
  * it may or may not have taken it, and neither driver in this build reaches this (both
  * return a state object and report a bad shader later, at the draw).
  */
+/* How far into each constant buffer the final shader reads, onto info's resources: a
+ * buffer bound at an offset this GPU cannot fetch from is uploaded per draw (bind_stage),
+ * and without air.buffer_size that was the whole rest of the buffer -- 175 KB a draw of
+ * CoreAnimation's uniforms, read out of write-combined memory, 1.6 ms of every draw. A
+ * buffer read at a run-time offset, or through a run-time index, stays unknown (0). */
+static void
+note_constant_reads(nir_shader *nir, struct air_shader_info *info)
+{
+   uint32_t upto[PIPE_MAX_CONSTANT_BUFFERS] = { 0 };
+   bool unknown[PIPE_MAX_CONSTANT_BUFFERS] = { false };
+   bool any_unknown_index = false;
+   bool ubo_used[PIPE_MAX_CONSTANT_BUFFERS] = { false };
+   bool ssbo_used[PIPE_MAX_SHADER_BUFFERS] = { false };
+   bool any_ssbo_unknown = false;
+   bool tex_used[PIPE_MAX_SHADER_SAMPLER_VIEWS] = { false }, sampler_used[PIPE_MAX_SAMPLERS] = { false };
+   bool image_used[PIPE_MAX_SHADER_IMAGES] = { false };
+   bool any_tex_unknown = false, any_image_unknown = false;
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex) {
+               /* which textures and samplers it samples at all (`unused`) */
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+               if (nir_tex_instr_src_index(tex, nir_tex_src_texture_offset) >= 0 ||
+                   nir_tex_instr_src_index(tex, nir_tex_src_texture_deref) >= 0 ||
+                   nir_tex_instr_src_index(tex, nir_tex_src_sampler_offset) >= 0 ||
+                   nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref) >= 0)
+                  any_tex_unknown = true;
+               if (tex->texture_index < PIPE_MAX_SHADER_SAMPLER_VIEWS)
+                  tex_used[tex->texture_index] = true;
+               if (tex->sampler_index < PIPE_MAX_SAMPLERS)
+                  sampler_used[tex->sampler_index] = true;
+               continue;
+            }
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+            if (strstr(nir_intrinsic_infos[in->intrinsic].name, "image") != NULL) {
+               if (in->num_components == 0 && nir_intrinsic_infos[in->intrinsic].num_srcs == 0)
+                  continue;
+               if (strstr(nir_intrinsic_infos[in->intrinsic].name, "deref") != NULL ||
+                   !nir_src_is_const(in->src[0]))
+                  any_image_unknown = true;
+               else if (nir_src_as_uint(in->src[0]) < PIPE_MAX_SHADER_IMAGES)
+                  image_used[nir_src_as_uint(in->src[0])] = true;
+               continue;
+            }
+            /* which buffers it reads or writes at all (`unused`) */
+            int ssbo_src = -1;
+            switch (in->intrinsic) {
+            case nir_intrinsic_load_ssbo:
+            case nir_intrinsic_ssbo_atomic:
+            case nir_intrinsic_ssbo_atomic_swap:
+            case nir_intrinsic_get_ssbo_size:
+               ssbo_src = 0;
+               break;
+            case nir_intrinsic_store_ssbo:
+               ssbo_src = 1;
+               break;
+            default:
+               break;
+            }
+            if (ssbo_src >= 0) {
+               if (!nir_src_is_const(in->src[ssbo_src]))
+                  any_ssbo_unknown = true;
+               else if (nir_src_as_uint(in->src[ssbo_src]) < PIPE_MAX_SHADER_BUFFERS)
+                  ssbo_used[nir_src_as_uint(in->src[ssbo_src])] = true;
+               continue;
+            }
+            if (in->intrinsic != nir_intrinsic_load_ubo)
+               continue;
+            if (!nir_src_is_const(in->src[0])) {
+               any_unknown_index = true;
+               continue;
+            }
+            unsigned ubo = nir_src_as_uint(in->src[0]);
+            if (ubo >= PIPE_MAX_CONSTANT_BUFFERS)
+               continue;
+            ubo_used[ubo] = true;
+            if (!nir_src_is_const(in->src[1])) {
+               unknown[ubo] = true;
+               continue;
+            }
+            uint32_t end = nir_src_as_uint(in->src[1]) +
+                           in->def.num_components * in->def.bit_size / 8;
+            upto[ubo] = MAX2(upto[ubo], end);
+         }
+      }
+   }
+   for (unsigned i = 0; i < info->num_resources; i++) {
+      struct air_resource *r = &info->resources[i];
+      if (r->kind == AIR_RESOURCE_DEVICE_BUFFER && r->argbuf_set == ~0u &&
+          r->index < PIPE_MAX_SHADER_BUFFERS)
+         r->unused = !any_ssbo_unknown && !ssbo_used[r->index];
+      /* a texture: sampled (a sampler view) or, written, an image */
+      if (r->kind == AIR_RESOURCE_TEXTURE && r->argbuf_set == ~0u && r->index < PIPE_MAX_SHADER_IMAGES &&
+          r->index < PIPE_MAX_SHADER_SAMPLER_VIEWS)
+         r->unused = !any_tex_unknown && !any_image_unknown && !tex_used[r->index] && !image_used[r->index];
+      if (r->kind == AIR_RESOURCE_SAMPLER && r->argbuf_set == ~0u && r->index < PIPE_MAX_SAMPLERS &&
+          !r->inline_sampler)
+         r->unused = !any_tex_unknown && !sampler_used[r->index];
+      if (r->kind != AIR_RESOURCE_CONSTANT_BUFFER || r->argbuf_set != ~0u ||
+          r->index >= PIPE_MAX_CONSTANT_BUFFERS)
+         continue;
+      r->unused = !any_unknown_index && !ubo_used[r->index];
+      r->reads = any_unknown_index || unknown[r->index] ? 0 : MAX2(upto[r->index], 4);
+   }
+}
+
 static void *
-make_stage_cso(struct rwa_device *device, nir_shader *nir, char *why, size_t why_size)
+make_stage_cso(struct rwa_device *device, nir_shader *nir, struct air_shader_info *info,
+               char *why, size_t why_size)
 {
    nir_shader *clone = nir_shader_clone(NULL, nir);
    if (!clone) {
@@ -5113,6 +5751,8 @@ make_stage_cso(struct rwa_device *device, nir_shader *nir, char *why, size_t why
       return NULL;
    }
    finalize_for_gallium(clone, device->screen);
+   if (info)
+      note_constant_reads(clone, info);
 
    struct pipe_shader_state templ = { .type = PIPE_SHADER_IR_NIR, .ir.nir = clone };
    struct pipe_context *pipe = device->pipe;
@@ -5595,8 +6235,43 @@ rt_blend_equal(const struct pipe_rt_blend_state *a, const struct pipe_rt_blend_s
  * fragment shader and every one of air_metal_test's own designated initialisers is that
  * case, so the proven path is not merely preserved, it is the same struct.
  */
+/*
+ * With independent blending off Gallium says rt[0] governs every target, and freedreno and
+ * softpipe read only rt[0] then; panfrost reads rt[c] for every target c regardless
+ * (pan_blend.c), so rt[1..] left zero were write mask 0 and blending "Off": on the Mali
+ * nothing but target 0 was ever written. Mesa's own GL state tracker copies rt[0] to every
+ * target and sets max_rt, and so does this, which every driver reads the same way.
+ */
+static void
+blend_copy_rt0(struct pipe_blend_state *b)
+{
+   if (!b->independent_blend_enable)
+      for (unsigned i = 1; i < PIPE_MAX_COLOR_BUFS; i++)
+         b->rt[i] = b->rt[0];
+   /* and max_rt, which panfrost takes as how many targets the state describes
+    * (rt_count = max_rt + 1): left 0, every target past the first was "Off" */
+   b->max_rt = PIPE_MAX_COLOR_BUFS - 1;
+}
+
+static bool
+blend_state_from_metal_inner(const struct rwa_render_shape *shape, struct pipe_screen *screen,
+                             struct pipe_blend_state *out, unsigned *enabled_mask,
+                             unsigned *write_masks, char *why, size_t why_size);
+
 static bool
 blend_state_from_metal(const struct rwa_render_shape *shape, struct pipe_screen *screen,
+                       struct pipe_blend_state *out, unsigned *enabled_mask,
+                       unsigned *write_masks, char *why, size_t why_size)
+{
+   bool ok = blend_state_from_metal_inner(shape, screen, out, enabled_mask, write_masks,
+                                          why, why_size);
+   if (ok)
+      blend_copy_rt0(out);
+   return ok;
+}
+
+static bool
+blend_state_from_metal_inner(const struct rwa_render_shape *shape, struct pipe_screen *screen,
                        struct pipe_blend_state *out, unsigned *enabled_mask,
                        unsigned *write_masks, char *why, size_t why_size)
 {
@@ -5819,6 +6494,36 @@ blend_state_from_metal(const struct rwa_render_shape *shape, struct pipe_screen 
    return true;
 }
 
+/* rwa_render_constants: what the next rwa_render_create on this thread takes */
+#define RWA_MAX_CONSTANTS 128
+static _Thread_local struct rwa_constant next_vertex_constants[RWA_MAX_CONSTANTS],
+   next_fragment_constants[RWA_MAX_CONSTANTS];
+static _Thread_local unsigned next_vertex_count, next_fragment_count;
+
+void
+rwa_render_constants(const struct rwa_constant *vertex, unsigned vertex_count,
+                     const struct rwa_constant *fragment, unsigned fragment_count)
+{
+   RWA_GUARD();
+   next_vertex_count = MIN2(vertex_count, RWA_MAX_CONSTANTS);
+   next_fragment_count = MIN2(fragment_count, RWA_MAX_CONSTANTS);
+   if (vertex)
+      memcpy(next_vertex_constants, vertex, next_vertex_count * sizeof(*vertex));
+   if (fragment)
+      memcpy(next_fragment_constants, fragment, next_fragment_count * sizeof(*fragment));
+}
+
+/* the values a runtime handed over, laid on the zeros air_module_function_constants made */
+static void
+take_constants(struct air_constant_value *values, unsigned count,
+               const struct rwa_constant *given, unsigned given_count)
+{
+   for (unsigned i = 0; i < count; i++)
+      for (unsigned k = 0; k < given_count; k++)
+         if (given[k].index == values[i].index)
+            values[i].bits = given[k].bits;
+}
+
 struct rwa_render *
 rwa_render_create(struct rwa_device *device,
                   const void *vertex_bitcode, size_t vertex_size,
@@ -5828,6 +6533,8 @@ rwa_render_create(struct rwa_device *device,
                   const struct rwa_render_shape *shape,
                   struct rwa_render_info *info, char *why, size_t why_size)
 {
+   RWA_GUARD();
+   int64_t made_began = os_time_get_nano();
    if (!shape) {
       say(why, why_size, "a render pipeline with no attachment description");
       return NULL;
@@ -5981,6 +6688,15 @@ rwa_render_create(struct rwa_device *device,
 
    struct rwa_render_info out = { 0 };
 
+   /*
+    * The translation without the lock (26 October): AIR -> NIR asks nothing of the context (the
+    * function constants handed over are this thread's, the translator keeps no state), and it was
+    * some 40% of a pipeline's 100 to 250 ms -- time the worker's draws waited, which is the hitch
+    * of an effect seen for the first time (run 202, "rwm pipelines"). Taken again before the
+    * driver compiles (make_stage_cso) and on the way out.
+    */
+   bool unlocked = pthread_mutex_unlock(&rwa_lock) == 0;
+
    /* The fragment shader first. Its AIR -> NIR errors surface here, at creation, which
     * is the half of docs/metal.md 10.18 a driver must put in the right NSError: a link
     * error between the stages cannot surface until the draw, because ir3 compiles and
@@ -5989,6 +6705,8 @@ rwa_render_create(struct rwa_device *device,
    struct air_constant_value *ffc;
    unsigned num_ffc =
       air_module_function_constants(render->mem_ctx, fragment_bitcode, fragment_size, &ffc);
+   take_constants(ffc, num_ffc, next_fragment_constants, next_fragment_count);
+   next_fragment_count = 0;
    const struct air_to_nir_options fopts = { .constants = ffc, .num_constants = num_ffc };
    const char *error;
    nir_shader *fs = air_to_nir(render->mem_ctx, fragment_bitcode, fragment_size,
@@ -6044,6 +6762,7 @@ rwa_render_create(struct rwa_device *device,
       struct air_constant_value *vfc;
       unsigned num_vfc =
          air_module_function_constants(render->mem_ctx, vertex_bitcode, vertex_size, &vfc);
+      take_constants(vfc, num_vfc, next_vertex_constants, next_vertex_count);
       const struct air_to_nir_options vopts = { .constants = vfc, .num_constants = num_vfc };
       vs = air_to_nir(render->mem_ctx, vertex_bitcode, vertex_size, vertex_entry, &vopts,
                       device->nir_options, &render->vinfo, &error);
@@ -6134,10 +6853,16 @@ rwa_render_create(struct rwa_device *device,
    /* Compile both stages now. A failure here is a creation failure and says so; the
     * stages are linked later, at the draw.
     */
-   render->fs_cso = make_stage_cso(device, fs, why, why_size);
+   int64_t made_translated = os_time_get_nano();
+   if (unlocked) {
+      pthread_mutex_lock(&rwa_lock);
+      unlocked = false;
+   }
+   render->fs_cso = make_stage_cso(device, fs, &render->finfo, why, why_size);
    if (!render->fs_cso)
       goto fail;
-   render->vs_cso = make_stage_cso(device, vs, why, why_size);
+   render->vs_cso = make_stage_cso(device, vs, render->generated_vertex ? NULL : &render->vinfo,
+                                   why, why_size);
    /* the generated stage is standalone (not under mem_ctx); the driver has a clone, so
     * the source is this library's to free either way
     */
@@ -6145,6 +6870,9 @@ rwa_render_create(struct rwa_device *device,
       ralloc_free(vs);
    if (!render->vs_cso)
       goto fail;
+   rwa_pipelines_made++;
+   rwa_pipelines_translate_ns += made_translated - made_began;
+   rwa_pipelines_compile_ns += os_time_get_nano() - made_translated;
 
    /*
     * THE BLEND STATE, which until now was the fixed one air_run draws with -- colormask
@@ -6216,6 +6944,12 @@ rwa_render_create(struct rwa_device *device,
          .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
          .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
          .multisample = samples > 1 });
+   /* the same with the scissor test on, for a draw under -setScissorRect: */
+   render->rast_scissor = device->pipe->create_rasterizer_state(device->pipe,
+      &(struct pipe_rasterizer_state){
+         .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
+         .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
+         .multisample = samples > 1, .scissor = 1 });
    if (!render->blend || !render->dsa || !render->rast) {
       say(why, why_size, "%s would not make the fixed render state", rwa_device_name(device));
       goto fail;
@@ -6310,6 +7044,8 @@ rwa_render_create(struct rwa_device *device,
    return render;
 
 fail:
+   if (unlocked)
+      pthread_mutex_lock(&rwa_lock);   /* (the guard lets go of it on the way out) */
    rwa_render_destroy(render);
    return NULL;
 }
@@ -6317,6 +7053,7 @@ fail:
 void
 rwa_render_destroy(struct rwa_render *render)
 {
+   RWA_GUARD();
    if (!render)
       return;
    struct pipe_context *pipe = render->device->pipe;
@@ -6345,6 +7082,8 @@ rwa_render_destroy(struct rwa_render *render)
    if (render->rast) {
       pipe->bind_rasterizer_state(pipe, NULL);
       pipe->delete_rasterizer_state(pipe, render->rast);
+      if (render->rast_scissor)
+         pipe->delete_rasterizer_state(pipe, render->rast_scissor);
    }
    if (render->velem) {
       /* Unbound before deleted, and the vertex buffer unbound with it: the context holds
@@ -6406,6 +7145,8 @@ int
 rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
                 char *why, size_t why_size)
 {
+   RWA_GUARD();
+   uint64_t t0 = os_time_get_nano();
    struct rwa_device *device = render->device;
    struct pipe_context *pipe = device->pipe;
    const char *fname = render->finfo.entry_point ? render->finfo.entry_point
@@ -6680,6 +7421,8 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    }
 
 
+   uint64_t t1 = os_time_get_nano();
+   rwa_draw_ns[0] += t1 - t0;
    /* Everything each stage declares has to be bound, the same check a dispatch makes. */
    if (check_bindings(&render->finfo, render->frag_slots, &draw->fragment,
                       draw->fragment_buffer_table, draw->fragment_buffer_table_count, fname, why,
@@ -6694,6 +7437,8 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          return -1;
    }
 
+   uint64_t t2 = os_time_get_nano();
+   rwa_draw_ns[1] += t2 - t1;
    /* The framebuffer, from the caller's own textures. create_surface wants a context,
     * so it is a draw-time cost and not a pipeline one, and it is released again below
     * before the caller may destroy the textures under it.
@@ -6710,28 +7455,58 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
                                         .nr_cbufs = draw->color_count,
                                         .samples = samples };
    for (unsigned i = 0; i < draw->color_count; i++) {
-      surf[i] = pipe->create_surface(pipe, draw->color[i]->res,
-         &(struct pipe_surface){ .format = draw->color[i]->res->format });
+      struct rwa_texture *t = (struct rwa_texture *)draw->color[i];
+      if (!t->rt)
+         t->rt = pipe->create_surface(pipe, t->res,
+            &(struct pipe_surface){ .format = t->res->format });
+      surf[i] = t->rt;
       if (!surf[i]) {
          say(why, why_size, "%s would not make a render surface of colour attachment %u",
              rwa_device_name(device), i);
-         for (unsigned j = 0; j < i; j++)
-            pipe->surface_destroy(pipe, surf[j]);
          return -1;
       }
       fb.cbufs[i] = surf[i];
    }
    if (draw->depth) {
-      zsurf = pipe->create_surface(pipe, draw->depth->res,
-         &(struct pipe_surface){ .format = draw->depth->res->format });
+      struct rwa_texture *t = (struct rwa_texture *)draw->depth;
+      if (!t->rt)
+         t->rt = pipe->create_surface(pipe, t->res,
+            &(struct pipe_surface){ .format = t->res->format });
+      zsurf = t->rt;
       if (!zsurf) {
          say(why, why_size, "%s would not make a render surface of the depth attachment",
              rwa_device_name(device));
-         for (unsigned j = 0; j < draw->color_count; j++)
-            pipe->surface_destroy(pipe, surf[j]);
          return -1;
       }
       fb.zsbuf = zsurf;
+   }
+   /*
+    * (Was off unless RWA_FLUSH_ON_SWITCH was set -- now on, see below: the crash it was put in against was panfrost writing
+    * past a pool allocation, answered with slack in pan_mempool.c, and sending passes off early
+    * split a pass that CoreAnimation returns to into two, each with its own preload.)
+    * One pass in flight at a time: a draw into other attachments than the last one's sends
+    * the passes so far off first. Left to itself panfrost keeps a batch per framebuffer and,
+    * when one samples what another draws, submits that other one from inside this draw --
+    * and that path ended the window server in pan_preload_fb_part, writing a descriptor past
+    * the end of a pool's mapping (24 October, twice). The passes are sent in the order
+    * CoreAnimation made them either way.
+    */
+   static int flush_on_switch = -1;
+   if (flush_on_switch < 0) {
+      /* on unless RWA_FLUSH_ON_SWITCH=0, since 26 October: a frame's passes kept until its end left
+       * the GPU idle while the processor recorded them and the processor idle while the GPU drew,
+       * 8 + 11 ms one after the other -- 28 frames a second (run 148) */
+      const char *flag = getenv("RWA_FLUSH_ON_SWITCH");
+      flush_on_switch = flag == NULL || strcmp(flag, "0") != 0;
+   }
+   if (flush_on_switch) {
+      static struct pipe_surface *last_cbuf, *last_zs;
+      if ((fb.nr_cbufs ? fb.cbufs[0] : NULL) != last_cbuf || fb.zsbuf != last_zs) {
+         if (last_cbuf || last_zs)
+            pipe->flush(pipe, NULL, 0);
+         last_cbuf = fb.nr_cbufs ? fb.cbufs[0] : NULL;
+         last_zs = fb.zsbuf;
+      }
    }
    pipe->set_framebuffer_state(pipe, &fb);
 
@@ -6744,6 +7519,9 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     */
    float znear = draw->depth_range ? draw->depth_range[0] : 0.0f;
    float zfar = draw->depth_range ? draw->depth_range[1] : 1.0f;
+   /* -setViewport:'s rectangle where one was given (Metal's: origin top left, y down) */
+   float vx = draw->viewport ? draw->viewport[0] : 0.0f, vy = draw->viewport ? draw->viewport[1] : 0.0f;
+   float vw = draw->viewport ? draw->viewport[2] : (float)w, vh = draw->viewport ? draw->viewport[3] : (float)h;
    pipe->set_viewport_states(pipe, 0, 1, &(struct pipe_viewport_state){
       /* The y scale is NEGATIVE, and that is Metal's rule rather than a convention picked
        * here. Metal's render-target origin is the top left and its NDC y points up, so clip
@@ -6757,8 +7535,15 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
        * it is landed against -- it must turn from (100+x, 200+y, ...) into
        * (100+x, 200+(3-y), ...), the texture mirrored vertically, on both back ends.
        */
-      .scale = { w / 2.0f, -(h / 2.0f), zfar - znear },
-      .translate = { w / 2.0f, h / 2.0f, znear } });
+      .scale = { vw / 2.0f, -(vh / 2.0f), zfar - znear },
+      .translate = { vx + vw / 2.0f, vy + vh / 2.0f, znear } });
+   if (draw->scissor) {
+      unsigned x0 = MIN2(draw->scissor[0], w), y0 = MIN2(draw->scissor[1], h);
+      unsigned x1 = MIN2(draw->scissor[0] + draw->scissor[2], w), y1 = MIN2(draw->scissor[1] + draw->scissor[3], h);
+
+      pipe->set_scissor_states(pipe, 0, 1, &(struct pipe_scissor_state){
+         .minx = x0, .miny = y0, .maxx = x1, .maxy = y1 });
+   }
 
    pipe->bind_blend_state(pipe, render->blend);
    /* The caller's depth/stencil state, or the pipeline's zeroed one, which is Metal's
@@ -6773,7 +7558,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    pipe->set_stencil_ref(pipe, (struct pipe_stencil_ref){
       .ref_value = { (uint8_t)(draw->stencil_reference[0] & 0xff),
                      (uint8_t)(draw->stencil_reference[1] & 0xff) } });
-   pipe->bind_rasterizer_state(pipe, render->rast);
+   pipe->bind_rasterizer_state(pipe, draw->scissor && render->rast_scissor ? render->rast_scissor : render->rast);
    pipe->bind_vs_state(pipe, render->vs_cso);
    pipe->bind_fs_state(pipe, render->fs_cso);
 
@@ -6851,13 +7636,17 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 
    struct rwa_bound fbound = { 0 }, vbound = { 0 };
    int rc = -1;
-   if (bind_stage(device, PIPE_SHADER_FRAGMENT, &render->finfo, render->frag_own_sampler,
+   uint64_t t3 = os_time_get_nano(), t4 = t3, t5 = t3;
+   rwa_draw_ns[2] += t3 - t2;
+   if (bind_stage(device, PIPE_SHADER_FRAGMENT, &render->finfo, render->frag_slots,
+                  render->frag_own_sampler,
                   render->frag_compare_sampler,
                   &draw->fragment, draw->fragment_buffer_table, draw->fragment_buffer_table_count,
                   fname, &fbound, why, why_size) != 0)
       goto unbind;
    if (!render->generated_vertex &&
-       bind_stage(device, PIPE_SHADER_VERTEX, &render->vinfo, render->vert_own_sampler,
+       bind_stage(device, PIPE_SHADER_VERTEX, &render->vinfo, render->vert_slots,
+                  render->vert_own_sampler,
                   render->vert_compare_sampler,
                   &draw->vertex, draw->vertex_buffer_table, draw->vertex_buffer_table_count, vname,
                   &vbound, why, why_size) != 0)
@@ -6926,7 +7715,11 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          .count = draw->vertex_count,
          .index_bias = index_size ? draw->base_vertex : 0,
       };
+      t4 = os_time_get_nano();
       pipe->draw_vbo(pipe, &info, 0, NULL, &sc, 1);
+      t5 = os_time_get_nano();
+      rwa_draw_ns[3] += t4 - t3;
+      rwa_draw_ns[4] += t5 - t4;
    }
 
    /* Waited for here, on the same grounds as a dispatch: a picture that was never drawn
@@ -6934,22 +7727,24 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * come back (docs/air.md section 5). A link error between the stages, which ir3 only
     * finds now, surfaces as this not finishing.
     */
-   rc = finish_or_say_why(device, true, "draw", why, why_size);
+   /* ...was. Waiting for every draw kept the GPU and the CPU taking turns, and a frame of
+    * CoreAnimation is dozens of draws, so the window server ran at a few frames a second.
+    * The draw is sent off and not waited for; the command buffer waits once, at its end
+    * (rwa_finish from redwoodCommitWork), before anything shows the picture. Not even
+    * flushed: the next draw into the same attachments joins this one's pass. */
+   rc = 0;
 
 unbind:
    unbind_stage(device, PIPE_SHADER_FRAGMENT, &fbound);
    if (!render->generated_vertex)
       unbind_stage(device, PIPE_SHADER_VERTEX, &vbound);
-   /* The framebuffer is released before the surfaces are destroyed, and both before the
-    * caller's next call, which may be rwa_texture_destroy on one of these attachments:
-    * a context still holding a surface of a freed resource is the same trap as a bound
-    * sampler state (rwa_sampler_destroy).
+   /* The framebuffer is released before the caller's next call, which may be
+    * rwa_texture_destroy on one of these attachments: a context still holding a surface
+    * of a freed resource is the same trap as a bound sampler state (rwa_sampler_destroy).
+    * The surfaces themselves are the textures' own (rwa_texture.rt) and stay.
     */
    pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
-   for (unsigned i = 0; i < draw->color_count; i++)
-      if (surf[i])
-         pipe->surface_destroy(pipe, surf[i]);
-   if (zsurf)
-      pipe->surface_destroy(pipe, zsurf);
+   rwa_draw_ns[5] += os_time_get_nano() - t5;
+   rwa_draw_ns[6]++;
    return rc;
 }

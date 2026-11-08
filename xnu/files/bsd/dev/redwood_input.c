@@ -300,6 +300,8 @@ redwood_input_init(void)
 	redwood_battery_init();
 	redwood_ufs_init();
 	lancelot_emmc_init();
+	lancelot_sspm_pmic_init();     /* opt-in RAM protocol test; no physical mailbox access */
+	lancelot_mali_init();          /* explicit mode=1: SPM only, no GPU/PMIC access */
 	redwood_net_init();
 	redwood_adreno_init();
 	redwood_wifi_init();

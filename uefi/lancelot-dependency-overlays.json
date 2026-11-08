@@ -1,0 +1,17 @@
+{
+  "base_heads": {
+    "Mu_Basecore": "cfb93724a06ff86ff5ba971413368a7809ee42a5"
+  },
+  "files": {
+    "Mu_Basecore/ArmPkg/Library/ArmGenericTimerPhyCounterLib/ArmGenericTimerPhyCounterLib.c": "7c676cd59a6c39c83e778fd53e5205c8cf4b9050aefaca10a642184c1eb72b91",
+    "Mu_Basecore/ArmPkg/Library/ArmGenericTimerPhyCounterLib/ArmGenericTimerPhyCounterLib.inf": "30658314b880644f90f248f1bc3d584280bd789b49434c8d7a8b1e3b09077a90",
+    "Mu_Basecore/ArmPkg/Library/ArmGenericTimerVirtCounterLib/ArmGenericTimerVirtCounterLib.c": "3976093187ff5c8830052681698e0f8aa13ea7d6d72c4a19e5e029c4909d5611",
+    "Mu_Basecore/ArmPkg/Library/ArmGenericTimerVirtCounterLib/ArmGenericTimerVirtCounterLib.inf": "e331ce24c80312bb5b0b164e2e01e30a236fc5c77352799ee7537dfc1ed57136",
+    "Mu_Basecore/MdeModulePkg/Application/BootManagerMenuApp/BootManagerMenu.c": "729edbd15ef80d1b5c95b15f32f136c02a0618768aba5715367f4e1be621498b",
+    "Mu_Basecore/MdeModulePkg/Application/BootManagerMenuApp/BootManagerMenu.h": "a9cf99f1ed91c577ac6e6639111e24a2b9ea2de185cfa3d8b47593e0c92f6536",
+    "Mu_Basecore/MdeModulePkg/Bus/Usb/UsbBusDxe/UsbBus.h": "8464a38e60e46e80384796ee04779c9bf510b995f631bbe8a02b2bc7d0e06b82",
+    "Mu_Basecore/MdePkg/Include/AArch64/AsmMacroLib.h": "46c634ef10ae8a4d4198bb36a91596ef04ead3c2e374a58a022f49446c49cff5",
+    "Mu_Basecore/SecurityPkg/Library/AuthVariableLib/AuthService.c": "c11aada44b43f04aa71bd26b84e74aabfb3a7cbe6a6c5089291eeb0943f84cac",
+    "Mu_Basecore/SecurityPkg/Library/AuthVariableLib/AuthVariableLib.inf": "b0ddda34c59405976b5074ca767294a8ed82cc1cfad7070613ba8f82ac4ced4a"
+  }
+}

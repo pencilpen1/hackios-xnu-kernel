@@ -11,6 +11,7 @@
  */
 
 #include "air_private.h"
+#include "nir_constant_expressions.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -87,6 +88,120 @@ static bool
 val_is_pointerish(const struct air_val *v)
 {
    return v && (v->kind == AIR_VAL_PTR || v->kind == AIR_VAL_PTR_SELECT);
+}
+
+/* The local a pointer is stored into or loaded from, by its byte offset in
+ * scratch, or -1: a local at a place known now, and nothing else. */
+/* A byte offset known while translating, through the arithmetic a getelementptr
+ * leaves on it (an add of two constants is an iadd here, not a constant). */
+static bool
+offset_known(nir_def *d, uint64_t *out, unsigned depth)
+{
+   if (depth > 16 || d->num_components != 1)
+      return false;
+   if (nir_src_is_const(nir_src_for_ssa(d))) {
+      *out = nir_src_as_uint(nir_src_for_ssa(d));
+      return true;
+   }
+   nir_instr *ins = d->parent_instr;
+   if (ins->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(ins);
+   uint64_t a = 0, b = 0;
+   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+      if (alu->src[i].swizzle[0] != 0 && alu->src[i].src.ssa->num_components == 1)
+         return false;
+      if (!offset_known(alu->src[i].src.ssa, i == 0 ? &a : &b, depth + 1))
+         return false;
+   }
+   uint64_t mask = d->bit_size >= 64 ? ~0ull : (1ull << d->bit_size) - 1;
+   switch (alu->op) {
+   case nir_op_iadd: *out = (a + b) & mask; return true;
+   case nir_op_imul: *out = (a * b) & mask; return true;
+   case nir_op_ishl: *out = (a << (b & 63)) & mask; return true;
+   case nir_op_mov:
+   case nir_op_u2u32: case nir_op_u2u64: case nir_op_i2i32: case nir_op_i2i64:
+      *out = a & mask; return true;
+   default:
+      return false;
+   }
+}
+
+/*
+ * A scalar known while translating: a constant, or an ALU instruction over scalars that are
+ * (nir_builder does not fold). What decides a branch of QuartzCore's uber shader is a function
+ * constant, compared and combined: known here, only the side taken is translated into the CFG,
+ * and the shader Mesa optimizes is the specialized one rather than all of it -- a pipeline took
+ * one to four seconds to build, the window server waiting (24 October).
+ */
+static bool scalar_known_component(nir_def *d, unsigned component, nir_const_value *out, unsigned depth);
+
+static bool
+scalar_known(nir_def *d, nir_const_value *out, unsigned depth)
+{
+   if (depth > 24 || d->num_components != 1)
+      return false;
+   if (d->parent_instr->type == nir_instr_type_load_const) {
+      *out = nir_instr_as_load_const(d->parent_instr)->value[0];
+      return true;
+   }
+   if (d->parent_instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(d->parent_instr);
+   const nir_op_info *info = &nir_op_infos[alu->op];
+   if (info->output_size != 0 || info->num_inputs > 4)
+      return false;
+   nir_const_value values[4][NIR_MAX_VEC_COMPONENTS];
+   nir_const_value *srcs[4];
+   for (unsigned i = 0; i < info->num_inputs; i++) {
+      nir_def *s = alu->src[i].src.ssa;
+      nir_const_value v;
+      if (info->input_sizes[i] != 0 || !scalar_known_component(s, alu->src[i].swizzle[0], &v, depth + 1))
+         return false;
+      for (unsigned k = 0; k < NIR_MAX_VEC_COMPONENTS; k++)
+         values[i][k] = v;
+      srcs[i] = values[i];
+   }
+   nir_const_value dest[NIR_MAX_VEC_COMPONENTS];
+   /* the size an unsized type has here, as nir_opt_constant_folding takes it: the result's,
+    * or for a comparison (a sized result) its first unsized source's */
+   unsigned bit_size = 0;
+   if (!nir_alu_type_get_type_size(info->output_type))
+      bit_size = d->bit_size;
+   for (unsigned i = 0; !bit_size && i < info->num_inputs; i++)
+      if (!nir_alu_type_get_type_size(info->input_types[i]))
+         bit_size = alu->src[i].src.ssa->bit_size;
+   if (!bit_size)
+      bit_size = 32;
+   nir_eval_const_opcode(alu->op, dest, 1, bit_size, srcs, 0);
+   *out = dest[0];
+   return true;
+}
+
+/* one component of a def, known while translating */
+static bool
+scalar_known_component(nir_def *d, unsigned component, nir_const_value *out, unsigned depth)
+{
+   if (d->num_components == 1)
+      return component == 0 && scalar_known(d, out, depth);
+   if (d->parent_instr->type == nir_instr_type_load_const && component < d->num_components) {
+      *out = nir_instr_as_load_const(d->parent_instr)->value[component];
+      return true;
+   }
+   return false;
+}
+
+static int
+ptr_slot_offset(const struct air_val *p)
+{
+   if (!p || p->kind != AIR_VAL_PTR || p->ptr.class != AIR_PTR_SCRATCH)
+      return -1;
+   if (p->ptr.offset == NULL)
+      return 0;
+   uint64_t at;
+   if (!offset_known(p->ptr.offset, &at, 0) || at > INT32_MAX)
+      return -1;
+   return (int)at;
 }
 
 /* Two resolutions that are the same resolution.
@@ -336,7 +451,18 @@ air_constant_val(struct air_ctx *c, const struct air_constant *k)
       if (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY) {
          unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count;
          struct air_val *v = air_val_agg(c, n);
-         /* fields stay NONE until insertvalue puts something there */
+         /* Scalar fields stay NONE until insertvalue puts something there; an aggregate
+          * field is an aggregate of its own, so that a nested index path (insertvalue
+          * [2 x struct] poison, x, 0, 0 -- QuartzCore's uber shader builds its image
+          * configs that way) has somewhere to go. */
+         for (unsigned i = 0; i < n; i++) {
+            const struct air_type *et = t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem;
+            if (et->kind == AIR_TYPE_STRUCT || et->kind == AIR_TYPE_ARRAY) {
+               struct air_constant u = { .base = { .kind = AIR_VALUE_CONSTANT, .type = et },
+                                         .ckind = k->ckind };
+               v->elems[i] = air_constant_val(c, &u);
+            }
+         }
          return v;
       }
       if (t->kind == AIR_TYPE_POINTER) {
@@ -486,6 +612,9 @@ air_ptr_add(struct air_ctx *c, struct air_ptr ptr, nir_def *bytes)
    return ptr;
 }
 
+static int scratch_global_at(struct air_ctx *c, nir_def *offset);
+static int scratch_global_containing(struct air_ctx *c, uint64_t off);
+
 static nir_def *
 ptr_offset(struct air_ctx *c, struct air_ptr ptr)
 {
@@ -508,7 +637,7 @@ air_load_ptr(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
       bits = 8;
 
    nir_def *off = ptr_offset(c, ptr);
-   nir_def *res;
+   nir_def *res = NULL;
    switch (ptr.class) {
    case AIR_PTR_UBO:
       res = nir_load_ubo(&c->b, comps, bits, nir_imm_int(&c->b, ptr.binding), off,
@@ -521,9 +650,32 @@ air_load_ptr(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
    case AIR_PTR_SHARED:
       res = nir_load_shared(&c->b, comps, bits, off, .base = 0, .align_mul = align);
       break;
-   case AIR_PTR_SCRATCH:
+   case AIR_PTR_SCRATCH: {
+      int g = scratch_global_at(c, ptr.offset);
+      nir_def *k = g >= 0 && !c->global_plan[g].written_outside_init ? c->global_plan[g].init_value : NULL;
+
+      if (k && k->num_components == comps && k->bit_size == bits) {
+         res = nir_build_imm(&c->b, comps, bits, nir_instr_as_load_const(k->parent_instr)->value);
+         break;
+      }
+      /* a field of such a global, stored once with a constant (init_stores) */
+      uint64_t at;
+      if (ptr.offset && offset_known(ptr.offset, &at, 0)) {
+         int gc = scratch_global_containing(c, at);
+         for (unsigned i = 0; gc >= 0 && !c->global_plan[gc].written_outside_init && i < c->num_init_stores; i++) {
+            nir_def *v = c->init_stores[i].value;
+            if (c->init_stores[i].offset == at && !c->init_stores[i].bad && v &&
+                v->num_components == comps && v->bit_size == bits) {
+               res = nir_build_imm(&c->b, comps, bits, nir_instr_as_load_const(v->parent_instr)->value);
+               break;
+            }
+         }
+         if (res)
+            break;
+      }
       res = nir_load_scratch(&c->b, comps, bits, off, .align_mul = align);
       break;
+   }
    case AIR_PTR_CONSTANT_DATA:
       res = nir_load_constant(&c->b, comps, bits, off, .base = 0, .range = c->nir->constant_data_size,
                               .align_mul = align);
@@ -575,6 +727,13 @@ air_load_ptr(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
        * bytes in an argument buffer are the runtime's 8-byte handles.
        */
       return air_error(c, "instruction: a load of bytes out of an argument buffer"), NULL;
+   case AIR_PTR_NONE:
+      /* Through null: what the uber shaders' `fc_has_x ? buffer : nullptr` leaves in a branch
+       * the pipeline's function constants never take (this frontend translates every block,
+       * taken or not). Zero, as reading it never happens; a branch that IS taken with a null
+       * buffer is a bug of the caller's either way. */
+      res = nir_imm_zero(&c->b, comps, bits);
+      break;
    default:
       return air_error(c, "instruction: a load through a %s pointer",
                        ptr.class == AIR_PTR_NONE ? "null" : "texture or sampler"), NULL;
@@ -602,10 +761,63 @@ air_store_ptr(struct air_ctx *c, struct air_ptr ptr, nir_def *value, unsigned al
       nir_store_shared(&c->b, value, off, .base = 0, .write_mask = BITFIELD_MASK(comps),
                        .align_mul = align);
       return true;
-   case AIR_PTR_SCRATCH:
+   case AIR_PTR_SCRATCH: {
+      if (c->in_static_init && value->num_components == 1 &&
+          !nir_src_is_const(nir_src_for_ssa(value))) {
+         /* a function constant passed through air.normalize_function_constant_predicate and the
+          * like is still a constant: stored as one, the copy folds (scalar_known) */
+         nir_const_value known;
+         bool ok = scalar_known(value, &known, 0);
+         if (ok)
+            value = nir_build_imm(&c->b, 1, value->bit_size, &known);
+      }
+      uint64_t at;
+      if (c->in_static_init && ptr.offset && offset_known(ptr.offset, &at, 0) &&
+          scratch_global_containing(c, at) >= 0) {
+         unsigned i;
+         for (i = 0; i < c->num_init_stores; i++)
+            if (c->init_stores[i].offset == at)
+               break;
+         bool is_const = nir_src_is_const(nir_src_for_ssa(value));
+         if (i == c->num_init_stores && c->num_init_stores < ARRAY_SIZE(c->init_stores)) {
+            c->init_stores[i].offset = at;
+            c->init_stores[i].value = is_const ? value : NULL;
+            c->init_stores[i].bad = !is_const;
+            c->num_init_stores++;
+         } else if (i < c->num_init_stores) {
+            nir_def *old = c->init_stores[i].value;
+            if (!is_const || !old || old->bit_size != value->bit_size ||
+                old->num_components != value->num_components ||
+                memcmp(nir_instr_as_load_const(old->parent_instr)->value,
+                       nir_instr_as_load_const(value->parent_instr)->value,
+                       sizeof(nir_const_value) * value->num_components))
+               c->init_stores[i].bad = true;
+         }
+      }
+      if (c->in_static_init) {
+         int g = scratch_global_at(c, ptr.offset);
+         if (g >= 0) {
+            struct air_global_plan *pl = &c->global_plan[g];
+            nir_def *old = pl->init_value;
+            bool same = old && old->num_components == value->num_components &&
+                        old->bit_size == value->bit_size &&
+                        nir_src_is_const(nir_src_for_ssa(value)) &&
+                        !memcmp(nir_instr_as_load_const(old->parent_instr)->value,
+                                nir_instr_as_load_const(value->parent_instr)->value,
+                                sizeof(nir_const_value) * value->num_components);
+            /* one constant, however many times stored, is foldable; a second value (an
+             * initializer with branches stores different ones on different paths) or a
+             * value that is not a constant is not */
+            if (!nir_src_is_const(nir_src_for_ssa(value)) || (old && !same))
+               pl->written_outside_init = true;
+            else
+               pl->init_value = value;
+         }
+      }
       nir_store_scratch(&c->b, value, off, .align_mul = align,
                         .write_mask = BITFIELD_MASK(comps));
       return true;
+   }
    case AIR_PTR_UBO:
    case AIR_PTR_CONSTANT_DATA:
       return air_error(c, "instruction: a store into constant memory");
@@ -944,9 +1156,35 @@ make_io_var(struct air_ctx *c, nir_variable_mode mode, const struct air_type *t,
    else
       gt = glsl_vector_type(bits == 16 ? GLSL_TYPE_INT16 : GLSL_TYPE_INT, comps);
 
+   /*
+    * A VARYING is 32 bits a component whatever the shader's type, on both sides: the vertex
+    * stage widens what it writes and the fragment stage narrows what it reads (as a vertex
+    * attribute is fetched, add_vertex_attribute). Panfrost on the Bifrost Mali laid a `half4`
+    * varying out as four halves on the side that wrote it and read four floats on the other:
+    * a black fill came out (0, 1/128, garbage, garbage) -- every CoreAnimation layer whose
+    * colour is a vertex's, the widgets' platters blue (24 October).
+    */
+   if (bits == 16 && location >= VARYING_SLOT_VAR0 &&
+       ((mode == nir_var_shader_out && c->nir->info.stage == MESA_SHADER_VERTEX) ||
+        (mode == nir_var_shader_in && c->nir->info.stage == MESA_SHADER_FRAGMENT)))
+      gt = air_type_is_float(air_type_scalar(t)) ? glsl_vec_type(comps)
+                                                  : glsl_vector_type(GLSL_TYPE_INT, comps);
    nir_variable *var = nir_variable_create(c->nir, mode, gt, name ? name : "io");
    var->data.location = location;
    return var;
+}
+
+/* A value into an output whose variable may be wider than the value (a widened varying). */
+static void
+store_output(struct air_ctx *c, nir_variable *var, nir_def *v)
+{
+   unsigned want = glsl_get_bit_size(glsl_without_array(var->type));
+   if (v->bit_size != want) {
+      enum glsl_base_type base = glsl_get_base_type(glsl_without_array(var->type));
+      bool is_float = base == GLSL_TYPE_FLOAT || base == GLSL_TYPE_FLOAT16;
+      v = is_float ? nir_f2fN(&c->b, v, want) : nir_i2iN(&c->b, v, want);
+   }
+   nir_store_var(&c->b, var, v, BITFIELD_MASK(v->num_components));
 }
 
 /* fragment inputs and vertex outputs take the slots in the order they appear;
@@ -1922,7 +2160,12 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
       var->data.sample = md_key(node, "air.sample") >= 0;
       if (c->nir->info.stage == MESA_SHADER_FRAGMENT)
          add_varying(c, name, slot, air_nir_components(t), node);
-      c->params[param] = air_val_ssa(c, nir_load_var(&c->b, var));
+      nir_def *in_v = nir_load_var(&c->b, var);
+      unsigned in_bits = air_nir_bit_size(c, t);
+      if (in_v->bit_size != in_bits)
+         in_v = air_type_is_float(air_type_scalar(t)) ? nir_f2fN(&c->b, in_v, in_bits)
+                                                      : nir_u2uN(&c->b, in_v, in_bits);
+      c->params[param] = air_val_ssa(c, in_v);
       return true;
    }
 
@@ -2047,6 +2290,86 @@ translate_output(struct air_ctx *c, const struct air_md *node, unsigned field,
  * the pipeline binds, so both are readable; a pipeline that bound neither
  * would read a descriptor it did not set up.
  */
+/* Is this pointer a sampler the shader declares itself (__air_sampler_state)? */
+static bool
+is_inline_sampler(struct air_ctx *c, const struct air_val *v)
+{
+   if (!v || v->kind != AIR_VAL_PTR || v->ptr.class != AIR_PTR_SAMPLER)
+      return false;
+   for (unsigned i = 0; i < c->info->num_resources; i++) {
+      const struct air_resource *r = &c->info->resources[i];
+      if (r->kind == AIR_RESOURCE_SAMPLER && r->index == v->ptr.binding)
+         return r->inline_sampler;
+   }
+   return false;
+}
+
+/*
+ * The POINTER a load from `p` gives, known while translating, or NULL (and no
+ * error) when it is not: one stored into a local before (AIR_OP_STORE), or one a
+ * constant global was made with -- QuartzCore's uber shader falls back on
+ * `constant metal::sampler unused_sampler`, a struct whose one member points at
+ * the shader's own __air_sampler_state. Through a choice made at run time, both
+ * sides; and a choice between a sampler argument and that fallback is the
+ * argument: the fallback is taken when there is no texture to sample, where
+ * which sampler samples nothing does not matter (QuartzCore's materials, the
+ * widgets' platters, 24 October).
+ */
+static struct air_val *
+pointer_loaded(struct air_ctx *c, struct air_val *p)
+{
+   if (p->kind == AIR_VAL_PTR_SELECT) {
+      struct air_val *a = pointer_loaded(c, p->elems[0]);
+      struct air_val *b = a ? pointer_loaded(c, p->elems[1]) : NULL;
+      if (!a || !b)
+         return NULL;
+      if (a == b || (a->kind == AIR_VAL_PTR && b->kind == AIR_VAL_PTR && same_ptr(&a->ptr, &b->ptr)))
+         return a;
+      if (is_inline_sampler(c, a) && !is_inline_sampler(c, b))
+         return b;
+      if (is_inline_sampler(c, b) && !is_inline_sampler(c, a))
+         return a;
+      return air_val_ptr_select(c, p->def, a, b);
+   }
+   int at = ptr_slot_offset(p);
+   if (at < 0)
+      return NULL;
+   for (unsigned i = 0; i < c->num_ptr_slots; i++)
+      if (c->ptr_slots[i].offset == (unsigned)at)
+         return c->ptr_slots[i].val;
+   int g = scratch_global_at(c, nir_imm_int(&c->b, at));
+   if (g < 0 || c->global_plan[g].written_outside_init)
+      return NULL;
+   const struct air_value *init = c->m->globals[g]->init;
+   const struct air_constant *k = init ? air_value_as_constant(init) : NULL;
+   if (k && k->ckind == AIR_CONST_AGGREGATE && k->num_elems > 0)
+      init = k->elems[0];
+   /* through the casts a constant may wear (`ptr addrspace(2) @__air_sampler_state` is
+    * written as a cast of the global in QuartzCore's modules) */
+   for (unsigned depth = 0; init && init->kind == AIR_VALUE_CONSTANT && depth < 4; depth++) {
+      const struct air_constant *e = air_value_as_constant(init);
+      if (!e || e->ckind != AIR_CONST_EXPR || e->num_operands < 1)
+         break;
+      if (e->expr_op == AIR_OP_GEP) {
+         /* a getelementptr whose indices are all zero is its base */
+         bool zero = true;
+         for (unsigned o = 1; o < e->num_operands; o++) {
+            uint64_t v;
+            if (!air_const_uint(e->operands[o], &v) || v != 0)
+               zero = false;
+         }
+         if (!zero)
+            break;
+      } else if (e->expr_op != AIR_OP_CAST) {
+         break;
+      }
+      init = e->operands[0];
+   }
+   if (!init || init->kind != AIR_VALUE_GLOBAL)
+      return NULL;
+   return air_get(c, init);
+}
+
 static nir_def *
 load_through_choice(struct air_ctx *c, struct air_val *v, const struct air_type *t,
                     unsigned align)
@@ -2307,6 +2630,31 @@ translate_cmp(struct air_ctx *c, const struct air_inst *in)
    nir_def *y = air_get_ssa(c, in->operands[1]);
    if (!x || !y)
       return false;
+   /* Two integer constants -- a function constant against a number, most of all -- are
+    * compared now, so that what depends on the answer (a select between a texture and
+    * texture2d<T>(), or between two samplers) can be chosen while translating. */
+   if (in->sub >= AIR_ICMP_EQ && x->num_components == 1 && y->num_components == 1 &&
+       nir_src_is_const(nir_src_for_ssa(x)) && nir_src_is_const(nir_src_for_ssa(y))) {
+      uint64_t ux = nir_src_as_uint(nir_src_for_ssa(x)), uy = nir_src_as_uint(nir_src_for_ssa(y));
+      int64_t sx = nir_src_as_int(nir_src_for_ssa(x)), sy = nir_src_as_int(nir_src_for_ssa(y));
+      bool r;
+      switch (in->sub) {
+      case AIR_ICMP_EQ: r = ux == uy; break;
+      case AIR_ICMP_NE: r = ux != uy; break;
+      case AIR_ICMP_UGT: r = ux > uy; break;
+      case AIR_ICMP_UGE: r = ux >= uy; break;
+      case AIR_ICMP_ULT: r = ux < uy; break;
+      case AIR_ICMP_ULE: r = ux <= uy; break;
+      case AIR_ICMP_SGT: r = sx > sy; break;
+      case AIR_ICMP_SGE: r = sx >= sy; break;
+      case AIR_ICMP_SLT: r = sx < sy; break;
+      case AIR_ICMP_SLE: r = sx <= sy; break;
+      default: goto not_folded;
+      }
+      air_set(c, &in->base, air_val_ssa(c, nir_imm_bool(&c->b, r)));
+      return true;
+   }
+not_folded:;
    nir_def *res;
    switch (in->sub) {
    /* NaN never appears in these shaders (nnan is set on every one), so the
@@ -2468,6 +2816,13 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
             return false;
          if (pc->num_components != 1)
             return air_error(c, "instruction: a vector select between pointers");
+         /* a condition known now -- a function constant -- chooses now: a texture or a
+          * sampler cannot be chosen at run time, and the uber shaders choose between the
+          * real texture and texture2d<T>() exactly this way */
+         if (nir_src_is_const(nir_src_for_ssa(pc))) {
+            air_set(c, &in->base, nir_src_as_bool(nir_src_for_ssa(pc)) ? pa : pb);
+            return true;
+         }
          air_set(c, &in->base, air_val_ptr_select(c, pc, pa, pb));
          return true;
       }
@@ -2495,8 +2850,13 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       nir_def *i = air_get_ssa(c, in->operands[2]);
       if (!v || !x || !i)
          return false;
-      if (!nir_src_is_const(nir_src_for_ssa(i)))
-         return air_error(c, "instruction: insertelement at a run-time index");
+      /* a run-time index is a select per component (nir_vector_insert);
+       * QuartzCore's ...Tc3b... draw shaders insert that way */
+      if (!nir_src_is_const(nir_src_for_ssa(i))) {
+         air_set(c, &in->base,
+                 air_val_ssa(c, nir_vector_insert(&c->b, v, x, nir_u2u32(&c->b, i))));
+         return true;
+      }
       air_set(c, &in->base,
               air_val_ssa(c, nir_vector_insert_imm(&c->b, v, x,
                                                    nir_src_as_uint(nir_src_for_ssa(i)))));
@@ -2619,6 +2979,14 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       struct air_val *p = air_get(c, in->operands[0]);
       if (!p)
          return false;
+      if (p->kind == AIR_VAL_PTR_SELECT && in->base.type->kind == AIR_TYPE_POINTER) {
+         struct air_val *v = pointer_loaded(c, p);
+         if (!v)
+            return c->error[0] ? false : air_error(c, "instruction: a pointer loaded from "
+                                                      "memory chosen at run time");
+         air_set(c, &in->base, v);
+         return true;
+      }
       if (p->kind == AIR_VAL_PTR_SELECT) {
          nir_def *res = load_through_choice(c, p, in->base.type, in->align);
          if (!res)
@@ -2638,6 +3006,25 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
             return false;
          air_set(c, &in->base, res);
          return true;
+      }
+      if (in->base.type->kind == AIR_TYPE_POINTER) {
+         struct air_val *v = pointer_loaded(c, p);
+         if (v) {
+            air_set(c, &in->base, v);
+            return true;
+         }
+         if (c->error[0])
+            return false;
+         /* what was not known, for the refusal to say */
+         int at = ptr_slot_offset(p), g = at >= 0 ? scratch_global_at(c, nir_imm_int(&c->b, at)) : -1;
+         const struct air_value *init = g >= 0 ? c->m->globals[g]->init : NULL;
+         const struct air_constant *k = init ? air_value_as_constant(init) : NULL;
+         return air_error(c, "ptr load: cl %u at %d slots %u g %d %.24s w%d vk %d/%d e%d",
+                          p->ptr.class, at, c->num_ptr_slots, g,
+                          g >= 0 && c->m->globals[g]->base.name ? c->m->globals[g]->base.name : "-",
+                          g >= 0 ? c->global_plan[g].written_outside_init : -1,
+                          init ? (int)init->kind : -1, k ? (int)k->ckind : -1,
+                          k && k->num_elems > 0 && k->elems[0] ? (int)k->elems[0]->kind : -1);
       }
       nir_def *res = air_load_ptr(c, p->ptr, in->base.type, in->align);
       if (!res)
@@ -2659,9 +3046,33 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       struct air_val *sv = air_get(c, in->operands[0]);
       if (!sv)
          return false;
-      if (val_is_pointerish(sv))
-         return air_error(c, "instruction: a store of a pointer into memory, which this "
-                             "frontend has no address to write");
+      /* A POINTER stored into a local: QuartzCore's uber shader keeps each
+       * sampler argument in a metal::sampler of its own (an alloca holding the
+       * argument) and loads it back where it samples. The local is a slot
+       * known while translating, and a load of it answers the pointer stored --
+       * sound while one pointer only is ever stored there, which is checked. */
+      if (val_is_pointerish(sv)) {
+         int at = ptr_slot_offset(p);
+         if (at < 0)
+            return air_error(c, "instruction: a store of a pointer into memory, which this "
+                                "frontend has no address to write");
+         for (unsigned i = 0; i < c->num_ptr_slots; i++) {
+            if (c->ptr_slots[i].offset == (unsigned)at) {
+               if (c->ptr_slots[i].val == sv ||
+                   (sv->kind == AIR_VAL_PTR && c->ptr_slots[i].val->kind == AIR_VAL_PTR &&
+                    same_ptr(&sv->ptr, &c->ptr_slots[i].val->ptr)))
+                  return true;
+               return air_error(c, "instruction: two different pointers stored into one local");
+            }
+         }
+         if (c->num_ptr_slots == ARRAY_SIZE(c->ptr_slots))
+            return air_error(c, "instruction: more pointers stored into locals than %u",
+                             (unsigned)ARRAY_SIZE(c->ptr_slots));
+         c->ptr_slots[c->num_ptr_slots].offset = at;
+         c->ptr_slots[c->num_ptr_slots].val = sv;
+         c->num_ptr_slots++;
+         return true;
+      }
       if (p->kind == AIR_VAL_PTR_SELECT)
          return air_error(c, "instruction: a store through a chosen pointer, which would "
                              "have to write both of them");
@@ -2759,8 +3170,7 @@ emit_return(struct air_ctx *c, const struct air_inst *in)
             return air_error(c, "interface: field %u of the result has no output", i);
          if (!v->elems[i] || v->elems[i]->kind != AIR_VAL_SSA)
             continue; /* a field left undef is a target nothing writes */
-         nir_store_var(&c->b, c->outputs[i].var, v->elems[i]->def,
-                       BITFIELD_MASK(v->elems[i]->def->num_components));
+         store_output(c, c->outputs[i].var, v->elems[i]->def);
       }
       return true;
    }
@@ -2768,7 +3178,7 @@ emit_return(struct air_ctx *c, const struct air_inst *in)
       return air_error(c, "instruction: a returned value that is not a number");
    if (!c->num_outputs || !c->outputs[0].var)
       return air_error(c, "interface: a returned value with no output");
-   nir_store_var(&c->b, c->outputs[0].var, v->def, BITFIELD_MASK(v->def->num_components));
+   store_output(c, c->outputs[0].var, v->def);
    return true;
 }
 
@@ -2835,6 +3245,28 @@ val_holds_ptr(const struct air_val *v)
    return false;
 }
 
+/* A pointer argument whose byte offset is computed at run time: the offset is
+ * a def of the CALLER's impl, so it travels as one more parameter, after the
+ * ordinary ones. A constant offset needs none -- the callee builds the same
+ * immediate itself, which also keeps an argument buffer's member resolvable.
+ */
+static bool
+ptr_offset_is_param(const struct air_val *v)
+{
+   return v && v->kind == AIR_VAL_PTR && v->ptr.offset &&
+          v->ptr.offset->parent_instr->type != nir_instr_type_load_const;
+}
+
+/* The extra parameters ptr_offset_is_param asks for, appended to a call. */
+static void
+call_add_ptr_offsets(nir_call_instr *call, unsigned *idx, unsigned n,
+                     struct air_val **argv, const bool *is_param)
+{
+   for (unsigned i = 0; i < n; i++)
+      if (!is_param[i] && ptr_offset_is_param(argv[i]))
+         call->params[(*idx)++] = nir_src_for_ssa(argv[i]->ptr.offset);
+}
+
 /* A function of the module, translated as a nir_function so that
  * nir_inline_functions can fold it into its callers afterwards.
  *
@@ -2862,9 +3294,11 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
     * callee to its call site -- so it is not cached. Each of the four modules
     * that needs this has exactly one call site, counted beforehand.
     *
-    * A pointer carrying a byte offset is refused instead: that offset is an
-    * nir_def of the CALLER's impl, and using it here would be the same
-    * cross-function def/use that the globals used to cause.
+    * A pointer carrying a byte offset computed at run time passes that offset
+    * as a parameter of its own (ptr_offset_is_param): using the caller's def
+    * here would be the same cross-function def/use that the globals used to
+    * cause. QuartzCore's widget and blur shaders (…Tmua…, …Tmap…) are that
+    * shape, and refusing them took backboardd down with them.
     */
    bool specialised = false;
    for (unsigned i = 0; i < f->num_args; i++) {
@@ -2877,11 +3311,6 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
        */
       bool ptr = argv && argv[i] && (argv[i]->kind == AIR_VAL_PTR ||
                                      val_holds_ptr(argv[i]));
-      if (ptr && argv[i]->kind == AIR_VAL_PTR && argv[i]->ptr.offset) {
-         air_error(c, "intrinsic: a call passing a pointer at a computed offset as "
-                      "argument %u, which would use the caller's own value here", i);
-         return NULL;
-      }
       /* The same reason, for the two pointers that are values: a chosen
        * pointer's condition is a def of the CALLER's impl, and a slot's
        * soundness rests on every use being in one block of one function.
@@ -2922,7 +3351,10 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
    } else if (has_ret) {
       nret = 1;
    }
-   unsigned nparams = f->num_args + nret;
+   unsigned noffsets = 0;
+   for (unsigned i = 0; i < f->num_args; i++)
+      noffsets += argv && !is_param[i] && ptr_offset_is_param(argv[i]);
+   unsigned nparams = f->num_args + nret + noffsets;
    nir_function *fn = nir_function_create(c->nir, f->base.name ? f->base.name : "callee");
    fn->num_params = nparams;
    fn->params = rzalloc_array(c->nir, nir_parameter, MAX2(nparams, 1));
@@ -2959,7 +3391,9 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
          .bit_size = (uint8_t)air_nir_bit_size(c, at),
       };
    }
-   fn->num_params = idx;   /* the pointers took no parameter */
+   for (unsigned i = 0; i < noffsets; i++)
+      fn->params[idx++] = (nir_parameter){ .num_components = 1, .bit_size = 32 };
+   fn->num_params = idx;   /* the pointers took no parameter, only their offsets */
 
    /* cached before the body is translated, so that a callee which calls itself
     * meets its own declaration rather than being translated for ever */
@@ -3028,6 +3462,21 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
          continue;
       }
       air_set(c, &f->args[i], air_val_ssa(c, nir_load_param(&c->b, pidx++)));
+   }
+   /* the pointers with an offset, rebuilt here with this impl's own offset */
+   for (unsigned i = 0; i < f->num_args && ok; i++) {
+      if (!argv || is_param[i] || !argv[i] || argv[i]->kind != AIR_VAL_PTR ||
+          !argv[i]->ptr.offset)
+         continue;
+      struct air_val *v = ralloc(c->mem_ctx, struct air_val);
+      *v = *argv[i];
+      if (ptr_offset_is_param(argv[i])) {
+         v->ptr.offset = nir_load_param(&c->b, pidx++);
+      } else {
+         nir_load_const_instr *k = nir_instr_as_load_const(argv[i]->ptr.offset->parent_instr);
+         v->ptr.offset = nir_imm_int(&c->b, (int)k->value[0].u32);
+      }
+      air_set(c, &f->args[i], v);
    }
    if (ok)
       ok = translate_body(c);
@@ -3126,6 +3575,7 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
                           i, name);
       call->params[idx++] = nir_src_for_ssa(a);
    }
+   call_add_ptr_offsets(call, &idx, f->num_args, argv, is_param);
    nir_builder_instr_insert(&c->b, &call->instr);
 
    if (ret_struct) {
@@ -3317,6 +3767,7 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
          return air_error(c, "library: argument %u has no value to pass", i);
       call->params[idx++] = nir_src_for_ssa(a);
    }
+   call_add_ptr_offsets(call, &idx, f->num_args, argv, is_param);
    nir_builder_instr_insert(&c->b, &call->instr);
 
    struct air_ptr out = { .class = AIR_PTR_SSBO, .binding = 1, .pointee = rt };
@@ -3369,7 +3820,16 @@ resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *re
                              "%s", v && v->kind == AIR_VAL_PTR_SELECT
                                       ? "itself a pointer chosen at run time"
                                       : "not a resolved pointer");
-      if (!first)
+      /* texture2d<T>() on one path and the real texture on another is the uber shaders'
+       * "a texture if the pipeline has one": the null one is never sampled (a sample of it
+       * is refused where it happens), so the phi is the real texture */
+      if (v->ptr.class == AIR_PTR_TEXTURE && v->ptr.binding == AIR_NULL_TEXTURE_BINDING) {
+         if (!first)
+            first = v;
+         continue;
+      }
+      if (!first || (first->ptr.class == AIR_PTR_TEXTURE &&
+                     first->ptr.binding == AIR_NULL_TEXTURE_BINDING))
          first = v;
       else if (!same_ptr(&first->ptr, &v->ptr))
          return air_error(c, "instruction: a phi between pointers that name different "
@@ -3431,8 +3891,15 @@ translate_body(struct air_ctx *c)
    for (unsigned oi = 0; oi < num_order; oi++)
       reachable[order[oi]] = true;
 
+   /* LIVE: reached by an edge taken while translating -- a branch decided now (scalar_known)
+    * leaves its other side unreached, and that side is not translated at all */
+   bool *live = rzalloc_array(c->mem_ctx, bool, MAX2(f->num_blocks, 1));
+   live[0] = true;
+
    for (unsigned oi = 0; oi < num_order; oi++) {
       unsigned bi = order[oi];
+      if (!live[bi])
+         continue;
       const struct air_block *blk = &f->blocks[bi];
       nir_block *nb = nir_block_of(c, blk);
       c->b.cursor = nir_after_block(nb);
@@ -3484,6 +3951,7 @@ translate_body(struct air_ctx *c)
                               ralloc_memdup(c->mem_ctx, &at_end, sizeof(at_end)));
 
       const struct air_inst *term = blk->insts[blk->num_insts - 1];
+      int only = -1;            /* the one target taken, when the branch was decided now */
       switch (term->op) {
       case AIR_OP_RET:
          if (!emit_return(c, term))
@@ -3497,8 +3965,14 @@ translate_body(struct air_ctx *c)
             nir_def *cond = air_get_ssa(c, term->operands[0]);
             if (!cond)
                return false;
+            nir_const_value known;
             if (term->targets[0] == term->targets[1])
                nir_goto(&c->b, nir_block_of(c, term->targets[0]));
+            else if (cond->num_components == 1 && scalar_known(cond, &known, 0)) {
+               /* decided now: only the side taken (scalar_known) */
+               only = nir_const_value_as_bool(known, cond->bit_size) ? 0 : 1;
+               nir_goto(&c->b, nir_block_of(c, term->targets[only]));
+            }
             else
                nir_goto_if(&c->b, nir_block_of(c, term->targets[0]), cond,
                            nir_block_of(c, term->targets[1]));
@@ -3556,6 +4030,9 @@ translate_body(struct air_ctx *c)
       default:
          return air_error(c, "instruction: block %u ends with opcode %u", bi, term->op);
       }
+      for (unsigned k = 0; k < term->num_targets; k++)
+         if (term->targets[k] && (only < 0 || (int)k == only))
+            live[term->targets[k]->index] = true;
    }
 
    /* the phi stores, now that every value exists */
@@ -3684,7 +4161,16 @@ plan_globals(struct air_ctx *c)
          pl->binding = next;
 
          uint64_t word = 0;
-         if (g->init && !air_const_uint(g->init, &word)) {
+         const struct air_constant *agg = air_value_as_constant(g->init);
+         /* Newer compilers (AIR 2.8, the macOS QuartzCore's library) write the state as an
+          * aggregate whose first member is the same 64-bit word -- a struct of the word and
+          * the LOD bias, or an array of words -- so the word is taken from there. */
+         if (agg && agg->ckind == AIR_CONST_AGGREGATE && agg->num_elems > 0 &&
+             air_const_uint(agg->elems[0], &word)) {
+            /* taken */
+         } else if (agg && agg->ckind == AIR_CONST_DATA && agg->data) {
+            word = agg->data[0];
+         } else if (g->init && !air_const_uint(g->init, &word)) {
             air_error(c, "interface: an inline sampler whose state is not a constant");
             return;
          }
@@ -3748,6 +4234,71 @@ materialise_globals(struct air_ctx *c)
    }
 }
 
+/* Which program-scope globals anything but air.static_init stores into. Newer compilers
+ * (AIR 2.8) copy every function constant into such a global in the initializer and read the
+ * copy everywhere else; a copy nothing else writes holds the constant for the whole
+ * invocation, so a load of it can BE the constant (air_load_ptr), and what branches or selects
+ * on it -- a texture against texture2d<T>(), one sampler against another -- is decided while
+ * translating, which a texture or a sampler has to be. */
+static void
+mark_globals_written_outside_init(struct air_ctx *c)
+{
+   for (unsigned i = 0; i < c->m->num_functions; i++) {
+      const struct air_function *f = c->m->functions[i];
+      if (f->is_declaration || (f->section && !strcmp(f->section, "air.static_init")))
+         continue;
+      for (unsigned b = 0; b < f->num_blocks; b++) {
+         for (unsigned k = 0; k < f->blocks[b].num_insts; k++) {
+            const struct air_inst *in = f->blocks[b].insts[k];
+            if (in->op != AIR_OP_STORE && in->op != AIR_OP_CALL)
+               continue;
+            /* a store's pointer, or any global handed to a call, may be written */
+            for (unsigned o = in->op == AIR_OP_STORE ? 1 : 0; o < in->num_operands; o++) {
+               const struct air_value *v = in->operands[o];
+               if (!v || v->kind != AIR_VALUE_GLOBAL)
+                  continue;
+               for (unsigned g = 0; g < c->m->num_globals; g++)
+                  if (&c->m->globals[g]->base == v)
+                     c->global_plan[g].written_outside_init = true;
+               if (in->op == AIR_OP_STORE)
+                  break;
+            }
+         }
+      }
+   }
+}
+
+/* the global whose planned scratch slot CONTAINS this byte offset, or -1 */
+static int
+scratch_global_containing(struct air_ctx *c, uint64_t off)
+{
+   for (unsigned g = 0; g < c->m->num_globals; g++) {
+      const struct air_global_plan *pl = &c->global_plan[g];
+      if (pl->skip || pl->class != AIR_PTR_SCRATCH || !pl->has_offset)
+         continue;
+      uint64_t size = air_type_alloc_size(c->m, c->m->globals[g]->value_type);
+      if (off >= pl->offset && off < pl->offset + size)
+         return g;
+   }
+   return -1;
+}
+
+/* the global whose planned scratch slot is at this constant offset, or -1 */
+static int
+scratch_global_at(struct air_ctx *c, nir_def *offset)
+{
+   uint64_t off;
+   /* (through the iadds a getelementptr leaves: offset_known) */
+   if (!offset || !offset_known(offset, &off, 0))
+      return -1;
+   for (unsigned g = 0; g < c->m->num_globals; g++) {
+      const struct air_global_plan *pl = &c->global_plan[g];
+      if (!pl->skip && pl->class == AIR_PTR_SCRATCH && pl->has_offset && pl->offset == off)
+         return g;
+   }
+   return -1;
+}
+
 /* The functions of @llvm.global_ctors, inlined at the top of the entry point:
  * this is where a function constant turns into the program-scope variable the
  * body reads (AV1SW computes kPixelShift from kBitDepth that way).
@@ -3779,7 +4330,9 @@ run_static_initializers(struct air_ctx *c)
           * also why this could not be reached before the reader learnt to read
           * one.
           */
+         c->in_static_init = true;
          nir_function *fn = translate_callee(c, f, NULL, NULL);
+         c->in_static_init = false;
          if (!fn)
             return;   /* translate_callee has said why */
          nir_builder_instr_insert(&c->b, &nir_call_instr_create(c->nir, fn)->instr);
@@ -3787,13 +4340,17 @@ run_static_initializers(struct air_ctx *c)
       }
       /* its instructions, in place, without its ret */
       const struct air_block *blk = &f->blocks[0];
+      c->in_static_init = true;
       for (unsigned k = 0; k < blk->num_insts; k++) {
          const struct air_inst *in = blk->insts[k];
          if (in->op == AIR_OP_RET)
             continue;
-         if (!translate_instruction(c, in))
+         if (!translate_instruction(c, in)) {
+            c->in_static_init = false;
             return;
+         }
       }
+      c->in_static_init = false;
    }
 }
 
@@ -3944,6 +4501,7 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
 
    if (!c.error[0])
       plan_globals(&c);
+      mark_globals_written_outside_init(&c);
    if (!c.error[0])
       materialise_globals(&c);
    if (!c.error[0])

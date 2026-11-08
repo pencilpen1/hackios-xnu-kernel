@@ -46,6 +46,8 @@ void lancelot_touch_init(void);         /* lancelot_touch=1/2/3: snapshot / trim
 void redwood_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
 void redwood_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
 void lancelot_emmc_init(void);         /* native read-only MT6768 PIO, only with validated loader metadata */
+void lancelot_sspm_pmic_init(void);    /* mode1: production protocol RAM selftest only; real backend absent */
+void lancelot_mali_init(void);         /* mode1 observation; full modes require shared WACS2 handoff */
 bool lancelot_emmc_dev(dev_t dev);     /* native flash is not a memory disk */
 void redwood_ufs_report(const char *when); /* where reading the storage has spent its time so far */
 bool redwood_ufs_dev(dev_t dev);           /* one of the storage's devices */

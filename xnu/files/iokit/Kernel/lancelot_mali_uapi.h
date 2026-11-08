@@ -24,6 +24,7 @@ extern "C" {
 #define LMAL_MAX_STRUCT_SIZE          UINT32_C(4096)
 #define LMAL_PAGE_SIZE                UINT64_C(4096)
 #define LMAL_MAX_BO_BYTES             UINT64_C(0x08000000) /* 128 MiB */
+#define LMAL_MAX_OWNED_SURFACE_BYTES  UINT64_C(0x10000000) /* donor's 256 MiB surface backing */
 #define LMAL_MAX_VM_BYTES             UINT64_C(0x10000000) /* 256 MiB */
 #define LMAL_MAX_SUBMIT_BOS           UINT32_C(8192)
 #define LMAL_MAX_SUBMIT_SYNCS         UINT32_C(256)
@@ -72,6 +73,11 @@ enum lmal_selector {
     LMAL_SELECTOR_SURFACE_QUERY   = LMAL_SELECTOR_BASE + 0x0f,
     LMAL_SELECTOR_SURFACE_IMPORT  = LMAL_SELECTOR_BASE + 0x10,
     LMAL_SELECTOR_BO_UNMAP        = LMAL_SELECTOR_BASE + 0x11,
+    LMAL_SELECTOR_SUBMIT_ACCESS   = LMAL_SELECTOR_BASE + 0x12,
+    LMAL_SELECTOR_SUBMIT_PAIR_SYNC = LMAL_SELECTOR_BASE + 0x13,
+    LMAL_SELECTOR_CHECK_PAIR_SYNC = LMAL_SELECTOR_BASE + 0x14,
+    LMAL_SELECTOR_SYNCOBJ_SNAPSHOT = LMAL_SELECTOR_BASE + 0x15,
+    LMAL_SELECTOR_JOB_PROFILE      = LMAL_SELECTOR_BASE + 0x16,
 };
 
 /* BO flags.  HEAP is fixed-size backing in v1; it never grows implicitly. */
@@ -181,7 +187,9 @@ struct lmal_bo_wait {
     uint64_t absolute_monotonic_ns; /* XNU mach_absolute_time converted to ns; Mesa sends converted remaining deadline */
 };
 
-/* Submit is synchronous in v1: no raw fence is returned to user space. */
+/* The v1 wire layout is fixed. Submission is synchronous unless GET_CAPS
+ * negotiates LMAL_CAP_ASYNC_SUBMIT; then sequence is an enqueue token and
+ * syncobj/BO waits report completion. There is no per-submit flags field. */
 #define LMAL_SUBMIT_REQUIRE_COMPLETE UINT32_C(0x00000001)
 struct lmal_submit {
     struct lmal_header h;
@@ -196,6 +204,108 @@ struct lmal_submit {
     uint64_t sequence;            /* output, monotonically increasing */
     uint32_t job_status;          /* output, core status */
     uint32_t reserved;
+};
+
+/* Optional extension; old SUBMIT keeps its exact 88-byte layout/semantics.
+ * One value per handle: 0 conservative RW, 1 GPU read-only for this job.
+ * Kernel enforces RO PTEs before omitting post-DMA CPU invalidation. Duplicate
+ * RW uses win; JC must be RW. Aliases/OOM retain full-VM RW maintenance. */
+#define LMAL_CAP_SUBMIT_ACCESS UINT32_C(1)
+#define LMAL_CAP_HAKIOS_DONOR UINT32_C(16) /* shared-AS MT6768 implementation */
+#define LMAL_CAP_ASYNC_SUBMIT UINT32_C(32) /* submit returns an enqueue token; syncobj/BO waits report completion */
+#define LMAL_CAP_FENCE_SNAPSHOT UINT32_C(64) /* bridge retains the current fence without waiting */
+#define LMAL_CAP_JOB_PROFILE UINT32_C(128) /* read-only completed JM timing by FIFO token */
+#define LMAL_CAP_QUEUED_DRM UINT32_C(8) /* real FIFO/fence bridge; old SUBMIT wire is unchanged */
+#define LMAL_ACCESS_READONLY UINT32_C(1)
+struct lmal_submit_access {
+    struct lmal_submit submit;
+    uint64_t bo_readonly;        /* uint32_t[submit.bo_count], user address */
+};
+
+/* Bridge-local retained fence snapshot. It copies the source's current
+ * completion object; later RESET/SUBMIT/DESTROY of source cannot retarget it. */
+struct lmal_syncobj_snapshot {
+    struct lmal_header h;
+    uint32_t source;
+    uint32_t handle;              /* output, new independently destroyable syncobj */
+};
+
+/* Completed-job observation retained independently of waits. No GPU payload
+ * or shader memory is read; absent/overwritten records return EBUSY/EINVAL. */
+struct lmal_job_profile {
+    struct lmal_header h;
+    uint64_t sequence;
+    uint64_t start_ns,end_ns,jm_ns,worker_ns;
+    uint32_t hz;
+    int32_t error;
+};
+
+/* Optional SYNCHRONOUS VTC->FS transaction. No enqueue token, async callback
+ * or early fence is exposed. Both arrays/JC headers are validated before DMA;
+ * the same CPU roots remain blocked until the two real stages have retired.
+ * Old SUBMIT/SUBMIT_ACCESS keep their exact layouts and semantics. */
+#define LMAL_CAP_SUBMIT_PAIR_SYNC UINT32_C(2)
+#define LMAL_SYNC_PAIR_STAGE_BOS UINT32_C(256)
+struct lmal_sync_pair_stage {
+    uint64_t jc;
+    uint32_t bo_count;
+    uint32_t reserved;
+    uint64_t bo_handles;
+    uint64_t bo_readonly;
+};
+struct lmal_submit_pair_sync {
+    struct lmal_header h;
+    struct lmal_sync_pair_stage stage[2]; /* requirements0 VTC,1 FS */
+    uint64_t timeout_ns;
+    uint32_t in_sync_count;
+    uint32_t out_sync;
+    uint64_t in_syncs;
+    uint64_t sequence[2];
+    uint32_t job_status[2];
+    int32_t stage_error[2];
+    uint32_t attempted_mask;
+    uint32_t completed_mask;
+    uint32_t reserved[2];
+};
+
+/* Read-only, client-local workset admission. This is NOT an execution grant,
+ * reservation, enqueue token or alias proof. SUBMIT_PAIR_SYNC revalidates all
+ * inputs under its own lock and retains its original mandatory lease checks. */
+#define LMAL_CAP_CHECK_PAIR_SYNC UINT32_C(4)
+#define LMAL_PAIR_STAGE_NONE UINT32_MAX
+enum lmal_pair_reason {
+    LMAL_PAIR_REASON_NONE = 0,
+    LMAL_PAIR_REASON_REQUEST,
+    LMAL_PAIR_REASON_BO_STATE,
+    LMAL_PAIR_REASON_MISSING_LEASE,
+    LMAL_PAIR_REASON_ACCESS,
+    LMAL_PAIR_REASON_JC,
+    LMAL_PAIR_REASON_SYNC,
+    LMAL_PAIR_REASON_COPY,
+    LMAL_PAIR_REASON_ALLOC,
+    LMAL_PAIR_REASON_DEADLINE,
+    LMAL_PAIR_REASON_VM,
+    LMAL_PAIR_REASON_CPU,
+    LMAL_PAIR_REASON_WIRE,
+};
+#define LMAL_PAIR_BO_MEMORY UINT32_C(1)
+#define LMAL_PAIR_BO_MAPPED UINT32_C(2)
+#define LMAL_PAIR_BO_PREPARED UINT32_C(4)
+#define LMAL_PAIR_BO_QUARANTINED UINT32_C(8)
+#define LMAL_PAIR_BO_LEASE UINT32_C(16)
+struct lmal_pair_admission {
+    uint32_t eligible;
+    uint32_t reason;
+    uint32_t stage_index;
+    uint32_t bo_handle;
+    uint32_t surface_id;
+    uint32_t bo_flags;
+    uint32_t bo_state;
+    uint32_t reserved;
+};
+struct lmal_check_pair_sync {
+    struct lmal_submit_pair_sync submit;
+    struct lmal_pair_admission admission; /* output metadata, no pointers */
 };
 
 #define LMAL_SYNCOBJ_CREATE_SIGNALED UINT32_C(0x00000001)
@@ -290,10 +400,14 @@ struct lmal_surface_import {
 static_assert(sizeof(struct lmal_header) == 24, "LMAL header ABI");
 static_assert(sizeof(struct lmal_bo_create) == 64, "LMAL BO create ABI");
 static_assert(sizeof(struct lmal_submit) == 88, "LMAL submit ABI");
+static_assert(sizeof(struct lmal_submit_pair_sync) == 160, "LMAL synchronous pair ABI");
+static_assert(sizeof(struct lmal_check_pair_sync) == 192, "LMAL pair admission ABI");
 #elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(struct lmal_header) == 24, "LMAL header ABI");
 _Static_assert(sizeof(struct lmal_bo_create) == 64, "LMAL BO create ABI");
 _Static_assert(sizeof(struct lmal_submit) == 88, "LMAL submit ABI");
+_Static_assert(sizeof(struct lmal_submit_pair_sync) == 160, "LMAL synchronous pair ABI");
+_Static_assert(sizeof(struct lmal_check_pair_sync) == 192, "LMAL pair admission ABI");
 #endif
 
 #endif /* LANCELOT_MALI_UAPI_H */

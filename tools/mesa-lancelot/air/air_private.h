@@ -39,6 +39,9 @@ enum air_ptr_class {
    AIR_PTR_ARGBUF,
 };
 
+/* the binding of Metal 3's texture2d<T>() -- air.get_null_texture_*: no texture at all */
+#define AIR_NULL_TEXTURE_BINDING (~0u)
+
 struct air_ptr {
    enum air_ptr_class class;
    unsigned binding;
@@ -187,7 +190,10 @@ struct air_ctx {
       unsigned offset;      /* bytes, when has_offset */
       bool has_offset;
       bool skip;            /* llvm.* lists, and anything that failed */
+      bool written_outside_init; /* a store to it outside air.static_init */
+      nir_def *init_value;  /* the constant air.static_init stored in it, when it did */
    } *global_plan;
+   bool in_static_init;
 
    /* what the entry point's parameters are */
    unsigned num_params;
@@ -208,6 +214,24 @@ struct air_ctx {
 
    unsigned scratch_size;
    unsigned shared_size;
+
+   /* POINTERS stored into locals: a local's byte offset in scratch and the
+    * pointer stored there, answered again by a load of it (see AIR_OP_STORE) */
+   /* constants air.static_init stored into a FIELD of a program-scope global (a struct of
+    * function constants): byte offset in scratch, and the value; `bad` when that place got
+    * a second value or one not known while translating */
+   unsigned num_init_stores;
+   struct {
+      unsigned offset;
+      nir_def *value;
+      bool bad;
+   } init_stores[256];
+
+   unsigned num_ptr_slots;
+   struct {
+      unsigned offset;
+      struct air_val *val;
+   } ptr_slots[32];
 
    /* module-scope variables, by their air_global */
    struct hash_table *globals;

@@ -3,6 +3,7 @@
 # in this repository. Nothing is tracked unless it is named here.
 /*
 !/.gitignore
+!/.gitattributes
 !/README.md
 !/CLAUDE.md
 !/LICENSE

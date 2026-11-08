@@ -16,6 +16,7 @@ using task_t=void*;
 constexpr task_t TASK_NULL=nullptr;
 constexpr int kIOReturnSuccess=0, kIOReturnError=-1;
 constexpr IOOptionBits kIODirectionInOut=3, kIOMapReference=0x02000000, kIOMapUnique=0x04000000;
+constexpr IOOptionBits kIOMapCacheMask=0x00000f00;
 inline thread_local task_t host_current_task=(void*)1;
 inline unsigned host_task_refs;
 inline task_t current_task() { return host_current_task; }
