@@ -72,6 +72,11 @@
 #include <string.h>
 
 #include "drawable.h"
+#include "lancelot_mali_uapi.h"
+#include "lancelot_mali_queue_uapi.h"
+#include <mutex>
+
+static_assert(sizeof(struct rwd_surface) == sizeof(struct lmq_surface), "native Mali surface ABI");
 
 /*
  * The two requests this file needs, by the numbers the kernel answers them on
@@ -79,8 +84,8 @@
  * kDrmGemClose is Linux's. Repeated here rather than shared for the reason the structs are
  * repeated, and it is two lines.
  */
-#define RWD_REQUEST_SURFACE   0x7e
-#define RWD_REQUEST_GEM_CLOSE 0x09
+#define RWD_REQUEST_SURFACE   LMQ_SURFACE
+#define RWD_REQUEST_GEM_CLOSE LMQ_CLOSE
 
 /* A sentence into a caller's buffer, once, with no dependency on the caller having one. */
 static void
@@ -102,24 +107,19 @@ rwd_gpu_open(io_connect_t *connection, char *why, size_t why_size)
 	/* The Adreno's service, or the Mali's: RedwoodMali.cpp answers kRedwoodSurface with
 	 * the same structure, so a drawable on the Infinix is the surface's own memory too
 	 * rather than a texture copied into it after every frame. */
-	io_service_t service = IOServiceGetMatchingService(0, IOServiceMatching("RedwoodGPU"));
 	kern_return_t result;
-
-	if (service == IO_OBJECT_NULL) {
-		service = IOServiceGetMatchingService(0, IOServiceMatching("RedwoodMali"));
-	}
 
 	if (connection == NULL) {
 		rwd_say(why, why_size, "rwd_gpu_open was given nowhere to put the connection");
 		return -1;
 	}
+	io_service_t service = IOServiceGetMatchingService(0, IOServiceMatching(LMAL_SERVICE_NAME));
 	*connection = 0;
 	if (service == IO_OBJECT_NULL) {
-		rwd_say(why, why_size, "no RedwoodGPU or RedwoodMali service: this kernel was "
-		    "booted without gpu=1 or mali=1, so there is no GPU to give a surface to");
+		rwd_say(why, why_size, "no %s service for the drawable's native Mali import", LMAL_SERVICE_NAME);
 		return -1;
 	}
-	result = IOServiceOpen(service, mach_task_self(), 0, connection);
+	result = IOServiceOpen(service, mach_task_self(), LMAL_OPEN_TYPE, connection);
 	IOObjectRelease(service);
 	if (result != KERN_SUCCESS) {
 		*connection = 0;
@@ -154,17 +154,15 @@ static io_connect_t
 rwd_shared_connection(void)
 {
 	static io_connect_t connection;
-	static int opened;
-
-	if (!opened) {
+	static std::once_flag once;
+	std::call_once(once, [] {
 		char why[256] = { 0 };
 
-		opened = 1;
 		if (rwd_gpu_open(&connection, why, sizeof(why)) != 0) {
 			connection = 0;
 			printf("redwooddrawable: %s\n", why);
 		}
-	}
+	});
 	return connection;
 }
 
@@ -208,7 +206,7 @@ rwd_surface_call(io_connect_t connection, struct rwd_surface *surface, const cha
 			    : "");
 		return -1;
 	}
-	if (size < sizeof(reply)) {
+	if (size != sizeof(reply)) {
 		rwd_say(why, why_size, "the kernel answered %zu bytes about surface %u, not %zu",
 		    size, surface->surface, sizeof(reply));
 		return -1;
@@ -260,13 +258,14 @@ rwd_surface_give_back(io_connect_t connection, uint32_t handle, char *why, size_
 		uint32_t handle, pad;
 	} close = { handle, 0 };
 	kern_return_t result;
+	size_t reply_size = sizeof(close);
 
 	if (connection == 0 || handle == 0) {
 		return 0;                 /* nothing was taken, so nothing is owed */
 	}
 	result = IOConnectCallStructMethod(connection, RWD_REQUEST_GEM_CLOSE, &close,
-	    sizeof(close), NULL, NULL);
-	if (result != KERN_SUCCESS) {
+	    sizeof(close), &close, &reply_size);
+	if (result != KERN_SUCCESS || reply_size != sizeof(close)) {
 		rwd_say(why, why_size, "the kernel would not take buffer %u back: %#x", handle,
 		    result);
 		return -1;
@@ -320,6 +319,10 @@ rwd_surface_fits_adreno(const struct rwd_surface *surface, unsigned bytes_per_pi
 		rwd_say(why, why_size, "rwd_surface_fits_adreno needs a surface and a pixel size");
 		return -1;
 	}
+	if (!surface->width || !surface->height || !surface->rowBytes) {
+		rwd_say(why, why_size, "surface %u has empty geometry", surface->surface);
+		return -1;
+	}
 	if (surface->planes > 1) {
 		rwd_say(why, why_size, "surface %u has %u planes; a drawable's texture is one "
 		    "plane and this driver imports no others", surface->surface, surface->planes);
@@ -340,7 +343,8 @@ rwd_surface_fits_adreno(const struct rwd_surface *surface, unsigned bytes_per_pi
 		    surface->surface, surface->rowBytes, align, align);
 		return -1;
 	}
-	if (surface->size < (uint64_t)surface->rowBytes * surface->height + surface->offset) {
+	uint64_t rows = (uint64_t)surface->rowBytes * surface->height;
+	if (surface->offset > surface->size || rows > surface->size - surface->offset) {
 		rwd_say(why, why_size, "surface %u is %llu bytes, and %u rows of %u bytes from "
 		    "offset %u need %llu", surface->surface, (unsigned long long)surface->size,
 		    surface->height, surface->rowBytes, surface->offset,

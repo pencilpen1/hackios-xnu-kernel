@@ -192,8 +192,12 @@ rwm_texture_copy_in(struct rwm_texture *texture, size_t *bytes, char *why, size_
 	const unsigned origin[3] = { 0, 0, 0 }, size[3] = { width, height, 1 };
 
 	*bytes = 0;
-	if (texture->source == nullptr || air->texture_write == nullptr) {
+	if (texture->source == nullptr) {
 		return 0;
+	}
+	if (air->texture_write == nullptr) {
+		snprintf(why, why_size, "compiler library cannot write the sampled surface");
+		return -1;
 	}
 
 	uint32_t seed = IOSurfaceGetSeed(texture->source);
@@ -205,7 +209,8 @@ rwm_texture_copy_in(struct rwm_texture *texture, size_t *bytes, char *why, size_
 	surface_lock lock(texture->source, kIOSurfaceLockReadOnly);
 
 	if (!lock.held()) {
-		return 0;
+		snprintf(why, why_size, "the sampled surface could not be locked");
+		return -1;
 	}
 
 	const plane first = plane_of(texture->source, 0);
@@ -237,7 +242,8 @@ rwm_texture_copy_in(struct rwm_texture *texture, size_t *bytes, char *why, size_
 
 		packed.reset((uint8_t *)malloc((size_t)width * height * 4));
 		if (packed == nullptr) {
-			return 0;
+			snprintf(why, why_size, "no memory for the sampled two-plane surface");
+			return -1;
 		}
 		for (unsigned y = 0; y < height; y++) {
 			const uint8_t *l = luma + y * luma_row, *c = chroma + (y / 2) * chroma_row;
@@ -378,8 +384,12 @@ rwm_texture_sync_surface(struct rwm_texture *texture, char *why, size_t why_size
 	IOSurfaceRef surface = texture->surface;
 	char inner[256] = { 0 };
 
-	if (surface == nullptr || air->texture_read == nullptr) {
+	if (surface == nullptr) {
 		return 0;
+	}
+	if (air->texture_read == nullptr) {
+		snprintf(why, why_size, "compiler library cannot read back the rendered surface");
+		return -1;
 	}
 	/* one buffer per call: the window server commits from more than one thread, and a buffer
 	   shared between them was freed under a copy (signal 11 in memmove) */
@@ -402,12 +412,14 @@ rwm_texture_sync_surface(struct rwm_texture *texture, char *why, size_t why_size
 	uint8_t *base = (uint8_t *)(planar ? IOSurfaceGetBaseAddressOfPlane(surface, 0)
 					   : IOSurfaceGetBaseAddress(surface));
 	const size_t pitch = planar ? IOSurfaceGetBytesPerRowOfPlane(surface, 0) : IOSurfaceGetBytesPerRow(surface);
-	const size_t height = planar ? IOSurfaceGetHeightOfPlane(surface, 0) : IOSurfaceGetHeight(surface);
-	const size_t alloc = IOSurfaceGetAllocSize(surface), copy = row < pitch ? row : pitch;
-
-	for (size_t y = 0; base != nullptr && pitch != 0 && y < rows && y < height &&
-	     y * pitch + copy <= alloc; y++) {
-		memcpy(base + y * pitch, scratch.get() + y * row, copy);
+	const plane destination = plane_of(surface, 0);
+	if (texture->shape.width > destination.width || !covers(surface, destination, row, rows)) {
+		snprintf(why, why_size, "rendered surface cannot hold the complete %ux%u frame",
+			 texture->shape.width, texture->shape.height);
+		return -1;
+	}
+	for (size_t y = 0; y < rows; y++) {
+		memcpy(base + y * pitch, scratch.get() + y * row, row);
 	}
 	return 0;
 }

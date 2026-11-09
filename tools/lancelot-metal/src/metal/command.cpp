@@ -49,12 +49,21 @@ extern "C" int
 rwm_submit(struct rwa_device *device, bool finish, uint64_t *seq, char *why, size_t why_size)
 {
 	const struct rwm_air *air = rwm_air();
+	*seq = 0;
+	if (device == nullptr) {
+		snprintf(why, why_size, "no Mali/Panfrost device for the command buffer");
+		return -1;
+	}
 
 	if (!finish && air->flush_seq != nullptr && air->wait_seq != nullptr &&
 	    (*seq = air->flush_seq(device)) != 0) {
 		return 0;               /* sent */
 	}
-	if (air->finish != nullptr && air->finish(device, why, why_size) != 0) {
+	if (air->finish == nullptr) {
+		snprintf(why, why_size, "compiler library has no GPU completion wait");
+		return -1;
+	}
+	if (air->finish(device, why, why_size) != 0) {
 		return -1;
 	}
 	return 0;

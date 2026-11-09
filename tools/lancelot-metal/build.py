@@ -25,13 +25,23 @@ core = sorted((P / 'src/metal').glob('*.cpp'))
 plugin = P / 'src/redwoodmetal.m'
 headers = [p for p in (P / 'src').rglob('*.h')]
 headers.append(R / 'tools/mesa-lancelot/air/air_metal.h')
-inputs = {p.relative_to(R).as_posix(): sha(p) for p in core + headers + [plugin, P / 'src/metal_plugin.plist']}
+headers += [R/'xnu/files/iokit/Kernel/lancelot_mali_uapi.h', R/'xnu/files/iokit/Kernel/lancelot_mali_queue_uapi.h']
+runtime = [P/'src/ca_runtime.m', P/'src/lancelot_metal_test.m', P/'src/metal_props.c', P/'src/lancelot_metal_init.inc']
+shaders = sorted((P/'tests/shaders').glob('*.ll'))
+recipes = [Path(__file__), P/'build-shaders.py', P/'apply-init.py', P/'apply-inject.py']
+inputs = {p.relative_to(R).as_posix(): sha(p) for p in core + headers + runtime + shaders + recipes + [plugin, P / 'src/metal_plugin.plist']}
+frozen = O/'source'
+for name, expected in inputs.items():
+    dest=frozen/name;dest.parent.mkdir(parents=True,exist_ok=True)
+    shutil.copy2(R/name,dest);assert sha(dest)==expected
+source=frozen/'tools/lancelot-metal'
 with (O / 'inputs.json').open('x') as f:
     json.dump(inputs, f, indent=2)
 CC = W / 'xnu-deps/host/bin/xnu-clang'
 CXX = W / 'xnu-deps/host/bin/xnu-clang++'
 common = ['-arch', 'arm64', '-isysroot', str(SDK), '-Os', '-fblocks',
-          '-I' + str(R / 'tools/mesa-lancelot/air'), '-I' + str(P / 'src')]
+          '-I' + str(frozen / 'tools/mesa-lancelot/air'), '-I' + str(source / 'src'),
+          '-I' + str(frozen / 'xnu/files/iokit/Kernel')]
 runs = []
 def run(name, command):
     log = O / (name + '.log')
@@ -48,21 +58,36 @@ def run(name, command):
 objects = []
 for p in core:
     obj = O / 'obj' / (p.stem + '.o')
-    run(p.stem, [CXX, *common, '-std=c++20', '-stdlib=libc++', '-fno-exceptions', '-fno-rtti', '-c', p, '-o', obj])
+    run(p.stem, [CXX, *common, '-std=c++20', '-stdlib=libc++', '-fno-exceptions', '-fno-rtti', '-c', source/'src/metal'/p.name, '-o', obj])
     objects.append(obj)
 bundle = O / 'RedwoodMetal.bundle'
 bundle.mkdir()
 binary = bundle / 'RedwoodMetal'
 run('plugin', [CC, *common, '-bundle', '-framework', 'Foundation', '-framework', 'IOKit',
                '-framework', 'IOSurface', '-framework', 'Metal', '-lobjc', '-lc++',
-               '-o', binary, plugin, *objects])
-shutil.copy2(P / 'src/metal_plugin.plist', bundle / 'Info.plist')
+               '-o', binary, source/'src/redwoodmetal.m', *objects])
+shutil.copy2(source / 'src/metal_plugin.plist', bundle / 'Info.plist')
+helper=O/'liblancelot-metal-ca.dylib'
+run('ca-runtime',[CC,*common,'-dynamiclib','-framework','Foundation','-framework','Metal',
+    '-lobjc','-install_name','/redwood/lib/liblancelot-metal-ca.dylib','-o',helper,source/'src/ca_runtime.m'])
+test=O/'lancelot_metal_test'
+run('metal-test',[CC,*common,'-framework','Foundation','-framework','Metal','-framework','IOKit','-lobjc',
+    '-o',test,source/'src/lancelot_metal_test.m'])
+props=O/'metal_props'
+run('metal-props',[CC,*common,'-framework','CoreFoundation','-framework','IOKit','-o',props,source/'src/metal_props.c'])
+run('test-shaders',['python3','-B',source/'build-shaders.py','--out',O/'shaders'])
 assert all(sha(R / n) == h for n, h in inputs.items())
 result = {'passed': True, 'inputs': inputs, 'runs': runs,
           'plugin': {'path': binary.relative_to(R).as_posix(), 'bytes': binary.stat().st_size, 'sha256': sha(binary)},
           'bundle_info': {'path': (bundle / 'Info.plist').relative_to(R).as_posix(), 'sha256': sha(bundle / 'Info.plist')},
           'public_MTK_core_files_compiled': len(core), 'runtime_20H392_verified': False,
-          'CoreAnimation_Metal_verified': False, 'GPU_complete': False}
+          'ca_helper':{'path':helper.relative_to(R).as_posix(),'bytes':helper.stat().st_size,'sha256':sha(helper)},
+          'device_test':{'path':test.relative_to(R).as_posix(),'bytes':test.stat().st_size,'sha256':sha(test)},
+          'discovery_tool':{'path':props.relative_to(R).as_posix(),'bytes':props.stat().st_size,'sha256':sha(props)},
+          'test_shaders':{'path':(O/'shaders/lancelot-test.metallib').relative_to(R).as_posix(),
+              'sha256':sha(O/'shaders/lancelot-test.metallib'),'bytes':(O/'shaders/lancelot-test.metallib').stat().st_size},
+          'source_snapshot':str(frozen), 'fixed_20F66_device_test_addresses':False,
+          'CoreAnimation_Metal_verified': False, 'GPU_complete': False,'deployed':False}
 with (O / 'result.json').open('x') as f:
     json.dump(result, f, indent=2)
 print('Built public MTK Metal core and plugin:', O, flush=True)

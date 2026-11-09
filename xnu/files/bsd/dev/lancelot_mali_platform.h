@@ -129,15 +129,20 @@ struct lmp_dvfs_ops {
      * reset, DMA, power or clock writes. Called under that same mali_lock. */
     void (*revoke)(void *cookie, int error);
     /* Optional real hardware-backed XNU caps, never Android snapshots/mock
-     * temperature. Any never-started/absent component limits the effective
-     * maximum to850MHz but DOES NOT disable load DVFS or boost below that cap.
-     * Every available valid lower cap still wins. All three started+valid allow
-     * rated950MHz. NULL/ENODEV/ENOTSUP mean ordinary startup absence ONLY when
+     * temperature. Startup absence uses missing_provider_max_hz, or the
+     * default850MHz ceiling. Every available valid lower cap still wins.
+     * All three started+valid allow rated950MHz. NULL/ENODEV/ENOTSUP mean
+     * ordinary startup absence ONLY when
      * no previously/explicitly started component is lost or invalid; aggregate
      * ENODEV/ENOTSUP may report partial valid feedback with other components
      * absent. Other errors, fault_mask, stale feedback or loss after start are
      * protective failures. Sample again before every resource write. */
     int (*limits)(void *cookie, struct lmp_dvfs_limits *limits);
+    /* Explicit board boot policy for feedback that has never started.
+     * Zero retains850MHz. Rated950MHz requires an explicit request; this
+     * changes neither feedback validity nor failure-after-start protection.
+     * Mandatory rail readback, source checks and idle guards still apply. */
+    uint32_t missing_provider_max_hz;
 };
 #define LMP_DVFS_PEER_EXCLUSIVE 0u
 #define LMP_DVFS_NATIVE_AP 1u

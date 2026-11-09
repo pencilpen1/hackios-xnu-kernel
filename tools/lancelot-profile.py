@@ -40,6 +40,16 @@ def render(profile, environment=None):
         set_value('lancelot_data', env['LANCELOT_DATA'])
         if env['LANCELOT_DATA'] == '0':
             set_value('lancelot_data_map', None)
+    if 'LANCELOT_GPU_MAX_MHZ' in env:
+        ceiling = env['LANCELOT_GPU_MAX_MHZ']
+        if ceiling not in ('850', '950'):
+            raise ValueError('LANCELOT_GPU_MAX_MHZ must be 850 or 950')
+        set_value('lancelot_gpu_dvfs', '2' if ceiling == '950' else '1')
+    if 'LANCELOT_MALI_TRACE' in env:
+        trace = env['LANCELOT_MALI_TRACE']
+        if trace not in ('0', '1', '2'):
+            raise ValueError('LANCELOT_MALI_TRACE must be 0, 1 or 2')
+        set_value('mali_trace', trace)
 
     values = {}
     for word in words:
@@ -55,6 +65,16 @@ def render(profile, environment=None):
             raise ValueError('Continuous lancelot boot requires ' + key + '=' + wanted)
     if values.get('lancelot_mali') not in ('1', '3', '4'):
         raise ValueError('Unsupported Mali service mode')
+    if values.get('lancelot_gpu_dvfs', '0') not in ('0', '1', '2'):
+        raise ValueError('Unsupported native GPU DVFS request mode')
+    if values.get('metal', '0') not in ('0', '1') or values.get('camtl', '0') not in ('0', '1'):
+        raise ValueError('Metal discovery and compositor arguments must be 0 or 1')
+    if values.get('camtl') == '1' and values.get('metal') != '1':
+        raise ValueError('CoreAnimation Metal requires metal=1 discovery')
+    # The existing 20H392 media hook deliberately checks the explicit token.
+    # Omitting a default-off kernel option also removes its portrait-prewarm guard.
+    if values.get('metal') == '1' and values.get('gpu') != '0':
+        raise ValueError('Native Mali Metal requires explicit gpu=0 to retain the 20H392 media prewarm guard')
     if values.get('lancelot_data') == '1' and not re.fullmatch('[0-9a-f]{64}', values.get('lancelot_data_map', '')):
         raise ValueError('Writable data volume requires its exact 64-digit map SHA256')
     if any(key.startswith(('loader_return_after', 'return_cpu', 'return_panic')) for key in values):

@@ -15,21 +15,29 @@ for name in names:
     source=R/'xnu/files/bsd/dev'/name;shutil.copy2(source,O/name);sources[source.relative_to(R).as_posix()]=sha(source)
 fixture=R/'tools/lancelot-data/tests/backend_test.c'
 sources[fixture.relative_to(R).as_posix()]=sha(fixture)
+baseline=R/'tools/lancelot-data/tests/data_write_before_snapshot.inc'
+sources[baseline.relative_to(R).as_posix()]=sha(baseline)
+shutil.copy2(baseline,O/baseline.name)
 sources[Path(__file__).relative_to(R).as_posix()]=sha(Path(__file__))
 text=fixture.read_text(encoding='utf-8')
 anchor='#define lck_mtx_lock pthread_mutex_lock\n#define lck_mtx_unlock pthread_mutex_unlock\n#define lck_mtx_try_lock(p) (pthread_mutex_trylock(p)==0)'
 assert text.count(anchor)==1
 text=text.replace(anchor,r'''
 static _Thread_local unsigned owned_controller;
+static _Thread_local unsigned owned_request;
+static pthread_mutex_t lancelot_data_request_lock;
+static bool allocation_failure;
 static void (*lock_observer)(pthread_mutex_t *),(*unlock_observer)(pthread_mutex_t *);
 static int model_lock(pthread_mutex_t *lock){
  if(lock_observer)lock_observer(lock);
  int error=pthread_mutex_lock(lock);assert(!error);
  if(lock==&lancelot_mmc_lock)owned_controller++;
+ if(lock==&lancelot_data_request_lock)owned_request++;
  return error;
 }
 static int model_unlock(pthread_mutex_t *lock){
  if(lock==&lancelot_mmc_lock){assert(owned_controller==1);owned_controller--;}
+ if(lock==&lancelot_data_request_lock){assert(owned_request==1);owned_request--;}
  int error=pthread_mutex_unlock(lock);assert(!error);
  if(unlock_observer)unlock_observer(lock);
  return error;
@@ -43,6 +51,9 @@ static bool model_try_lock(pthread_mutex_t *lock){
 #define lck_mtx_unlock model_unlock
 #define lck_mtx_try_lock model_try_lock
 ''')
+allocator='static void*kalloc_data(size_t n,__unused int flags){return calloc(1,n);}'
+assert text.count(allocator)==1
+text=text.replace(allocator,'static void*kalloc_data(size_t n,__unused int flags){assert(!owned_controller&&!owned_request);return allocation_failure?NULL:calloc(1,n);}')
 anchor=' int unlocked=pthread_mutex_trylock(&lancelot_mmc_lock);assert(!unlocked);\n pthread_mutex_unlock(&lancelot_mmc_lock);'
 # The reporter checks ownership by its caller, including when another thread
 # legitimately owns the shared controller during concurrent testing.
@@ -159,7 +170,29 @@ static void test_concurrent(void){
  printf("128 KiB production request: CMD24 sectors=%u verification reads=%u (legacy=256); foreground read completed before writer finished; flush stayed ordered\n",writes,readbacks);
  free(large_input);large_input=NULL;
 }
-static void optimization_tests(void){test_groups();test_geometry();test_fragmented();test_concurrent();}
+#include "data_write_before_snapshot.inc"
+static uint8_t *mutable_caller;
+static void change_written_source(unsigned completed){if(completed==2)mutable_caller[512]^=1;}
+static void test_snapshot(void){
+ uint8_t input[16384],expected[16384],output[16384];
+ for(unsigned i=0;i<sizeof(input);i++)expected[i]=(uint8_t)(i*19+7);
+ size_t done=0;
+ reset_io();memcpy(input,expected,sizeof(input));mutable_caller=input;after_sector_write=change_written_source;
+ assert(legacy_data_file_write(0,sizeof(input),input,&done)==EIO&&done==512&&writes==8&&readbacks==1&&data_failed);
+ assert(controller.last_command==18&&controller.last_stage==4&&controller.last_int==0x1000&&controller.last_response==0x900);
+ reset_io();memcpy(input,expected,sizeof(input));mutable_caller=input;after_sector_write=change_written_source;
+ assert(!data_file_write(0,sizeof(input),input,&done)&&done==sizeof(input)&&!data_failed);
+ assert(input[512]!=expected[512]);after_sector_write=NULL;
+ assert(!data_file_read(0,sizeof(output),output)&&!memcmp(output,expected,sizeof(output)));
+ reset_io();corrupt_read=1;corrupt_offset=512;
+ assert(data_file_write(0,sizeof(input),expected,&done)==EIO&&done==512&&data_failed);
+ reset_io();allocation_failure=true;
+ assert(data_file_write(0,4096,expected,&done)==ENOMEM&&!done&&!writes&&!data_failed);
+ allocation_failure=false;
+ assert(data_file_write(0,LANCELOT_DATA_SNAPSHOT_MAX+512,expected,&done)==EINVAL&&!done&&!writes);
+ puts("PASS R16 failure signature reproduced under mutable-source change: completed CMD18 plus 512 verified bytes; stable snapshot succeeds; genuine corruption still stops I/O; allocation outside both locks");
+}
+static void optimization_tests(void){test_groups();test_geometry();test_fragmented();test_concurrent();test_snapshot();}
 '''
 anchor='int main(int argc,char**argv){';assert text.count(anchor)==1
 text=text.replace(anchor,extension+'\n'+anchor,1)
@@ -182,5 +215,12 @@ with (O/'result.json').open('x',encoding='utf-8') as f:
         'guard_and_ext4_mapper_exercised':True,'controller_registers_and_kernel_objects_modeled':True,
         'logical_block_bytes':4096,'verification_chunk_bytes':4096,
         'verification_calls_for_128KiB':32,'legacy_verification_calls_for_128KiB':256,
-        'foreground_reader_and_flush_order_verified':passed,'device_access':False,'GPU_complete':False},f,indent=2)
+        'foreground_reader_and_flush_order_verified':passed,
+        'old_mutable_source_writeback_failure_reproduced':passed,
+        'immutable_snapshot_roundtrip_verified':passed,
+        'genuine_readback_corruption_stops_io':passed,
+        'snapshot_allocation_outside_storage_locks':passed,
+        'allocation_failure_does_not_stop_io':passed,
+        'snapshot_max_bytes':131072,
+        'device_access':False,'GPU_complete':False},f,indent=2)
 print('4K IO TESTS',O,flush=True);raise SystemExit(0 if passed and len(runs)==4 else 1)

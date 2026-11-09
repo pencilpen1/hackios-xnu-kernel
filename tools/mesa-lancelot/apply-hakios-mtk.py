@@ -70,7 +70,7 @@ change('src/panfrost/lib/pan_blend.c',
 target = 'src/gallium/targets/osmesa/meson.build'
 change(target, "  'osmesa_target.c',", "  ['osmesa_target.c', '../../../compiler/air/air_metal.c'],")
 change(target, '    inc_gallium_drivers,',
-       '    inc_gallium_drivers, inc_mapi, inc_mesa, inc_gallium_winsys_sw,')
+       '    inc_gallium_drivers, inc_mapi, inc_mesa, inc_gallium_winsys_sw, inc_panfrost,')
 change(target, 'driver_swrast, driver_panfrost, dep_libdrm, idep_mesautil,',
        'driver_swrast, driver_panfrost, dep_libdrm, idep_air, idep_mesautil,')
 

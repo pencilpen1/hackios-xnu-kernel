@@ -58,17 +58,23 @@ rwm_run_blit(const struct rwm_blit *blit, char *why, size_t why_size)
 					 blit->row_bytes, why, why_size) == 0 ? 0 : -1;
 	case RWM_BLIT_CLEAR:
 		if (air->render_clear == nullptr) {
-			return 0;
+			snprintf(why, why_size, "compiler library cannot clear a render target");
+			return -1;
 		}
 		return air->render_clear(blit->device, blit->colors, blit->color_count, blit->clear_color,
 					 blit->depth, blit->clear_depth, blit->clear_stencil, why,
 					 why_size) == 0 ? 0 : -1;
 	case RWM_BLIT_MIPMAPS:
-		return air->texture_mipmaps == nullptr ||
+		if (air->texture_mipmaps == nullptr) {
+			snprintf(why, why_size, "compiler library cannot generate mipmaps");
+			return -1;
+		}
+		return
 		       air->texture_mipmaps(blit->to_texture, why, why_size) == 0 ? 0 : -1;
 	case RWM_BLIT_FILL:
 		return air->buffer_fill(blit->to_buffer, blit->to_offset, blit->bytes, blit->fill_value, why,
 					why_size) == 0 ? 0 : -1;
 	}
-	return 0;
+	snprintf(why, why_size, "unsupported blit operation %u", blit->kind);
+	return -1;
 }

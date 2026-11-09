@@ -48,6 +48,7 @@
 #include "null/null_sw_winsys.h"
 #ifdef GALLIUM_PANFROST
 #include "panfrost/drm/panfrost_drm_public.h"
+#include "panfrost/pan_resource.h"
 #include "frontend/winsys_handle.h"     /* rwa_texture_from_surface, as for freedreno below */
 #include "drm-uapi/drm_fourcc.h"
 #include "util/driconf.h"
@@ -795,6 +796,19 @@ rwa_buffer_size(struct rwa_buffer *buffer)
 {
    RWA_GUARD();
    return buffer->size;
+}
+
+uint64_t
+rwa_buffer_gpu_address(struct rwa_buffer *buffer)
+{
+   RWA_GUARD();
+#ifdef GALLIUM_PANFROST
+   if (buffer && !buffer->device->software && buffer->res) {
+      struct panfrost_resource *resource = pan_resource(buffer->res);
+      return resource->bo ? resource->bo->ptr.gpu : 0;
+   }
+#endif
+   return 0;
 }
 
 void
@@ -1932,7 +1946,8 @@ rwa_buffer_copy(struct rwa_buffer *dst, size_t dst_offset, struct rwa_buffer *sr
                 size_t src_offset, size_t size, char *why, size_t why_size)
 {
    RWA_GUARD();
-   if (!dst || !src || dst_offset + size > dst->size || src_offset + size > src->size) {
+   if (!dst || !src || dst->device != src->device || dst_offset > dst->size ||
+       size > dst->size - dst_offset || src_offset > src->size || size > src->size - src_offset) {
       say(why, why_size, "a buffer copy of %zu bytes outside its buffers", size);
       return -1;
    }
@@ -1949,7 +1964,7 @@ rwa_buffer_fill(struct rwa_buffer *buffer, size_t offset, size_t size, uint8_t v
                 size_t why_size)
 {
    RWA_GUARD();
-   if (!buffer || offset + size > buffer->size) {
+   if (!buffer || offset > buffer->size || size > buffer->size - offset) {
       say(why, why_size, "a fill of %zu bytes outside its buffer", size);
       return -1;
    }

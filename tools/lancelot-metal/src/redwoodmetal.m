@@ -96,6 +96,7 @@
 #include <IOKit/IOKitLib.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <notify.h>
 #include <pthread.h>
 
@@ -471,28 +472,7 @@ ensure_spi(Class cls)
  * (iokit/Kernel/RedwoodGPU.cpp: kMsmGetParam = 0x40, struct msm_param). The parameters
  * worth asking for are 0x03 CHIP_ID (with the speed bin in the high half), 0x02 GMEM_SIZE
  * and 0x04 MAX_FREQ. Mesa reaches the same client the same way. */
-static bool
-gpu_param(io_connect_t gpu, uint32_t which, uint64_t *value)
-{
-	struct {
-		uint32_t pipe, param;
-		uint64_t value;
-		uint32_t len, pad;
-	} request = { .pipe = 0, .param = which, .value = 0, .len = 0, .pad = 0 };
-	size_t size = sizeof(request);
-
-	if (gpu == IO_OBJECT_NULL) {
-		return false;
-	}
-	if (IOConnectCallStructMethod(gpu, 0x40, &request, sizeof(request), &request,
-				      &size) != KERN_SUCCESS) {
-		return false;
-	}
-	*value = request.value;
-	return true;
-}
-
-/* (the kernel's GEM requests a buffer is made with are src/metal/buffer.cpp's now) */
+/* Resource allocation and device identity come from the native Mesa backend. */
 
 
 @class RedwoodMetalCommandQueue;
@@ -897,42 +877,31 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 		return nil;
 	}
 	ensure_spi([self class]);
+	if (!mesa_available() || mesa.device_open == NULL || mesa.device_close == NULL) {
+		rw_print("Metal device refused: Mali/Panfrost compiler library is unavailable\n");
+		return nil;
+	}
+	char backend_why[256] = { 0 };
+	struct rwa_device *backend = mesa.device_open(backend_why, sizeof(backend_why));
+	if (backend == NULL) {
+		rw_print("Metal device refused: %s\n", backend_why);
+		return nil;
+	}
 
 	self = [super init];
 	if (self == nil) {
+		mesa.device_close(backend);
 		return nil;
 	}
+	_mesa = backend;
 	_acceleratorService = port;
 	if (port != IO_OBJECT_NULL) {
 		IOObjectRetain(port);
 	}
 
-	/* The gpu this driver would actually drive. Not fatal if it is absent: the port
-	 * starts the Adreno only with the boot argument gpu=1, and a device object that
-	 * cannot allocate is still the thing under test until the resource layer exists. */
-	io_service_t gpu = IOServiceGetMatchingService(0, IOServiceMatching("RedwoodGPU"));
-
-	_gpu = IO_OBJECT_NULL;
-	if (gpu == IO_OBJECT_NULL) {
-		rw_print("no RedwoodGPU service (the gpu was not started)\n");
-	} else {
-		kern_return_t kr = IOServiceOpen(gpu, mach_task_self(), 0, &_gpu);
-
-		rw_print("RedwoodGPU client %s (%#x)\n",
-		         kr == KERN_SUCCESS ? "opened" : "refused", kr);
-		IOObjectRelease(gpu);
-	}
-
-	/* And the compiler, if it is there. Its absence is not fatal: the device still has to
-	 * exist and answer, it just cannot make a pipeline (and says so when asked). */
-	if (mesa_available()) {
-		char why[256] = { 0 };
-
-		_mesa = mesa.device_open(why, sizeof(why));
-		rw_print("the compiler library %s\n",
-		         _mesa != NULL ? mesa.device_name(_mesa) : why);
-		rw_warm_start(self, _mesa);
-	}
+	_gpu = IO_OBJECT_NULL; /* Mesa holds the native LancelotMali connection. */
+	rw_print("Metal device uses %s through LancelotMali/Panfrost\n", mesa.device_name(_mesa));
+	rw_warm_start(self, _mesa);
 
 	/* The struct Metal reads out of this device by raw pointer, filled here rather than on
 	 * demand: the pointer is handed out without a lock, from whichever thread a renderer
@@ -2187,13 +2156,13 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
  * Nothing in Metal's registration reads this; a person reading a log does. */
 - (NSString *)name
 {
-	uint64_t chip = 0;
-
-	if (gpu_param(_gpu, 0x03, &chip)) {
-		return [NSString stringWithFormat:@"Adreno 7c+ Gen 3 (chip %#x, Redwood)",
-				 (unsigned)(chip & 0xffffffffu)];
+	if (_mesa != NULL && mesa.device_name != NULL) {
+		const char *name = mesa.device_name(_mesa);
+		if (name != NULL) {
+			return [NSString stringWithUTF8String:name];
+		}
 	}
-	return @"Adreno (Redwood; the GPU is not started)";
+	return @"Mali/Panfrost (device unavailable)";
 }
 
 /*
@@ -3470,7 +3439,7 @@ redwood_clear_semaphore_debt(id commandBuffer)
 
 - (id)device       { return [_queue device]; }
 - (id)commandQueue { return _queue; }
-- (NSUInteger)status { return _core.status; }
+- (NSUInteger)status { return rwm_command_status(&_core); }
 - (NSError *)error { return _error; }
 - (BOOL)retainedReferences { return YES; }
 
@@ -3636,7 +3605,7 @@ rw_commit_job(void *context)
 	}
 	if (ran == RWM_RUN_DRAW_FAILED) {
 		[self failWith:why];
-	} else if (ran == RWM_RUN_DISPATCH_FAILED) {
+	} else if (ran != 0) {
 		_error = [[NSError errorWithDomain:@"RedwoodMetal" code:2
 					  userInfo:@{ NSLocalizedDescriptionKey:
 						      [NSString stringWithUTF8String:why] }]
@@ -3681,7 +3650,7 @@ rw_core_of(id texture)
 	_error = [[NSError errorWithDomain:@"RedwoodMetal" code:4
 				  userInfo:@{ NSLocalizedDescriptionKey:
 					      [NSString stringWithUTF8String:reason] }] retain];
-	_core.status = RWM_CB_ERROR;
+	rwm_command_set_error(&_core, EIO);
 }
 
 /* (the fence, and why it is the whole point: src/metal/cmdbuf.cpp) */
@@ -3739,7 +3708,7 @@ rw_core_of(id texture)
 	}
 	/* scheduled or further, an error included (3, 4, 5): the work this handler is about has
 	 * already run, so it is delivered rather than kept */
-	if (_core.status >= RWM_CB_SCHEDULED) {
+	if (rwm_command_status(&_core) >= RWM_CB_SCHEDULED) {
 		[self redwoodDeliver:handler];
 		return;
 	}
@@ -3754,7 +3723,9 @@ rw_core_of(id texture)
 	if (handler == NULL) {
 		return;
 	}
-	if (_core.status >= RWM_CB_SCHEDULED) {
+	if (rwm_command_status(&_core) >= RWM_CB_SCHEDULED) {
+		/* A handler added after scheduling still owes this buffer's fence. */
+		[self waitUntilCompleted];
 		[self redwoodDeliver:handler];
 		return;
 	}
@@ -3776,7 +3747,7 @@ rw_core_of(id texture)
 	for (id handler in scheduled) {
 		[self redwoodDeliver:(void (^)(id))handler];
 	}
-	if (_core.seq != 0 && _core.status != RWM_CB_ERROR) {
+	if (_core.seq != 0 && rwm_command_status(&_core) != RWM_CB_ERROR) {
 		/* the GPU still drawing: the completed handlers when it is done, from a queue of
 		 * their own and in the order the buffers were committed (one job queue, in order) */
 		static dispatch_queue_t completions;
@@ -3798,7 +3769,7 @@ rw_core_of(id texture)
 		});
 		return;
 	}
-	if ([completed count] > 0 && _core.status != RWM_CB_ERROR) {
+	if (rwm_command_status(&_core) != RWM_CB_ERROR) {
 		/* A completed handler is a promise about the GPU, so it is made true before it
 		 * is kept: -waitUntilCompleted is this driver's fence and sets the status the
 		 * handler will read. */

@@ -27,7 +27,8 @@ say(const char *line)
 bool
 again(unsigned long &times)
 {
-	return (++times & (times - 1)) == 0;
+	++times;
+	return (times & (times - 1)) == 0;
 }
 
 void

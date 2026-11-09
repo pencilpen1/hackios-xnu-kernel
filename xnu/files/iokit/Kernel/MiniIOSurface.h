@@ -177,7 +177,8 @@ void            MiniIOSurfaceMaliReadEnd(MiniIOSurface * surface);
 extern "C" bool LancelotMaliQueueSurfaceReadBegin(MiniIOSurface *, uint64_t);
 extern "C" void LancelotMaliQueueSurfaceReadEnd(MiniIOSurface *);
 /* A swap owns its surfaces until show() returns. Keep the queue reader gate
- * for that whole interval, including every early return. */
+ * through every pixel copy and recording. Metadata reporting can release it;
+ * the destructor still covers every early return. */
 class LancelotMaliQueueReadGroup {
     MiniIOSurface *fHeld[16] = {};
     uint32_t fCount = 0;
@@ -188,9 +189,10 @@ public:
         if (fCount==16 || !LancelotMaliQueueSurfaceReadBegin(surface,ns)) return false;
         fHeld[fCount++]=surface;return true;
     }
-    ~LancelotMaliQueueReadGroup() {
+    void releaseReaders() {
         while(fCount)LancelotMaliQueueSurfaceReadEnd(fHeld[--fCount]);
     }
+    ~LancelotMaliQueueReadGroup() { releaseReaders(); }
     LancelotMaliQueueReadGroup() = default;
     LancelotMaliQueueReadGroup(const LancelotMaliQueueReadGroup &) = delete;
     LancelotMaliQueueReadGroup &operator=(const LancelotMaliQueueReadGroup &) = delete;

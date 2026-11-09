@@ -94,7 +94,7 @@ lancelot_ubuntu_bootstrap(void)
 	};
 	static const struct {
 		const char *entry, *path;
-		struct lancelot_ramdisk_variant variants[21];
+		struct lancelot_ramdisk_variant variants[22];
 	} files[] = {
 		{"ramdisk", "/hackios/20H392/touch-hardware-20261024/root.apfs",
 		 {{4194304u, "81a86d265596387f227c7b8a3e021f991293c2900b69a89a38b0f29be6436763"},
@@ -117,7 +117,8 @@ lancelot_ubuntu_bootstrap(void)
 		  {6426624u, "38076f5aa7f0d16955995848493a23f9a6c19fa7609eb24a61c5a2f93d5c25ab"},
 		  {6426624u, "80422ed9d165334d177e4dcc7b62f832ca8342e1ef9d5f838b343f0095744b46"},
 		  {6426624u, "7d68892b14a8b883258c11120c4711a7f11328295b8c1160bbf2fe5ce8b1f615"},
-		  {6426624u, "30f9823aa00e81a1e279de1c4d19717c5a3c3abfd89679740821292f1e6a21a3"}}},
+		  {6426624u, "30f9823aa00e81a1e279de1c4d19717c5a3c3abfd89679740821292f1e6a21a3"},
+		  {6426624u, "60040ed24042afe57375be43dece4099f95fcce99149a47866acba04e1f9eb2d"}}},
 		{"bootdisk", "/hackios/20H392/flashboot.apfs",
 		 {{4194304u, "14485e7c5ce125ef516168445c2500ac04ca5e40a908c2aef516b2d92c24ba0c"},
 		  {0u, 0}}},

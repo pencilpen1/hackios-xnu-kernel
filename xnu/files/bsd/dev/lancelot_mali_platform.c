@@ -1169,10 +1169,11 @@ lmp_dvfs_checkpoint(struct lmp_state *s)
     return LMP_OK;
 }
 
-/* Optional startup absence is normal: <=850MHz still follows load in BOTH
- * directions. Existing valid lower hardware caps always win. Runtime failure
+/* Optional startup absence follows the configured board ceiling in BOTH
+ * directions (850MHz by default,950MHz when explicitly requested).
+ * Existing valid lower hardware caps always win. Runtime failure
  * after a provider starts is NOT absence: preserve protection, never replace
- * a failed real sensor/limit with invented data or the850MHz startup ceiling.
+ * a failed real sensor/limit with invented data or the startup ceiling.
  * Mandatory PMIC/clock/ownership/quiescence guards are entirely separate. */
 static int
 lmp_dvfs_live_cap(struct lmp_state *s, uint32_t *cap)
@@ -1206,7 +1207,8 @@ lmp_dvfs_live_cap(struct lmp_state *s, uint32_t *cap)
             error = LMP_ETIMEDOUT; goto stale;
         }
     }
-    result = limits.valid_mask == LMP_DVFS_LIMIT_ALL ? LGD_MAX_KHZ * 1000u : LMP_DVFS_OPTIONAL_MAX_HZ;
+    result = limits.valid_mask == LMP_DVFS_LIMIT_ALL ? LGD_MAX_KHZ * 1000u :
+        (s->dvfs.ops.missing_provider_max_hz ? s->dvfs.ops.missing_provider_max_hz : LMP_DVFS_OPTIONAL_MAX_HZ);
     if ((limits.valid_mask & LMP_DVFS_LIMIT_THERMAL) && result > limits.thermal_max_hz) result = limits.thermal_max_hz;
     if ((limits.valid_mask & LMP_DVFS_LIMIT_BATTERY) && result > limits.battery_max_hz) result = limits.battery_max_hz;
     if ((limits.valid_mask & LMP_DVFS_LIMIT_POWER) && result > limits.power_max_hz) result = limits.power_max_hz;
@@ -1247,6 +1249,8 @@ lmp_dvfs_attach(struct lmp_state *s, const struct lmp_dvfs_ops *ops)
     if (s->dvfs.attached || s->dvfs.transitioning) return LMP_EBUSY;
     if (!ops || !ops->guard || !ops->revoke || ops->control_policy > LMP_DVFS_NATIVE_AP ||
         !s->ops.pmic.read_rails || !s->ops.pmic.set_voltage_uv) return LMP_ENOTSUP;
+    if (ops->missing_provider_max_hz && ops->missing_provider_max_hz != LMP_DVFS_OPTIONAL_MAX_HZ &&
+        ops->missing_provider_max_hz != LGD_MAX_KHZ * 1000u) return LMP_EINVAL;
     s->dvfs.ops = *ops;
     lmp_dvfs_begin(s);
     if ((error = lmp_dvfs_guard(s))) return error == LMP_EBUSY ? lmp_dvfs_finish(s,error) : lmp_dvfs_fail(s, error);

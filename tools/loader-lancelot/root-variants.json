@@ -97,6 +97,11 @@
       "image": "local/lancelot-data-pager-20261108-r1/peers-20261108-042207-854243/root.lancelot-queued.apfs",
       "bytes": 6426624,
       "sha256": "30f9823aa00e81a1e279de1c4d19717c5a3c3abfd89679740821292f1e6a21a3"
+    },
+    {
+      "image": "out/lancelot/metal-repair-20261109/candidate-r181-20261109-045619-359992/root.apfs",
+      "bytes": 6426624,
+      "sha256": "60040ed24042afe57375be43dece4099f95fcce99149a47866acba04e1f9eb2d"
     }
   ]
 }

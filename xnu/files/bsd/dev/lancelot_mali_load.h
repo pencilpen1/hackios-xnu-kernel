@@ -11,6 +11,11 @@
  * launch->fresh idle intervals can request/refresh the bounded burst hold. */
 #define LGD_JOB_TARGET_NS UINT64_C(2000000)
 #define LGD_BURST_HOLD_NS UINT64_C(1000000000)
+/* Keep the physical donor FIFO intact. The explicit interactive profile
+ * bounds producer lookahead so old frames cannot fill all64 slots. */
+static inline uint32_t lgd_queue_limit(uint32_t request_mode,uint32_t capacity) {
+    return request_mode==2 && capacity>16u ?16u:capacity;
+}
 /* Demand only. A long measured JM interval requests enough OPP headroom to
  * approach the target in one controller transaction instead of repeatedly
  * parking/reprogramming by two OPPs. Live platform caps still clamp it. */

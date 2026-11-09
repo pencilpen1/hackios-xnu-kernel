@@ -1,5 +1,5 @@
 /*
- * The core of this port's Metal driver, in C++ (userland/src/metal/*.cpp), as C for the plug-in
+ * The core of this port's Metal driver, in C++ under userland/src/metal, as C for the plug-in
  * (src/redwoodmetal.m). The shape is hakios-metal's (include/hakios-metal/hakios_metal.h on the
  * hakios-metal branch): the plug-in keeps Metal's own classes -- subclasses of Metal's private base
  * classes, which only Objective-C can make -- and the core keeps the work behind them, so that the
@@ -74,6 +74,7 @@ struct rwm_air {
 	__typeof__(&rwa_buffer_map) buffer_map;
 	__typeof__(&rwa_buffer_size) buffer_size;
 	__typeof__(&rwa_buffer_destroy) buffer_destroy;
+	__typeof__(&rwa_buffer_gpu_address) buffer_gpu_address;
 	__typeof__(&rwa_compute_create) compute_create;
 	__typeof__(&rwa_compute_destroy) compute_destroy;
 	__typeof__(&rwa_texture_create) texture_create;
@@ -116,10 +117,8 @@ bool rwm_air_available(void);
 const struct rwm_air *rwm_air(void);
 
 /*
- * A buffer. With the compiler library loaded the memory is Mesa's (rwa_buffer_create), because only
- * such a buffer can be handed to a dispatch or a draw; without it, the kernel's GEM interface on
- * `gpu` (the device's RedwoodGPU client, not owned) gives memory a program can still write. Either
- * way it is write-combined and the GPU reads it through no cache of this processor.
+ * A buffer belongs to the same Mesa device used by every dispatch and draw.
+ * `gpu` remains in the C ABI; allocation and mapping use Mali/Panfrost exclusively.
  * NULL with the reason in `why` when neither would give it.
  */
 struct rwm_buffer;
@@ -129,7 +128,7 @@ struct rwm_buffer *rwm_buffer_new(struct rwa_device *device, mach_port_t gpu, si
 void rwm_buffer_free(struct rwm_buffer *buffer);
 void *rwm_buffer_contents(const struct rwm_buffer *buffer);
 size_t rwm_buffer_length(const struct rwm_buffer *buffer);
-uint64_t rwm_buffer_gpu_address(const struct rwm_buffer *buffer);    /* the kernel path only, else 0 */
+uint64_t rwm_buffer_gpu_address(const struct rwm_buffer *buffer);
 struct rwa_buffer *rwm_buffer_mesa(const struct rwm_buffer *buffer); /* the Mesa path only, else NULL */
 
 /*
@@ -469,6 +468,7 @@ void rwm_drawn_done(const struct rwm_drawn *drawn, uint64_t seq);
 void rwm_works_sampled(struct rwm_work *const *works, unsigned count, struct rwm_sampled *sampled);
 void rwm_works_drawn(struct rwm_work *const *works, unsigned count, struct rwm_drawn *drawn);
 void rwm_works_copy_in(struct rwm_work *const *works, unsigned count);
+int rwm_works_copy_in_checked(struct rwm_work *const *works, unsigned count, char *why, size_t why_size);
 void rwm_copy_in(struct rwm_texture *texture);
 
 /*
@@ -499,6 +499,10 @@ void rwm_trace_line(const char *what, void *object);
 enum {
 	RWM_RUN_DRAW_FAILED = -1,
 	RWM_RUN_DISPATCH_FAILED = -2,
+	RWM_RUN_BLIT_FAILED = -3,
+	RWM_RUN_SUBMIT_FAILED = -4,
+	RWM_RUN_COPYBACK_FAILED = -5,
+	RWM_RUN_COPYIN_FAILED = -6,
 };
 
 int rwm_run_works(struct rwa_device *device, struct rwm_work *const *works, unsigned count, bool copy_in, bool finish,
@@ -521,6 +525,7 @@ enum {
 
 struct rwm_command {
 	unsigned status;
+	int failure_error;
 	uint64_t born, born_cpu;        /* when it was made, and the making thread's processor time then */
 	uint64_t seq;                   /* its last GPU job, when it was sent off without a wait */
 	volatile bool queued, processed;   /* handed to the driver's worker at -commit, and done there */
@@ -529,6 +534,8 @@ struct rwm_command {
 };
 
 void rwm_command_begin(struct rwm_command *command);
+unsigned rwm_command_status(const struct rwm_command *command);
+void rwm_command_set_error(struct rwm_command *command, int error);
 /* -commit, on the thread that makes the buffer: the making counted, that thread put on a big core once (bigcore=1),
  * the surfaces read in place counted in use; with the driver's worker (rwm_async=1) -- then true, and the plug-in
  * hands the buffer over -- also the copies in made now, the first buffer that draws into each surface said (`label`:

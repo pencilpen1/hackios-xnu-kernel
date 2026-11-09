@@ -38,7 +38,7 @@ class LancelotMaliCpuLease : public OSObject {
     void *fObject; /* retained C VM proof object, not a C++ struct overlay */
     void *fBinding; /* retained VM-owned binding, installed only on fresh roots */
     IOAddressRange *fPages;
-    uint32_t fPageCount, fCacheBits, fGpuCount, fReaders, fWriters;
+    uint32_t fPageCount, fCacheBits, fGpuCount, fReaders, fWriters, fCpuWaiters;
     uint32_t fIdleRootRetains;
     uint64_t fLength, fNextCookie, fLastPair, fLastWriter;
     struct { uint64_t cookie, pair; bool writer, published; } fSlots[SLOT_COUNT];
@@ -167,7 +167,12 @@ class LancelotMaliCpuLease : public OSObject {
             for (uint32_t i = 0; i < SLOT_COUNT; ++i) if (fUsers[i].task == own) {
                 reads -= fUsers[i].reads; writes -= fUsers[i].writes;
             }
-        return fReaders || fWriters || reads || writes;
+        /* A legacy producer must let a pending CPU observer reach a quiet
+         * root. Already-queued GPU cookies still complete. An existing user
+         * writer may need GPU work to finish its own lock, so do not block
+         * that dependency before it releases the logical write ownership. */
+        return fReaders || fWriters || reads || writes ||
+            (legacy && fCpuWaiters && !fWriters && !fUserWrites);
     }
     static LancelotMaliCpuLease *rootFailure(LancelotMaliCpuLease *s, lmal_cpu_lease_why *why,
         uint32_t step, uint32_t detail, uint64_t value) {
@@ -258,7 +263,7 @@ public:
     bool canRecycle(IOBufferMemoryDescriptor *memory) {
         IOLockLock(fGate);
         bool safe=memory==fRoot && getRetainCount()==1 && fIdleRootRetains &&
-            fRoot->getRetainCount()==fIdleRootRetains && !fGpuCount && !fReaders && !fWriters &&
+            fRoot->getRetainCount()==fIdleRootRetains && !fGpuCount && !fCpuWaiters && !fReaders && !fWriters &&
             !fUserReads && !fUserWrites && !fFrozen && !fGpuRetain && !fError && !fWriteError && !fQuarantined &&
             objectValid(false,true) && cacheValid() &&
             lmal_cpu_vm_binding_verify(fObject,fBinding,this,false)==LMAL_OK;
@@ -415,22 +420,29 @@ public:
     }
     int waitCpu(uint64_t remaining_ns) {
         IOLockLock(fGate);
+        if(fCpuWaiters==UINT32_MAX){IOLockUnlock(fGate);return LMAL_EBUSY;}
+        ++fCpuWaiters;
         uint64_t end = deadline(remaining_ns);
+        int ret=LMAL_OK;
         while (fGpuCount && !fError)
-            if (!sleepUntil(&fGpuCount, end)) { IOLockUnlock(fGate); return LMAL_ETIMEDOUT; }
-        int ret = fError ? fError : fQuarantined ? LMAL_EIO : fWriteError;
+            if (!sleepUntil(&fGpuCount, end)) {ret=LMAL_ETIMEDOUT;break;}
+        if(!ret)ret=fError ? fError : fQuarantined ? LMAL_EIO : fWriteError;
+        --fCpuWaiters;IOLockWakeup(fGate,&fReaders,false);
         IOLockUnlock(fGate); return ret;
     }
     int beginCpuRead(uint64_t remaining_ns) {
         IOLockLock(fGate);
+        if(fCpuWaiters==UINT32_MAX){IOLockUnlock(fGate);return LMAL_EBUSY;}
+        ++fCpuWaiters;
         uint64_t end = deadline(remaining_ns);
+        int ret=LMAL_OK;
         while ((fGpuCount || fWriters || fUserWrites) && !fError)
-            if (!sleepUntil(&fGpuCount, end)) { IOLockUnlock(fGate); return LMAL_ETIMEDOUT; }
-        if (fError || fWriteError || fQuarantined || fReaders == UINT32_MAX) {
-            int e = fError ? fError : fWriteError ? fWriteError : LMAL_EBUSY; IOLockUnlock(fGate); return e;
-        }
-        ++fReaders; retain();
-        IOLockUnlock(fGate); return LMAL_OK;
+            if (!sleepUntil(&fGpuCount, end)) {ret=LMAL_ETIMEDOUT;break;}
+        if(!ret && (fError || fWriteError || fQuarantined || fReaders == UINT32_MAX))
+            ret=fError ? fError : fWriteError ? fWriteError : LMAL_EBUSY;
+        if(!ret){++fReaders;retain();}
+        --fCpuWaiters;IOLockWakeup(fGate,&fReaders,false);
+        IOLockUnlock(fGate); return ret;
     }
     void endCpuRead() {
         IOLockLock(fGate);
@@ -524,7 +536,7 @@ public:
         IOLockUnlock(fGate); return proof;
     }
     virtual void free() APPLE_KEXT_OVERRIDE {
-        if (fGpuCount || fReaders || fWriters || fUserReads || fUserWrites || fGpuRetain || fFrozen ||
+        if (fGpuCount || fCpuWaiters || fReaders || fWriters || fUserReads || fUserWrites || fGpuRetain || fFrozen ||
             (fHolder && fHolder->fRedirUPL)) {
             /* Retains normally make this unreachable. Fail closed on an
              * ownership bug rather than auto-commit a live UPL/descriptors. */

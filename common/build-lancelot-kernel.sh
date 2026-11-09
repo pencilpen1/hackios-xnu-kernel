@@ -34,6 +34,8 @@ python3 tools/test-lancelot-msdc-write.py
 python3 tools/test-lancelot-fifo-adapter.py
 python3 tools/test-lancelot-cpu-sampler.py
 python3 tools/test-lancelot-completion.py
+python3 tools/test-lancelot-gpu-high-load.py
+python3 tools/test-lancelot-metal.py
 python3 tools/test-lancelot-hfs-xattr.py
 python3 tools/test-lancelot-msdc.py
 python3 tools/test-lancelot-usb.py

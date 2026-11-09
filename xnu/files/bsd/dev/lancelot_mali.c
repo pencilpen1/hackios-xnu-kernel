@@ -104,6 +104,8 @@ static int start_dvfs_executor_locked(void);
 static int native_runtime_guard(void *);
 static void native_runtime_revoke(void *,int);
 static int native_limit_read(void *,struct lmp_dvfs_limits *);
+static bool hakios_queue_depth(uint32_t *);
+static uint64_t dvfs_backlog_boosts;
 static bool gpu_is_returning(void) {return __atomic_load_n(&gpu_returning,__ATOMIC_ACQUIRE);}
 static uint32_t native_mpidr(void) {
     uint64_t value;__asm__ volatile("mrs %0,mpidr_el1":"=r"(value));return value&0xffffffu;
@@ -365,7 +367,7 @@ void lancelot_mali_init(void) {
         printf("lancelot-mali: conflicting/invalid driver selection; no GPU access\n");return;
     }
     PE_parse_boot_argn("lancelot_gpu_dvfs",&native_dvfs_requested,sizeof(native_dvfs_requested));
-    if(native_dvfs_requested>1||(native_dvfs_requested&&mode!=3&&mode!=4)) {
+    if(native_dvfs_requested>2||(native_dvfs_requested&&mode!=3&&mode!=4)) {
         printf("lancelot-mali: invalid native DVFS/mode; no GPU access\n");return;
     }
     if(mode!=1&&mode!=3&&mode!=4) {printf("lancelot-mali: rejected mode=%u; no MMIO\n",mode);return;}
@@ -581,6 +583,16 @@ static int dvfs_before_job(__unused void *cookie) {
     if(!lgd_sampler_idle(&dvfs_load,clock_ns(NULL))&&platform.dvfs.attached) {
         dvfs_revoke_locked(LM_EIO);return LM_EIO;
     }
+    if(native_dvfs_requested==2&&hakios_requested) {
+        uint32_t depth;
+        if(hakios_queue_depth(&depth)&&depth>=8u) {
+            uint64_t now=clock_ns(NULL);
+            if(!lgd_sampler_hold(&dvfs_load,0,now)) {
+                dvfs_revoke_locked(LM_EIO);return LM_EIO;
+            }
+            lgd_sampler_demand(&dvfs_load,now);dvfs_backlog_boosts++;
+        }
+    }
     int e=dvfs_service_locked(true);snapshot_dvfs_sample(&admission_sample);return e;
 }
 static void dvfs_job_done(__unused void *cookie,const struct lm_job_result *r,int error) {
@@ -625,8 +637,8 @@ static void dvfs_tick(__unused thread_call_param_t a,__unused thread_call_param_
                     dvfs_load.burst_opp,dvfs_load.burst_valid,platform.dvfs.provider_missing_mask,
                     platform.dvfs.effective_max_hz);
                 dvfs_report_at=now;
-                printf("lancelot-dvfs-admit: at=%llu cached=%llu full=%llu wall_us=%llu max_meter_age_us=10000 fresh_guards=1\n",
-                    now/1000,dvfs_admit_cached,dvfs_admit_full,dvfs_admit_wall_ns/1000);
+                printf("lancelot-dvfs-admit: at=%llu cached=%llu full=%llu wall_us=%llu max_meter_age_us=10000 fresh_guards=1 backlog_boosts=%llu\n",
+                    now/1000,dvfs_admit_cached,dvfs_admit_full,dvfs_admit_wall_ns/1000,dvfs_backlog_boosts);
             }
         }
         if(dvfs_load.running) {
@@ -652,16 +664,18 @@ static int start_dvfs_executor_locked(void) {
         if(error)return error;
         native_control_ready=true;
         const struct lmp_dvfs_ops ops={.control_policy=LMP_DVFS_NATIVE_AP,
-            .guard=native_runtime_guard,.revoke=native_runtime_revoke,.limits=native_limit_read};
+            .guard=native_runtime_guard,.revoke=native_runtime_revoke,.limits=native_limit_read,
+            .missing_provider_max_hz=native_dvfs_requested==2?LGD_MAX_KHZ*1000u:0};
         if((error=lmp_dvfs_attach(&platform,&ops)))return error;
         if((error=lmp_dvfs_target(&platform,platform.dvfs.current_opp)))return error;
         index=platform.dvfs.current_opp;dvfs_target_error=LM_OK;
-        printf("lancelot-dvfs: native_AP=1 attached=1 opp=%u hz=%u measured_hz=%u VGPU=%u VSRAM=%u optional_missing=%u peer_verified=0 firmware_grant=0 table=Android30\n",
-            index,platform.source_hz,platform.dvfs.measured_hz,platform.dvfs.rails.uv[0],platform.dvfs.rails.uv[1],platform.dvfs.provider_missing_mask);
+        printf("lancelot-dvfs: native_AP=1 attached=1 opp=%u hz=%u measured_hz=%u VGPU=%u VSRAM=%u optional_missing=%u peer_verified=0 firmware_grant=0 table=Android30 request_mode=%u max_hz=%u\n",
+            index,platform.source_hz,platform.dvfs.measured_hz,platform.dvfs.rails.uv[0],platform.dvfs.rails.uv[1],platform.dvfs.provider_missing_mask,
+            native_dvfs_requested,platform.dvfs.effective_max_hz);
     }
     (void)lgd_sampler_start(&dvfs_load,clock_ns(NULL),index);
     __atomic_store_n(&dvfs_poll_enabled,true,__ATOMIC_RELEASE);
-    printf("lancelot-mali: DVFS demand=1 tick=50ms profile_independent=1 AP_backend_attached=%u native_AP=%u firmware_grant=0\n",platform.dvfs.attached,native_dvfs_requested);
+    printf("lancelot-mali: DVFS demand=1 tick=50ms profile_independent=1 AP_backend_attached=%u native_AP=%u firmware_grant=0 request_mode=%u\n",platform.dvfs.attached,native_dvfs_requested!=0,native_dvfs_requested);
     uint64_t deadline;clock_interval_to_deadline(50,NSEC_PER_MSEC,&deadline);
     thread_call_enter_delayed(dvfs_call,deadline);
     return LM_OK;

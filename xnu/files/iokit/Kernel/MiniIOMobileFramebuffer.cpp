@@ -252,6 +252,7 @@ public:
 	IOLock *        fSwapLock;              /* around the next five */
 	uint8_t         fSwap[SWAP_QUEUE][SWAP_SIZE];   /* the swaps on their way to the panel (fb_queue), from fSwapFirst on */
 	MiniIOSurface * fSwapSurfaces[SWAP_QUEUE][SWAP_LAYERS]; /* ... their surfaces, held from SwapEnd on: their maker may let go of them */
+	uint64_t        fSwapSubmitted[SWAP_QUEUE];
 	unsigned        fSwapFirst, fSwapsWaiting;
 	/*
 	 * ... and not whenever the GPU happens to be done, but on a beat of the refresh rate
@@ -300,7 +301,7 @@ public:
 	void publishModes(void);
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
-	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
+	void show(const uint8_t * swap, MiniIOSurface ** surfaces, uint64_t submitted);
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
@@ -957,6 +958,7 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	unsigned slot = (fSwapFirst + fSwapsWaiting) % SWAP_QUEUE;
 
 	memcpy(fSwap[slot], swap, SWAP_SIZE);
+	fSwapSubmitted[slot]=now;
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
 
@@ -986,8 +988,9 @@ IOMobileFramebuffer::presenter(void)
 		}
 		memcpy(swap, fSwap[fSwapFirst], SWAP_SIZE);
 		memcpy(surfaces, fSwapSurfaces[fSwapFirst], sizeof(surfaces));
+		uint64_t submitted=fSwapSubmitted[fSwapFirst];
 		IOLockUnlock(fSwapLock);
-		show(swap, surfaces);
+		show(swap, surfaces, submitted);
 		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 			if (surfaces[layer] != NULL) {
 				MiniIOSurfaceDrop(surfaces[layer]);
@@ -999,10 +1002,11 @@ IOMobileFramebuffer::presenter(void)
 
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
 void
-IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint64_t submitted)
 {
 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
 	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
+	uint64_t entered=began, gap_us=0;
 	uint32_t layers = 0;
 	MiniIOSurface * recorded = NULL;
 	bool report;
@@ -1039,6 +1043,10 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		fStatLost++;
 		IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
 		IOLockUnlock(fSwapLock);
+		queueReaders.releaseReaders();
+		IOLog("lancelot-present-drop: swap=%u at=%llu queue_us=%llu gpu_wait_us=%llu\n",
+		    swapWord(swap,SWAP_ID),micros(mach_absolute_time()),entered>=submitted?micros(entered-submitted):0,
+		    micros(mach_absolute_time()-entered));
 		return; /* no pixel algorithm, clearing, copying or record ran */
 	}
 	began = ready = mach_absolute_time();
@@ -1075,6 +1083,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	IOLockUnlock(fSwapLock);
 	IOLockLock(fLock);
 	if (fLastFrame != 0) {
+		gap_us=began>=fLastFrame?micros(began-fLastFrame):0;
 		absolutetime_to_nanoseconds(began - fLastFrame, &nanos);
 		nanos /= NSEC_PER_MSEC;
 		if (nanos >= FRAME_PAUSE) {
@@ -1143,6 +1152,13 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	if (recorded != NULL) {
 		record(recorded);
 	}
+	/* All helpers and source-pixel recording are complete. Preserve lock
+	 * ordering while releasing the CPU/GPU reader gates before console and
+	 * statistics work; the retained swap still owns every surface object. */
+	IOLockUnlock(fLock);
+	readers.releaseReaders();
+	queueReaders.releaseReaders();
+	IOLockLock(fLock);
 	fSwapsShown++;
 	if (gTouchLat) {
 		redwood_tl("tl: v %u ready %llu shown %llu done %llu\n", swapWord(swap, SWAP_ID), micros(ready), micros(shown),
@@ -1206,6 +1222,12 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	IOLockUnlock(fLock);
 	readers.releaseReaders();
+	uint64_t total_us=drawn>=submitted?micros(drawn-submitted):0;
+	if(total_us>=250000 || gap_us>=1000000)
+		IOLog("lancelot-present-latency: swap=%u at=%llu gap_us=%llu queue_us=%llu gpu_wait_us=%llu beat_us=%llu draw_us=%llu total_us=%llu\n",
+		    swapWord(swap,SWAP_ID),micros(drawn),gap_us,entered>=submitted?micros(entered-submitted):0,
+		    ready>=entered?micros(ready-entered):0,shown>=ready?micros(shown-ready):0,
+		    drawn>=shown?micros(drawn-shown):0,total_us);
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */

@@ -5,6 +5,7 @@
  */
 #include "rwm.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/sysctl.h>
@@ -126,6 +127,19 @@ rwm_command_begin(struct rwm_command *c)
 	c->status = RWM_CB_ENQUEUED;    /* nothing is pending yet */
 }
 
+extern "C" unsigned
+rwm_command_status(const struct rwm_command *c)
+{
+	return __atomic_load_n(&c->status, __ATOMIC_ACQUIRE);
+}
+
+extern "C" void
+rwm_command_set_error(struct rwm_command *c, int error)
+{
+	__atomic_store_n(&c->failure_error, error != 0 ? error : EIO, __ATOMIC_RELAXED);
+	__atomic_store_n(&c->status, RWM_CB_ERROR, __ATOMIC_RELEASE);
+}
+
 extern "C" bool
 rwm_command_commit(struct rwm_command *c, struct rwm_work *const *works, unsigned count,
 		   const char *(*label)(void *pipeline))
@@ -149,13 +163,18 @@ rwm_command_commit(struct rwm_command *c, struct rwm_work *const *works, unsigne
 	if (!async_wanted()) {
 		return false;
 	}
-	c->status = RWM_CB_COMMITTED;
+	__atomic_store_n(&c->status, RWM_CB_COMMITTED, __ATOMIC_RELEASE);
 	c->drawn.count = 0;
 	if (!rwm_copyin_late()) {
 		/* the surfaces this buffer samples, copied in now, as they are when it is committed: on the worker, later,
 		 * the process drawing one may already be halfway into its next picture -- icons cut in two and widgets
 		 * drawn as an "H" while paging, gone with rwm_async=0 (runs 234, 236, 242) */
-		rwm_works_copy_in(works, count);
+		char why[256] = { 0 };
+		if (rwm_works_copy_in_checked(works, count, why, sizeof(why)) != 0) {
+			rwm_print("command buffer copy-in failed: %s\n", why);
+			rwm_command_set_error(c, EIO);
+			return false;
+		}
 	}
 	say_first_drawn(works, count, label);
 	rwm_works_drawn(works, count, &c->drawn);       /* (pending for the display) */
@@ -167,6 +186,10 @@ extern "C" int
 rwm_command_run(struct rwm_command *c, struct rwa_device *device, struct rwm_work *const *works, unsigned count,
 		char *why, size_t why_size)
 {
+	if (rwm_command_status(c) == RWM_CB_ERROR) {
+		snprintf(why, why_size, "command buffer was rejected before execution");
+		return RWM_RUN_COPYIN_FAILED;
+	}
 	const uint64_t began = rwm_ns();
 	uint64_t waited = 0;
 	int ran;
@@ -175,13 +198,17 @@ rwm_command_run(struct rwm_command *c, struct rwa_device *device, struct rwm_wor
 	if (rwm_perf.last_end != 0 && began > rwm_perf.last_end) {
 		rwm_perf.between += began - rwm_perf.last_end;
 	}
-	c->status = RWM_CB_COMMITTED;
+	__atomic_store_n(&c->status, RWM_CB_COMMITTED, __ATOMIC_RELEASE);
 	/* its copies in -- here, unless the driver's worker made them at -commit --, the draws, dispatches and copies in
 	 * order, the work sent off, the surfaces copied back */
 	ran = rwm_run_works(device, works, count, !(rwm_worker_on() && !rwm_copyin_late()), finish_wanted(), &c->seq,
 			    &waited, why, why_size);
 	/* submitted; the fence is what makes it completed */
-	c->status = ran == 0 ? RWM_CB_SCHEDULED : RWM_CB_ERROR;
+	if (ran != 0) {
+		rwm_command_set_error(c, EIO);
+	} else {
+		__atomic_store_n(&c->status, RWM_CB_SCHEDULED, __ATOMIC_RELEASE);
+	}
 
 	const uint64_t now = rwm_ns(), took = now - began;
 
@@ -242,26 +269,47 @@ rwm_command_wait_completed(struct rwm_command *c, struct rwa_device *device, cha
 	if (c->queued && !c->processed && !rwm_worker_on()) {
 		rwm_command_wait_processed(c);
 	}
-	if (c->status == RWM_CB_ERROR || c->status == RWM_CB_COMPLETED) {
+	unsigned status = rwm_command_status(c);
+	if (status == RWM_CB_ERROR) {
+		snprintf(why, why_size, "command buffer failed (error %d)",
+			 __atomic_load_n(&c->failure_error, __ATOMIC_RELAXED));
+		return -1;
+	}
+	if (status == RWM_CB_COMPLETED) {
 		return 0;
+	}
+	if (status != RWM_CB_SCHEDULED) {
+		snprintf(why, why_size, "command buffer has not been submitted (status %u)", status);
+		return -1;
 	}
 	if (c->seq != 0) {
 		const uint64_t from = rwm_ns();
 
 		/* its own last job, and nothing after it */
-		if (air->wait_seq(c->seq, 5000000000ll) != 0) {
-			rwm_print("THE GPU DID NOT FINISH job %llu\n", (unsigned long long)c->seq);
-		}
+		int error = air->wait_seq != nullptr ? air->wait_seq(c->seq, 5000000000ll) : ENOTSUP;
 		rwm_perf.completed_waits++;
 		rwm_perf.completed_ns += rwm_ns() - from;
-		c->status = RWM_CB_COMPLETED;
-		return 0;
-	}
-	if (air->finish(device, why, why_size) != 0) {
+		if (error != 0) {
+			snprintf(why, why_size, "GPU job %llu did not finish (error %d)",
+				 (unsigned long long)c->seq, error);
+			rwm_command_set_error(c, error);
+			rwm_print("THE GPU DID NOT FINISH: %s\n", why);
+			return -1;
+		}
+	} else if (air->finish == nullptr || air->finish(device, why, why_size) != 0) {
+		if (air->finish == nullptr) {
+			snprintf(why, why_size, "compiler library cannot wait for GPU completion");
+		}
 		rwm_print("THE GPU DID NOT FINISH: %s\n", why);
-		c->status = RWM_CB_ERROR;
+		rwm_command_set_error(c, EIO);
 		return -1;
 	}
-	c->status = RWM_CB_COMPLETED;   /* the fence has been paid, and only now */
+	/* A concurrent failed wait cannot be overwritten by a successful waiter. */
+	unsigned expected = RWM_CB_SCHEDULED;
+	if (!__atomic_compare_exchange_n(&c->status, &expected, RWM_CB_COMPLETED, false,
+					__ATOMIC_RELEASE, __ATOMIC_ACQUIRE) && expected != RWM_CB_COMPLETED) {
+		snprintf(why, why_size, "command buffer completion failed concurrently");
+		return -1;
+	}
 	return 0;
 }

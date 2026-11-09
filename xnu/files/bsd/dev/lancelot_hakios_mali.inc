@@ -1036,6 +1036,7 @@ static struct {
 /* boot-arg mali_trace=1: a line for every job, "tl: j SEQ f|v q QUEUED b BEGAN e ENDED" in us of
  * mach_absolute_time, beside touch_lat's lines of the display's and the Metal driver's */
 static uint32_t mali_trace;
+#include "lancelot_mali_trace.h"
 static unsigned mali_queue_head, mali_queue_count;
 static uint64_t mali_queued_seq, mali_done_seq;
 static bool mali_worker_started;
@@ -1049,6 +1050,14 @@ struct hkmt_completion_error {
 /* Rare failures are retained for this boot, so a later BO wait cannot turn an
  * acknowledged failed job into success. No allocation occurs on success. */
 static struct hkmt_completion_error *hkmt_completion_errors;
+
+/* Admission may already hold mali_lock. Never wait for the producer lock:
+ * unavailable queue feedback is not an empty or measured idle interval. */
+static bool hakios_queue_depth(uint32_t *depth)
+{
+    if(!depth || !lck_mtx_try_lock(&mali_queue_lock))return false;
+    *depth=mali_queue_count;lck_mtx_unlock(&mali_queue_lock);return true;
+}
 
 static void
 mali_worker(__unused void *parameter, __unused wait_result_t result)
@@ -1074,10 +1083,12 @@ mali_worker(__unused void *parameter, __unused wait_result_t result)
 		began_profile=mach_absolute_time();
 		{
 			/* how busy the GPU is: every five seconds, its share of the time and by which slot */
-			static uint64_t busy[2], since, jobs[2];
+			static uint64_t busy[2], since, jobs[2], wait_total, wait_max, run_max;
+			static struct lm_trace_gate trace_gate;
 			uint64_t began = mach_absolute_time(), now, ns;
 
 			int result=lancelot_hakios_mali_submit(chain, fragment)?LM_EIO:LM_OK;
+            uint64_t callback_began=mach_absolute_time();
             uint64_t native_jm_ns=hkmt_job.jm.end_ns>=hkmt_job.jm.start_ns?
                 hkmt_job.jm.end_ns-hkmt_job.jm.start_ns:0;
             uint64_t native_start_ns=hkmt_job.started_ns;
@@ -1088,6 +1099,7 @@ mali_worker(__unused void *parameter, __unused wait_result_t result)
              * In particular it must not acquire the client lock: an enqueue
              * or GEM_CLOSE may hold that lock while waiting for queue space. */
             if(completion)result=completion(completion_context,seq,result,&dma_safe);
+            uint64_t callback_ended=mach_absolute_time();
             if(!dma_safe && !result)result=LM_EIO;
             profile=(struct hkmt_completed_profile){seq,native_start_ns,native_end_ns,native_jm_ns,0,native_hz,result};
 			if (result != LM_OK) {
@@ -1101,14 +1113,24 @@ mali_worker(__unused void *parameter, __unused wait_result_t result)
                 lck_mtx_unlock(&mali_queue_lock);
 			}
 			now = mach_absolute_time();
-			if (mali_trace) {
-				uint64_t q, b, e;
-
-				absolutetime_to_nanoseconds(queued, &q);
-				absolutetime_to_nanoseconds(began, &b);
-				absolutetime_to_nanoseconds(now, &e);
+			uint64_t q, b, e;
+			absolutetime_to_nanoseconds(queued, &q);
+			absolutetime_to_nanoseconds(began, &b);
+			absolutetime_to_nanoseconds(now, &e);
+			if (lm_trace_job(&trace_gate,mali_trace,q,b,e,result!=LM_OK)) {
 				printf("tl: j %llu %c q %llu b %llu e %llu\n", seq, fragment ? 'f' : 'v', q / 1000, b / 1000, e / 1000);
 			}
+			if(b>=q) {
+				uint64_t wait=b-q;
+				wait_total=wait>UINT64_MAX-wait_total?UINT64_MAX:wait_total+wait;
+				if(wait>wait_max)wait_max=wait;
+			}
+			if(e>=b&&e-b>run_max)run_max=e-b;
+            uint64_t callback_ns;
+            absolutetime_to_nanoseconds(callback_ended-callback_began,&callback_ns);
+            if(callback_ns>=UINT64_C(100000000))
+                printf("lancelot-hakios-callback: seq=%llu pid=%d at=%llu callback_us=%llu jm_us=%llu error=%d\n",
+                    seq,hkmt_exec_pid,e/1000,callback_ns/1000,native_jm_ns/1000,result);
 			absolutetime_to_nanoseconds(now - began, &ns);
 			busy[fragment] += ns;
 			jobs[fragment]++;
@@ -1121,6 +1143,10 @@ mali_worker(__unused void *parameter, __unused wait_result_t result)
 					    "fragment %llu jobs %llu ms (%llu us each)\n", (busy[0] + busy[1]) * 100 / ns,
 					    ns / NSEC_PER_SEC, jobs[0], busy[0] / 1000000, jobs[0] ? busy[0] / 1000 / jobs[0] : 0,
 					    jobs[1], busy[1] / 1000000, jobs[1] ? busy[1] / 1000 / jobs[1] : 0);
+					printf("lancelot-hakios-latency: at=%llu jobs=%llu queue_mean_us=%llu queue_max_us=%llu worker_max_us=%llu trace_mode=%u scope=FIFO_wall\n",
+					    e/1000,jobs[0]+jobs[1],wait_total/(jobs[0]+jobs[1])/1000,
+					    wait_max/1000,run_max/1000,mali_trace);
+					wait_total=wait_max=run_max=0;
 					busy[0] = busy[1] = jobs[0] = jobs[1] = 0;
 					since = now;
 				}
@@ -1159,7 +1185,7 @@ lancelot_hakios_mali_enqueue_complete(uint64_t chain,bool fragment,hkmt_completi
 		}
 	}
 	if(!mali_worker_started || !hkmt_ready()) {lck_mtx_unlock(&mali_queue_lock);return 0;}
-	while (mali_queue_count == MALI_QUEUE) {
+	while (mali_queue_count >= lgd_queue_limit(native_dvfs_requested,MALI_QUEUE)) {
 		lck_mtx_sleep(&mali_queue_lock, LCK_SLEEP_DEFAULT, (event_t)&mali_queue_head, THREAD_UNINT);
 		if(!hkmt_ready()){lck_mtx_unlock(&mali_queue_lock);return 0;}
 	}
@@ -1277,7 +1303,7 @@ static int hkmt_boot(void)
  if (!lancelot_hakios_mali_ready()) return LM_EIO;
  printf("lancelot-hakios-ptw: cached=%u config=%#x dirty=%u publish=before_job retire=before_free\n",
      !mali_fastmap,rd(mali,AS0+AS_TRANSCFG_LO),hkmt_pt_dirty);
- printf("lancelot-hakios-behavior: fifo=64 async_submit=1 shared_AS0=1 fastmap=%u max_bo_mib=256 recovery=reset_restore\n",mali_fastmap);
+ printf("lancelot-hakios-behavior: fifo=64 async_submit=1 shared_AS0=1 fastmap=%u max_bo_mib=256 recovery=reset_restore submit_window=%u\n",mali_fastmap,lgd_queue_limit(native_dvfs_requested,MALI_QUEUE));
  thread_t thread;
  if(kernel_thread_start(mali_thread,NULL,&thread)==KERN_SUCCESS)thread_deallocate(thread);
  return LM_OK;

@@ -5,6 +5,7 @@
  * the lines are kept to the character. And the boot arguments, read once.
  */
 #include "rwm.h"
+#include "boot_policy.h"
 
 #include <dlfcn.h>
 #include <mach/mach.h>
@@ -56,7 +57,7 @@ rwm_boot_args(void)
 extern "C" bool
 rwm_boot_arg(const char *text)
 {
-	return strstr(rwm_boot_args(), text) != nullptr;
+	return lancelot_metal_boot_token(rwm_boot_args(), text);
 }
 
 extern "C" uint64_t

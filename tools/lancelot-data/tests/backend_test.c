@@ -50,6 +50,7 @@ static uint64_t sector_reads,io_errors;
 static uint64_t max_read_blocks=128;
 static unsigned writes,readbacks,flushes,fail_write,fail_read,corrupt_read;
 static bool fail_flush;
+static void (*after_sector_write)(unsigned);
 static uint64_t mmc_ticks(__unused void*ctx){return ++ticks;}
 static uint64_t elapsed_us(uint64_t a,uint64_t b){return b-a;}
 static struct lmd_observer mmc_observer;
@@ -71,12 +72,13 @@ static int lancelot_msdc_write_sector(struct lancelot_msdc*m,uint32_t sector,con
  assert(m==&controller&&m->media_write_enabled&&m->media_write_first==sector&&m->media_write_end==(uint64_t)sector+1);
  assert((uint64_t)sector*512>=offer.partition_offset);writes++;if(writes==fail_write)return LM_IO;
  uint64_t offset=(uint64_t)sector*512-offer.partition_offset;assert(offset<=disk_bytes-512);
- memcpy(disk+offset,bytes,512);return LM_OK;
+ memcpy(disk+offset,bytes,512);if(after_sector_write)after_sector_write(writes);return LM_OK;
 }
 static int lancelot_msdc_read(struct lancelot_msdc*m,uint32_t sector,uint32_t count,uint8_t*out,size_t capacity){
  assert(m==&controller&&!m->media_write_enabled&&count>0&&count<=8&&capacity==(size_t)count*512);readbacks++;
  if(readbacks==fail_read)return LM_IO;
  uint64_t offset=(uint64_t)sector*512-offer.partition_offset;assert(offset<=disk_bytes-(uint64_t)count*512);memcpy(out,disk+offset,(size_t)count*512);
+ m->last_command=count>1?18:17;m->last_stage=4;m->last_int=LM_DATA_DONE;m->last_response=0x900;
  if(readbacks==corrupt_read)out[0]^=1;return LM_OK;
 }
 static int lancelot_msdc_flush(struct lancelot_msdc*m){
@@ -156,7 +158,7 @@ static void extent(uint8_t*p,unsigned depth,uint64_t physical,unsigned count){
  else{put16(p+16,(uint16_t)count);put16(p+18,(uint16_t)(physical>>32));put32(p+20,(uint32_t)physical);}
 }
 static void reset_io(void){
- failed=data_failed=false;data_ready=true;ready=true;writes=readbacks=flushes=0;fail_write=fail_read=corrupt_read=0;fail_flush=false;
+ failed=data_failed=false;data_ready=true;ready=true;writes=readbacks=flushes=0;fail_write=fail_read=corrupt_read=0;fail_flush=false;after_sector_write=NULL;
  controller.media_write_enabled=false;controller.media_write_first=controller.media_write_end=0;data_block_size=512;
  controller.recovery_status=LM_OK;max_read_blocks=128;
 }

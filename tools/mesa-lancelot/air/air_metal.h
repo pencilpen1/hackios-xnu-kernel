@@ -75,6 +75,7 @@ struct rwa_buffer *rwa_buffer_create(struct rwa_device *device, size_t size,
 				     char *why, size_t why_size);
 void *rwa_buffer_map(struct rwa_buffer *buffer);
 size_t rwa_buffer_size(struct rwa_buffer *buffer);
+uint64_t rwa_buffer_gpu_address(struct rwa_buffer *buffer);
 void rwa_buffer_destroy(struct rwa_buffer *buffer);
 
 /*
