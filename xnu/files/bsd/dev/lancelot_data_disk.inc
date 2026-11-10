@@ -4,6 +4,7 @@
  * fully initialized extent of one SHA-bound fixed file before issuing CMD24.
  */
 #include "lancelot_data_guard.h"
+#include "lancelot_mmc_io_limits.h"
 static struct ext4_inode data_image;
 static bool data_ready,data_failed;
 static uint64_t data_bytes,data_writes,data_write_bytes,data_flushes,data_write_us,data_guard_groups,data_guard_nodes;
@@ -11,7 +12,7 @@ static struct lhd_map data_map;
 static uint8_t *data_map_raw;
 static size_t data_map_size;
 #define LANCELOT_DATA_VERIFY_BYTES 4096u
-#define LANCELOT_DATA_SNAPSHOT_MAX (128u*1024u)
+#define LANCELOT_DATA_SNAPSHOT_MAX LANCELOT_MMC_REQUEST_BYTES
 static uint32_t data_block_size=4096;
 static uint32_t data_strategy_diagnostics;
 static uint8_t data_readback[LANCELOT_DATA_VERIFY_BYTES] __attribute__((aligned(64)));
@@ -84,7 +85,8 @@ data_file_write(uint64_t offset,size_t size,const void *buffer,size_t *transferr
     /* A mapped HFS/UPL page may be changed through another CPU alias while
      * PIO or readback runs. Verify the exact bytes submitted, not a later
      * version of the caller's memory. Allocation/copy can fault and must
-     * precede both storage locks. The device advertises 64 KiB requests. */
+     * precede both storage locks. The bound matches the Android-derived
+     * 512 KiB request limit; native writes and readback remain segmented. */
     size_t snapshot_size=size;
     uint8_t *snapshot=kalloc_data(snapshot_size,Z_WAITOK);
     if(!snapshot)return ENOMEM;
@@ -127,7 +129,18 @@ data_file_write(uint64_t offset,size_t size,const void *buffer,size_t *transferr
         }
         mmc_observe_begin(LMD_IO_DATA_WRITE,offset,chunk);
         if(result)failure_flags|=1u;
-        if(!result)for(;written<chunk/512;written++) {
+        if(!result && controller.queued_write) {
+            /* The complete group lies in the same sealed initialized extent.
+             * CQE transfers it by DMA, then the existing readback proves it.
+             * An ambiguous failed task reports no unverified prefix. */
+            controller.media_write_first=sector;
+            controller.media_write_end=sector+chunk/512;
+            controller.media_write_enabled=true;
+            int error=controller.queued_write(controller.ctx,(uint32_t)sector,(uint32_t)(chunk/512),in);
+            controller.media_write_enabled=false;
+            if(error){result=EIO;failure_flags|=2u;}
+            else written=(unsigned)(chunk/512);
+        } else if(!result)for(;written<chunk/512;written++) {
             /* No erase, partition switch or multi-block write is admitted. */
             controller.media_write_first=sector+written;
             controller.media_write_end=sector+written+1;
@@ -234,13 +247,11 @@ data_ioctl(dev_t dev,u_long cmd,caddr_t value,__unused int flag,__unused proc_t 
     case DKIOCGETPHYSICALBLOCKSIZE:*(uint32_t*)value=4096;return 0;
     case DKIOCGETBLOCKCOUNT:*(uint64_t*)value=data_bytes/data_block_size;return 0;
     case DKIOCISWRITABLE:*(uint32_t*)value=1;return 0;
-    case DKIOCGETMAXBLOCKCOUNTREAD:*(uint64_t*)value=65536/data_block_size;return 0;
-    case DKIOCGETMAXBLOCKCOUNTWRITE:*(uint64_t*)value=65536/data_block_size;return 0;
     /* Journaling must issue full cache flushes; no hardware FUA or barrier-only
      * shortcut is advertised by this synchronous PIO device. */
     case DKIOCGETFEATURES:*(uint32_t*)value=0;return 0;
     case DKIOCSYNCHRONIZE:return data_flush();
-    default:return ENOTTY;
+    default:return lancelot_mmc_io_limits(cmd,value,data_block_size);
     }
 }
 static int data_size(dev_t dev){return minor(dev)==1&&data_ready&&data_bytes/512<=INT32_MAX?(int)(data_bytes/512):-1;}
@@ -318,6 +329,8 @@ lancelot_data_init(void)
     if(cm<0 || !devfs_make_node(makedev(bm,1),DEVFS_BLOCK,UID_ROOT,GID_OPERATOR,0600,"lancelot_data") ||
        !devfs_make_node(makedev(cm,1),DEVFS_CHAR,UID_ROOT,GID_OPERATOR,0600,"rlancelot_data"))return;
     data_ready=true;
+    printf("lancelot-data-io: request_bytes=%u snapshot_bytes=%u segments=%u segment_bytes=%u active_commands=1 source=Android_mmcblk0\n",
+        LANCELOT_MMC_REQUEST_BYTES,LANCELOT_DATA_SNAPSHOT_MAX,LANCELOT_MMC_SEGMENTS,LANCELOT_MMC_SEGMENT_BYTES);
     printf("lancelot-data: HFSX data-file=%s bytes=%llu ranges=%u extent_nodes=%llu metadata_groups=%llu map_sha256=%s write_scope=sealed_initialized_file_extents readback=verified_4K_chunks logical_block=4096 native_sector=512 system_readonly=1\n",
         LANCELOT_DATA_FILE,data_bytes,data_map.count,data_guard_nodes,data_guard_groups,pinned_hex);
 }

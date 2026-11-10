@@ -32,8 +32,16 @@
 #define LM_R1_ERRORS 0xfff9a080u
 #define LM_DAT0 (1u << 16)
 #define LM_CLOCK_STABLE (1u << 7)
-/* Bound PIO interrupt-off latency; larger requests are split, not rejected. */
+/* Bound native transactions; larger upper-layer requests are split. */
 #define LM_MAX_BLOCKS 128u
+enum { LM_PHASE_IDLE, LM_PHASE_PREPARE, LM_PHASE_COMMAND, LM_PHASE_FIFO,
+    LM_PHASE_TAIL, LM_PHASE_CARD, LM_PHASE_RECOVERY, LM_PHASE_COUNT };
+
+struct lm_read_sample {
+	uint64_t fifo_ticks, first_ticks, empty_ticks, copy_ticks, gap_max_ticks;
+	uint32_t command, sector, requested, received, empty_polls, waits, bursts;
+	int status;
+};
 
 struct lancelot_msdc {
 	void *ctx;
@@ -46,7 +54,17 @@ struct lancelot_msdc {
 	void (*write_fifo)(void *, const uint8_t *, unsigned); /* ordered TX word burst */
 	uint64_t (*critical_enter)(void *);
 	void (*critical_exit)(void *, uint64_t);
-	void (*idle_wait)(void *); /* optional yield: only card-ready/DAT0 polling, never FIFO */
+	void (*idle_wait)(void *); /* adapter yields only when caller IRQ state permits it */
+	void (*phase)(void *, unsigned); /* phase boundaries only, never per FIFO word */
+	/* Reads poll briefly before yielding on an empty FIFO. Zero disables the
+	 * optional yield, not interrupts. All command/FIFO ownership stays with
+	 * the caller's controller mutex; only a <=128-byte burst masks CPU IRQs. */
+	uint64_t read_poll_ticks;
+	void (*read_sample)(void *, const struct lm_read_sample *);
+	bool bus_mode_change_enabled;
+	int (*queued_read)(void *, uint32_t, uint32_t, uint8_t *, size_t);
+	int (*queued_write)(void *, uint32_t, uint32_t, const uint8_t *);
+	int (*queued_flush)(void *);
 	uint32_t rca, last_command;
 	int recovery_status;
 	uint64_t commands_sent, multi_reads, recoveries;
@@ -56,12 +74,18 @@ struct lancelot_msdc {
     uint64_t media_write_first,media_write_end;
 };
 enum { LM_OK = 0, LM_TIMEOUT = -1, LM_IO = -2, LM_CONFIG = -3, LM_SWITCH_REJECTED = -4 };
+static inline void lm_phase(struct lancelot_msdc *m, unsigned phase)
+{
+	if (m->phase) m->phase(m->ctx, phase);
+}
 static int
 lm_wait_value(struct lancelot_msdc *m, uint32_t reg, uint32_t mask, uint32_t value)
 {
 	uint64_t start = m->ticks(m->ctx);
-	while ((m->read(m->ctx, reg) & mask) != value)
+	while ((m->read(m->ctx, reg) & mask) != value) {
 		if (m->ticks(m->ctx) - start >= m->timeout) return LM_TIMEOUT;
+		if (m->idle_wait) m->idle_wait(m->ctx);
+	}
 	return LM_OK;
 }
 static int
@@ -87,10 +111,17 @@ lm_command(struct lancelot_msdc *m, uint32_t raw, uint32_t argument)
 	uint32_t command = raw & 63;
 	if (command != 6 && command != 8 && command != 12 && command != 13 &&
     command != 17 && command != 18 && command != 23 &&
+    !(m->bus_mode_change_enabled && command==21 && raw==(21u|(1u<<7)|(1u<<11)|(128u<<16))) &&
     !(m->media_write_enabled && command==24 && raw==(24u|(1u<<7)|(1u<<11)|(1u<<13)|(512u<<16)))) return LM_CONFIG;
 	if (command == 6 && (raw != (6u | (7u << 7)) ||
     (((argument & 0xffff00ffu) != ((3u << 24) | (183u << 16)) || ((argument >> 8) & 255) > 2) &&
-     !(m->media_write_enabled && argument==((3u<<24)|(32u<<16)|(1u<<8)))))) return LM_CONFIG;
+     !(m->media_write_enabled && argument==((3u<<24)|(32u<<16)|(1u<<8))) &&
+     !(m->bus_mode_change_enabled &&
+       (argument==((3u<<24)|(183u<<16)|(6u<<8)) ||
+        argument==((3u<<24)|(185u<<16)|(1u<<8)) ||
+        argument==((3u<<24)|(185u<<16)|(2u<<8)) ||
+        argument==((3u<<24)|(185u<<16)|(3u<<8)) ||
+        argument==((3u<<24)|(15u<<16)|(1u<<8))))))) return LM_CONFIG;
     if(command==24 && (argument<m->media_write_first || argument>=m->media_write_end))return LM_CONFIG;
 	m->last_command = command;
 	int status = lm_wait_clear(m, LM_STATUS, command == 12 ? 2 : 3);
@@ -101,11 +132,19 @@ lm_command(struct lancelot_msdc *m, uint32_t raw, uint32_t argument)
 	m->commands_sent++;
 	m->last_stage = 3;
 	uint64_t start = m->ticks(m->ctx);
+	uint64_t last_wait = start;
 	for (;;) {
 		m->last_int = m->read(m->ctx, LM_INT);
 		if (m->last_int & LM_CMD_ERROR) return LM_IO;
 		if (m->last_int & LM_CMD_READY) break;
-		if (m->ticks(m->ctx) - start >= m->timeout) return LM_TIMEOUT;
+		uint64_t now = m->ticks(m->ctx);
+		if (now - start >= m->timeout) return LM_TIMEOUT;
+		bool read_command = command == 8 || command == 17 || command == 18 || command == 21;
+		if (m->idle_wait && (!read_command ||
+		    (m->read_poll_ticks && now - last_wait >= m->read_poll_ticks))) {
+			m->idle_wait(m->ctx);
+			last_wait = m->ticks(m->ctx);
+		}
 	}
 	m->write(m->ctx, LM_INT, LM_CMD_READY);
 	m->last_response = m->read(m->ctx, LM_RESPONSE);
@@ -165,20 +204,27 @@ static int
 lm_data_read(struct lancelot_msdc *m, uint32_t raw, uint32_t argument,
     uint32_t count, uint8_t *out, size_t capacity)
 {
-	if (!out || !count || count > LM_MAX_BLOCKS || capacity < (size_t)count * 512 || !m->timeout)
+	unsigned block_bytes = (raw & 63) == 21 ? 128 : 512;
+	if (!out || !count || count > LM_MAX_BLOCKS || capacity < (size_t)count * block_bytes || !m->timeout)
 		return LM_CONFIG;
 	if ((m->critical_enter == NULL) != (m->critical_exit == NULL)) return LM_CONFIG;
-	uint64_t critical = m->critical_enter ? m->critical_enter(m->ctx) : 0;
-	bool masked = m->critical_exit != NULL;
+	bool events_masked = false;
+	uint32_t saved_interrupts = 0;
+	int started = 0;
+	struct lm_read_sample sample = { .command = raw & 63, .sector = argument,
+	    .requested = count * block_bytes };
+	uint64_t fifo_start = 0, gap_start = 0;
+	bool in_fifo = false, gap = false, first = true;
+	lm_phase(m, LM_PHASE_PREPARE);
 	m->last_int = m->last_response = 0; m->last_stage = 1; m->recovery_status = LM_OK;
 	uint32_t cfg = m->read(m->ctx, LM_CFG);
 	int status = LM_CONFIG;
-	if ((cfg & 9) != 9 || (cfg & 4)) goto leave;
-	status = lm_wait_clear(m, LM_STATUS, 3);
-	if (status != LM_OK) goto leave;
-	uint32_t saved_interrupts = m->read(m->ctx, LM_INTEN);
+	if ((cfg & 9) != 9 || (cfg & 4)) goto done;
+	saved_interrupts = m->read(m->ctx, LM_INTEN);
 	m->write(m->ctx, LM_INTEN, saved_interrupts & ~LM_EVENTS);
-	int started = 0;
+	events_masked = true;
+	status = lm_wait_clear(m, LM_STATUS, 3);
+	if (status != LM_OK) goto done;
 	m->last_stage = 2;
 	m->write(m->ctx, LM_FIFO, 1u << 31);
 	if ((status = lm_wait_clear(m, LM_FIFO, 1u << 31)) != LM_OK) goto done;
@@ -188,45 +234,104 @@ lm_data_read(struct lancelot_msdc *m, uint32_t raw, uint32_t argument,
 		if (status != LM_OK) goto done; /* do not start CMD18 if SET_BLOCK_COUNT failed */
 	}
 	m->write(m->ctx, LM_COUNT, count);
+	/* MSDC events remain masked and the controller mutex owns the command.
+	 * CPU IRQ/FIQ masking is not needed while waiting for a response/data.
+	 * In counted PIO the receive FIFO provides backpressure; a full FIFO
+	 * does not authorize another CPU to consume it or issue a command. */
+	lm_phase(m, LM_PHASE_COMMAND);
 	started = 1; /* command timeout is also an uncertain transfer state */
 	status = lm_command(m, raw, argument);
 	if (status != LM_OK) goto done;
 	if (count > 1) m->multi_reads++;
 	m->last_stage = 4;
-	unsigned received = 0, total = count * 512;
+	lm_phase(m, LM_PHASE_FIFO);
+	unsigned received = 0, total = count * block_bytes;
+	bool payload_complete = false;
 	uint64_t start = m->ticks(m->ctx);
+	fifo_start = start; in_fifo = true;
+	uint64_t last_wait = start;
+	bool transfer_done = false;
 	for (;;) {
 		m->last_int = m->read(m->ctx, LM_INT);
 		if (m->last_int & (LM_CMD_ERROR | LM_DATA_ERROR)) { status = LM_IO; goto done; }
 		unsigned available = m->read(m->ctx, LM_FIFO) & 0xff;
 		if (available > 128 || available > total - received) { status = LM_IO; goto done; }
 		unsigned take = available & ~3u;
+		uint64_t now = m->ticks(m->ctx);
+		if (m->last_int & LM_DATA_DONE) transfer_done = true;
 		if (take) {
+			if (first) { sample.first_ticks = now - fifo_start; first = false; }
+			if (gap) {
+				uint64_t elapsed = now - gap_start;
+				sample.empty_ticks += elapsed;
+				if (elapsed > sample.gap_max_ticks) sample.gap_max_ticks = elapsed;
+				gap = false;
+			}
+			/* A short MMIO burst remains indivisible. Card latency, empty
+			 * polling and the rest of the request never extend this mask. */
+			uint64_t critical = m->critical_enter ? m->critical_enter(m->ctx) : 0;
+			uint64_t copy_start = m->ticks(m->ctx);
 			lm_fifo_read(m, out + received, take);
+			sample.copy_ticks += m->ticks(m->ctx) - copy_start;
+			if (m->critical_exit) m->critical_exit(m->ctx, critical);
+			sample.bursts++;
 			received += take;
+			sample.received = received;
+			last_wait = m->ticks(m->ctx);
+		} else if (!payload_complete) {
+			if (!gap) { gap_start = now; gap = true; }
+			sample.empty_polls++;
 		}
-		if (m->last_int & LM_DATA_DONE) {
-			/* No more FIFO service after transfer completion. Let timer/IPI
-			 * interrupts run during final controller/card readiness. */
-			if (masked) { m->critical_exit(m->ctx, critical); masked = false; }
-			status = received == total ? lm_wait_clear(m, LM_STATUS, 3) : LM_IO;
+		if (received == total && !payload_complete) {
+			/* All expected bytes are in RAM. Late CRC/completion must still
+			 * be checked, but the CPU no longer has to drain this FIFO. */
+			payload_complete = true;
+			sample.fifo_ticks = m->ticks(m->ctx) - fifo_start; in_fifo = false;
+			lm_phase(m, LM_PHASE_TAIL);
+		}
+		if (transfer_done && (payload_complete || !take)) {
+			/* Completion can precede the CPU's final FIFO drain. Consume
+			 * residual bytes first, but reject a completed short transfer.
+			 * Re-read status so a CRC error arriving during that drain wins. */
+			m->last_int = m->read(m->ctx, LM_INT);
+			status = (m->last_int & (LM_CMD_ERROR | LM_DATA_ERROR)) || !payload_complete
+			    ? LM_IO : lm_wait_clear(m, LM_STATUS, 3);
 			break;
 		}
 		if (m->ticks(m->ctx) - start >= m->timeout) { status = LM_TIMEOUT; break; }
+		if (payload_complete && m->idle_wait) m->idle_wait(m->ctx);
+		else if (!take && m->read_poll_ticks && m->idle_wait &&
+		    now - last_wait >= m->read_poll_ticks) {
+			m->idle_wait(m->ctx); sample.waits++;
+			last_wait = m->ticks(m->ctx);
+		}
 	}
 done:
+	if (in_fifo) sample.fifo_ticks = m->ticks(m->ctx) - fifo_start;
+	if (gap) {
+		uint64_t elapsed = m->ticks(m->ctx) - gap_start;
+		sample.empty_ticks += elapsed;
+		if (elapsed > sample.gap_max_ticks) sample.gap_max_ticks = elapsed;
+	}
+	if (first && in_fifo) sample.first_ticks = sample.fifo_ticks;
+	sample.status = status;
+	if (m->read_sample) m->read_sample(m->ctx, &sample);
 	/* Recovery abandons the payload; STOP/CMD13 need no CPU interrupt mask. */
-	if (masked) { m->critical_exit(m->ctx, critical); masked = false; }
-	if (status != LM_OK && started) (void)lm_recover_read(m);
-	m->write(m->ctx, LM_INT, LM_EVENTS);
-	m->write(m->ctx, LM_INTEN, saved_interrupts);
-leave:
-	if (masked) m->critical_exit(m->ctx, critical);
+	if (status != LM_OK && started) { lm_phase(m, LM_PHASE_RECOVERY); (void)lm_recover_read(m); }
+	if (events_masked) {
+		m->write(m->ctx, LM_INT, LM_EVENTS);
+		m->write(m->ctx, LM_INTEN, saved_interrupts);
+	}
+	lm_phase(m, LM_PHASE_IDLE);
 	return status;
 }
 static int
 lancelot_msdc_read(struct lancelot_msdc *m, uint32_t sector, uint32_t count, uint8_t *out, size_t capacity)
 {
+	if(m->queued_read) {
+		if(!out || !count || count>1024 || capacity<(size_t)count*512 || (uint64_t)sector+count>(1ULL<<32))return LM_CONFIG;
+		return m->queued_read(m->ctx,sector,count,out,capacity);
+	}
 	if (!count || count > LM_MAX_BLOCKS || (uint64_t)sector + count > (1ULL << 32)) return LM_CONFIG;
 	return lm_data_read(m, count == 1 ? LM_READ_SINGLE : LM_READ_MULTIPLE, sector, count, out, capacity);
 }
@@ -255,22 +360,28 @@ lancelot_msdc_write_sector(struct lancelot_msdc *m,uint32_t sector,const uint8_t
 {
     if(!data || !m->media_write_enabled || sector<m->media_write_first || sector>=m->media_write_end || !m->timeout)
         return LM_CONFIG;
+    if(m->queued_write)return m->queued_write(m->ctx,sector,1,data);
     if((m->critical_enter==NULL)!=(m->critical_exit==NULL))return LM_CONFIG;
-    uint64_t saved=m->critical_enter?m->critical_enter(m->ctx):0;
-    bool masked=m->critical_exit!=NULL;
+    uint64_t saved=0;
+    bool masked=false,events_masked=false;
     uint32_t events=LM_EVENTS|(1u<<16),mask=m->read(m->ctx,LM_INTEN);
     int result=LM_CONFIG;bool started=false;
+    lm_phase(m,LM_PHASE_PREPARE);
     m->last_int=m->last_response=0;m->last_stage=1;
     uint32_t cfg=m->read(m->ctx,LM_CFG);
     if((cfg&9)!=9 || (cfg&4))goto leave;
-    if((result=lm_wait_clear(m,LM_STATUS,3))!=LM_OK)goto leave;
     m->write(m->ctx,LM_INTEN,mask&~events);
+    events_masked=true;
+    if((result=lm_wait_clear(m,LM_STATUS,3))!=LM_OK)goto restore;
     m->write(m->ctx,LM_FIFO,1u<<31);
     if((result=lm_wait_clear(m,LM_FIFO,1u<<31))!=LM_OK)goto restore;
     m->write(m->ctx,LM_INT,events);m->write(m->ctx,LM_COUNT,1);
+    lm_phase(m,LM_PHASE_COMMAND);
+    if(m->critical_enter){saved=m->critical_enter(m->ctx);masked=true;}
     started=true;
     if((result=lm_command(m,LM_WRITE_SINGLE,sector))!=LM_OK)goto restore;
     m->last_stage=4;
+    lm_phase(m,LM_PHASE_FIFO);
     unsigned sent=0;uint64_t began=m->ticks(m->ctx);
     while(sent<512) {
         m->last_int=m->read(m->ctx,LM_INT);
@@ -282,6 +393,11 @@ lancelot_msdc_write_sector(struct lancelot_msdc *m,uint32_t sector,const uint8_t
         if(sent<512 && (m->last_int&LM_DATA_DONE)){result=LM_IO;goto restore;}
         if(m->ticks(m->ctx)-began>=m->timeout){result=LM_TIMEOUT;goto restore;}
     }
+    /* Every payload byte has been queued. Hardware can transmit the final
+     * FIFO contents without any further CPU writes. Preserve late status
+     * checks while allowing timer/IPI service during card completion. */
+    if(masked){m->critical_exit(m->ctx,saved);masked=false;}
+    lm_phase(m,LM_PHASE_TAIL);
     m->last_stage=5;
     for(;;) {
         m->last_int=m->read(m->ctx,LM_INT);
@@ -291,29 +407,34 @@ lancelot_msdc_write_sector(struct lancelot_msdc *m,uint32_t sector,const uint8_t
             result=lm_wait_clear(m,LM_STATUS,3);break;
         }
         if(m->ticks(m->ctx)-began>=m->timeout){result=LM_TIMEOUT;break;}
+        if(m->idle_wait)m->idle_wait(m->ctx);
     }
-    if(result==LM_OK)result=lm_card_ready(m);
+    if(result==LM_OK){lm_phase(m,LM_PHASE_CARD);result=lm_card_ready(m);}
 restore:
     if(masked){m->critical_exit(m->ctx,saved);masked=false;}
-    if(result!=LM_OK && started)(void)lm_recover_read(m);
-    m->write(m->ctx,LM_INT,events);m->write(m->ctx,LM_INTEN,mask);
+    if(result!=LM_OK && started){lm_phase(m,LM_PHASE_RECOVERY);(void)lm_recover_read(m);}
+    if(events_masked){m->write(m->ctx,LM_INT,events);m->write(m->ctx,LM_INTEN,mask);}
 leave:
     if(masked)m->critical_exit(m->ctx,saved);
+    lm_phase(m,LM_PHASE_IDLE);
     return result;
 }
 static inline int
 lancelot_msdc_flush(struct lancelot_msdc *m)
 {
     if(!m->media_write_enabled)return LM_CONFIG;
+    if(m->queued_flush)return m->queued_flush(m->ctx);
     if((m->critical_enter==NULL)!=(m->critical_exit==NULL))return LM_CONFIG;
     /* Flush has no FIFO payload. Serialize the controller and mask its own
      * events, while allowing the CPU to service timers and reschedule. */
     uint32_t mask=m->read(m->ctx,LM_INTEN);
     m->write(m->ctx,LM_INTEN,mask&~LM_EVENTS);
+    lm_phase(m,LM_PHASE_CARD);
     int result=lm_card_ready(m);
     if(result==LM_OK)result=lm_command(m,6u|(7u<<7),(3u<<24)|(32u<<16)|(1u<<8));
     if(result==LM_OK)result=lm_card_ready(m);
     m->write(m->ctx,LM_INTEN,mask);
+    lm_phase(m,LM_PHASE_IDLE);
     return result;
 }
 #endif

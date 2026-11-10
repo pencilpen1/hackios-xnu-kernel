@@ -23,10 +23,15 @@
 #include <sys/sysctl.h>
 #include <sys/uio.h>
 #include <sys/redwood_input.h>
+#include <vm/vm_kern.h>
+#include <vm/memory_types.h>
 #include "lancelot_storage.h"
 #include "lancelot_msdc.h"
 #include "lancelot_mmc_mode.h"
 #include "lancelot_mmc_observation.h"
+#include "lancelot_mmc_io_limits.h"
+#include "lancelot_mmc_hs400.h"
+#include "lancelot_cqhci.h"
 #define XNULOADER_NO_LIBC
 #include "lancelot_ext4.h"
 #include "lancelot_sha256.h"
@@ -41,6 +46,8 @@ static struct lancelot_msdc controller;
 static struct ext4_fs filesystem;
 static struct ext4_inode ios;
 static vm_offset_t registers;
+static vm_offset_t top_registers;
+static uint64_t mmc_cqe_requests,mmc_cqe_bytes,mmc_cqe_waits,mmc_cqe_total,mmc_cqe_max,mmc_cqe_failed;
 static bool ready, failed;
 static uint32_t device_block_size = 512;
 static uint8_t sector_buffer[512] __attribute__((aligned(64)));
@@ -50,6 +57,18 @@ static uint64_t pio_us, file_read_us, lock_wait_us, initial_cfg, bus_width;
 static uint64_t max_read_blocks = 1, active_clock_hz, mode_fallbacks;
 static uint64_t mmc_mask_began, mmc_mask_total, mmc_mask_max, mmc_mask_count;
 static uint64_t mmc_idle_wait_count;
+/* Controller-mutex serialized writer; the periodic reporter only reads
+ * atomics. Phase timers measure wall time, including scheduler waits. */
+static unsigned mmc_current_phase;
+static uint64_t mmc_phase_began;
+static uint64_t mmc_phase_total[LM_PHASE_COUNT], mmc_phase_max[LM_PHASE_COUNT];
+static struct {
+    uint64_t epoch, ticks;
+    uint32_t command, stage, phase;
+} mmc_longest_mask;
+static uint64_t mmc_read_count, mmc_read_fifo, mmc_read_empty, mmc_read_copy;
+static uint64_t mmc_read_epoch;
+static struct lm_read_sample mmc_slowest_read;
 static uint32_t image_read_diagnostics;
 static struct lmd_observer mmc_observer;
 /* Immutable after the first transport failure; publish without console I/O
@@ -125,19 +144,33 @@ void lancelot_mmc_dump_active_io(void) {
 static uint32_t
 mmc_read_register(__unused void *ctx, uint32_t offset)
 {
+	if(offset>=LH_TOP && offset<LH_TOP+4096)return *(volatile uint32_t *)(top_registers+offset-LH_TOP);
 	return *(volatile uint32_t *)(registers + offset);
 }
 static void
 mmc_write_register(__unused void *ctx, uint32_t offset, uint32_t value)
 {
 	if(offset==LM_CMD)os_atomic_store(&mmc_observer.command,value,relaxed);
-	*(volatile uint32_t *)(registers + offset) = value;
+	if(offset>=LH_TOP && offset<LH_TOP+4096)*(volatile uint32_t *)(top_registers+offset-LH_TOP)=value;
+	else *(volatile uint32_t *)(registers + offset) = value;
 	__asm__ volatile ("dsb sy" ::: "memory");
 }
 static uint64_t
 mmc_ticks(__unused void *ctx)
 {
 	return __builtin_arm_rsr64("CNTVCT_EL0");
+}
+static void mmc_phase(__unused void *ctx, unsigned phase) {
+    uint64_t now=mmc_ticks(NULL);
+    unsigned previous=mmc_current_phase;
+    if(previous>LM_PHASE_IDLE && previous<LM_PHASE_COUNT && now>=mmc_phase_began) {
+        uint64_t elapsed=now-mmc_phase_began;
+        os_atomic_add(&mmc_phase_total[previous],elapsed,relaxed);
+        if(elapsed>os_atomic_load(&mmc_phase_max[previous],relaxed))
+            os_atomic_store(&mmc_phase_max[previous],elapsed,relaxed);
+    }
+    mmc_current_phase=phase<LM_PHASE_COUNT?phase:LM_PHASE_IDLE;
+    mmc_phase_began=now;
 }
 static uint64_t mmc_enter(__unused void *ctx) {
     os_atomic_store(&mmc_observer.phase,LMD_PHASE_MASK_IRQ,relaxed);
@@ -156,24 +189,88 @@ static void mmc_leave(__unused void *ctx, uint64_t state) {
     __builtin_arm_wsr64("DAIF",state);
     os_atomic_add(&mmc_mask_total,elapsed,relaxed);
     os_atomic_inc(&mmc_mask_count,relaxed);
-    if(elapsed>os_atomic_load(&mmc_mask_max,relaxed))os_atomic_store(&mmc_mask_max,elapsed,relaxed);
+    if(elapsed>os_atomic_load(&mmc_mask_max,relaxed)) {
+        os_atomic_store(&mmc_mask_max,elapsed,relaxed);
+        os_atomic_inc(&mmc_longest_mask.epoch,acq_rel);
+        os_atomic_store(&mmc_longest_mask.ticks,elapsed,relaxed);
+        os_atomic_store(&mmc_longest_mask.command,controller.last_command,relaxed);
+        os_atomic_store(&mmc_longest_mask.stage,controller.last_stage,relaxed);
+        os_atomic_store(&mmc_longest_mask.phase,mmc_current_phase,relaxed);
+        os_atomic_inc(&mmc_longest_mask.epoch,release);
+    }
     os_atomic_store(&mmc_observer.phase,LMD_PHASE_IRQ_RESTORED,relaxed);
 }
 static void mmc_idle_wait(__unused void *ctx) {
-    /* Called with the controller mutex held but no live FIFO payload. The
-     * remaining width-negotiation/early callers may still mask interrupts. */
+    /* Read response/empty FIFO waits may yield after a short spin. Preserve
+     * an already-disabled caller state; never sleep inside a FIFO burst. */
     if(ml_get_interrupts_enabled()) {
         os_atomic_inc(&mmc_idle_wait_count,relaxed);
         delay_for_interval(100,NSEC_PER_USEC);
     }
 }
+static void mmc_read_sample(__unused void *ctx, const struct lm_read_sample *v) {
+    os_atomic_inc(&mmc_read_count,relaxed);
+    os_atomic_add(&mmc_read_fifo,v->fifo_ticks,relaxed);
+    os_atomic_add(&mmc_read_empty,v->empty_ticks,relaxed);
+    os_atomic_add(&mmc_read_copy,v->copy_ticks,relaxed);
+    if(v->fifo_ticks<=os_atomic_load(&mmc_slowest_read.fifo_ticks,relaxed))return;
+    os_atomic_inc(&mmc_read_epoch,acq_rel);
+#define SAVE_READ(field) os_atomic_store(&mmc_slowest_read.field,v->field,relaxed)
+    SAVE_READ(fifo_ticks); SAVE_READ(first_ticks); SAVE_READ(empty_ticks);
+    SAVE_READ(copy_ticks); SAVE_READ(gap_max_ticks); SAVE_READ(command);
+    SAVE_READ(sector); SAVE_READ(requested); SAVE_READ(received);
+    SAVE_READ(empty_polls); SAVE_READ(waits); SAVE_READ(bursts); SAVE_READ(status);
+#undef SAVE_READ
+    os_atomic_inc(&mmc_read_epoch,release);
+}
 void lancelot_mmc_report_latency(void);
 void lancelot_mmc_report_latency(void) {
     if(!counter_frequency)return;
-    printf("lancelot-mmc-sched: masks=%llu total_us=%llu max_us=%llu card_yields=%llu batch=%llu\n",
+    printf("lancelot-mmc-sched: masks=%llu total_us=%llu max_us=%llu idle_waits=%llu batch=%llu\n",
         os_atomic_load(&mmc_mask_count,relaxed),elapsed_us(0,os_atomic_load(&mmc_mask_total,relaxed)),
         elapsed_us(0,os_atomic_load(&mmc_mask_max,relaxed)),
         os_atomic_load(&mmc_idle_wait_count,relaxed),max_read_blocks);
+    printf("lancelot-mmc-phases: prep_us=%llu cmd_us=%llu fifo_us=%llu tail_us=%llu card_us=%llu recovery_us=%llu scope=wall\n",
+        elapsed_us(0,os_atomic_load(&mmc_phase_total[LM_PHASE_PREPARE],relaxed)),
+        elapsed_us(0,os_atomic_load(&mmc_phase_total[LM_PHASE_COMMAND],relaxed)),
+        elapsed_us(0,os_atomic_load(&mmc_phase_total[LM_PHASE_FIFO],relaxed)),
+        elapsed_us(0,os_atomic_load(&mmc_phase_total[LM_PHASE_TAIL],relaxed)),
+        elapsed_us(0,os_atomic_load(&mmc_phase_total[LM_PHASE_CARD],relaxed)),
+        elapsed_us(0,os_atomic_load(&mmc_phase_total[LM_PHASE_RECOVERY],relaxed)));
+    uint64_t epoch=os_atomic_load(&mmc_longest_mask.epoch,acquire);
+    uint64_t longest=os_atomic_load(&mmc_longest_mask.ticks,relaxed);
+    uint32_t command=os_atomic_load(&mmc_longest_mask.command,relaxed);
+    uint32_t stage=os_atomic_load(&mmc_longest_mask.stage,relaxed);
+    uint32_t phase=os_atomic_load(&mmc_longest_mask.phase,relaxed);
+    os_atomic_thread_fence(acquire);
+    bool valid=epoch && !(epoch&1) && epoch==os_atomic_load(&mmc_longest_mask.epoch,acquire);
+    printf("lancelot-mmc-longest: valid=%u irq_us=%llu cmd=%u stage=%u phase=%u fifo_max_us=%llu tail_max_us=%llu\n",
+        valid,valid?elapsed_us(0,longest):0,valid?command:0,valid?stage:0,valid?phase:0,
+        elapsed_us(0,os_atomic_load(&mmc_phase_max[LM_PHASE_FIFO],relaxed)),
+        elapsed_us(0,os_atomic_load(&mmc_phase_max[LM_PHASE_TAIL],relaxed)));
+    printf("lancelot-mmc-read: count=%llu fifo_us=%llu empty_us=%llu copy_us=%llu\n",
+        os_atomic_load(&mmc_read_count,relaxed),elapsed_us(0,os_atomic_load(&mmc_read_fifo,relaxed)),
+        elapsed_us(0,os_atomic_load(&mmc_read_empty,relaxed)),elapsed_us(0,os_atomic_load(&mmc_read_copy,relaxed)));
+    struct lm_read_sample r;
+    epoch=os_atomic_load(&mmc_read_epoch,acquire);
+#define LOAD_READ(field) r.field=os_atomic_load(&mmc_slowest_read.field,relaxed)
+    LOAD_READ(fifo_ticks); LOAD_READ(first_ticks); LOAD_READ(empty_ticks);
+    LOAD_READ(copy_ticks); LOAD_READ(gap_max_ticks); LOAD_READ(command);
+    LOAD_READ(sector); LOAD_READ(requested); LOAD_READ(received);
+    LOAD_READ(empty_polls); LOAD_READ(waits); LOAD_READ(bursts); LOAD_READ(status);
+#undef LOAD_READ
+    os_atomic_thread_fence(acquire);
+    valid=epoch && !(epoch&1) && epoch==os_atomic_load(&mmc_read_epoch,acquire);
+    if(valid) {
+        printf("lancelot-mmc-read-max: cmd=%u lba=%u requested=%u received=%u status=%d fifo_us=%llu first_us=%llu\n",
+            r.command,r.sector,r.requested,r.received,r.status,elapsed_us(0,r.fifo_ticks),elapsed_us(0,r.first_ticks));
+        printf("lancelot-mmc-read-wait: empty_us=%llu gap_max_us=%llu copy_us=%llu polls=%u waits=%u bursts=%u scope=wall\n",
+            elapsed_us(0,r.empty_ticks),elapsed_us(0,r.gap_max_ticks),elapsed_us(0,r.copy_ticks),r.empty_polls,r.waits,r.bursts);
+    }
+    printf("lancelot-mmc-cqe: requests=%llu bytes=%llu waits=%llu total_us=%llu max_us=%llu failed=%llu\n",
+        os_atomic_load(&mmc_cqe_requests,relaxed),os_atomic_load(&mmc_cqe_bytes,relaxed),
+        os_atomic_load(&mmc_cqe_waits,relaxed),elapsed_us(0,os_atomic_load(&mmc_cqe_total,relaxed)),
+        elapsed_us(0,os_atomic_load(&mmc_cqe_max,relaxed)),os_atomic_load(&mmc_cqe_failed,relaxed));
 }
 static void mmc_report_native_failure(void) {
     if(!os_atomic_load(&mmc_native_failure_ready,acquire) ||
@@ -227,6 +324,7 @@ mmc_verify_super(void *ctx)
 	sha256(super, sizeof(super), digest);
 	return memcmp(digest, offer.superblock_sha256, sizeof(digest)) == 0;
 }
+#include "lancelot_mmc_cqe.inc"
 static int
 partition_read(__unused void *ctx, uint64_t offset, size_t size, void *out)
 {
@@ -352,8 +450,7 @@ mmc_ioctl(dev_t dev, u_long command, caddr_t data, __unused int flags, __unused 
 	case DKIOCGETPHYSICALBLOCKSIZE: *(uint32_t *)data = 512; return 0;
 	case DKIOCGETBLOCKCOUNT: *(uint64_t *)data = ios.size / device_block_size; return 0;
 	case DKIOCISWRITABLE: *(uint32_t *)data = 0; return 0;
-	case DKIOCGETMAXBLOCKCOUNTREAD: *(uint64_t *)data = (128 * 1024) / device_block_size; return 0;
-	default: return ENOTTY;
+	default: return lancelot_mmc_io_limits(command, data, device_block_size);
 	}
 }
 static int mmc_size(__unused dev_t dev) { return ready ? (int)device_block_size : -1; }
@@ -418,11 +515,16 @@ lancelot_emmc_init(void)
 	counter_frequency = frequency;
 	registers = ml_io_map((vm_offset_t)offer.mmio, 4096);
 	if (!registers) return;
+	top_registers=ml_io_map(0x11cd0000,4096); /* live lancelot DT reg[1] */
+	if(!top_registers){failed=true;return;}
 	controller.ctx = NULL; controller.read = mmc_read_register; controller.write = mmc_write_register;
 	controller.ticks = mmc_ticks; controller.timeout = frequency / 2; /* 500 ms maximum per phase */
 	controller.read_fifo = mmc_fifo_words; controller.write_fifo = mmc_fifo_write_words;
 	controller.critical_enter = mmc_enter; controller.critical_exit = mmc_leave;
 	controller.idle_wait = mmc_idle_wait;
+	controller.phase = mmc_phase;
+	controller.read_poll_ticks = frequency / 20000; /* 50 us before yielding */
+	controller.read_sample = mmc_read_sample;
 	controller.rca = offer.rca;
 	initial_cfg = mmc_read_register(NULL, LM_CFG);
 	uint32_t width = (mmc_read_register(NULL, LM_BUS_CFG) >> 16) & 3;
@@ -434,8 +536,8 @@ lancelot_emmc_init(void)
 		printf("lancelot-emmc: native superblock does not match firmware digest\n");
 		failed = true; return;
 	}
-	/* At 48 MHz SDR a 64 KiB masked PIO transfer already exceeds 1 ms
-	 * before software overhead. Split at 8 KiB to bound timer/IPI latency. */
+	/* Keep the verified 8 KiB native transaction size independently of the
+	 * Android-derived 512 KiB VFS request limit and 128-byte IRQ-off bursts. */
 	uint32_t tune = 1, wanted_width = offer.max_bus_width, wanted_blocks = 16;
 	(void)PE_parse_boot_argn("lancelot_mmc_tune", &tune, sizeof(tune));
 	(void)PE_parse_boot_argn("lancelot_mmc_width", &wanted_width, sizeof(wanted_width));
@@ -462,6 +564,8 @@ lancelot_emmc_init(void)
 	}
 	printf("lancelot-emmc: verified width=%llu clock=%llu Hz batch=%llu sectors fallbacks=%llu\n",
 	    bus_width, active_clock_hz, max_read_blocks, mode_fallbacks);
+	printf("lancelot-emmc: read_irq_scope=fifo_burst max_burst=128 empty_spin_us=50 request_bytes=524288\n");
+	if(!mmc_enable_hs400_cqe()){failed=true;return;}
 	if (!ext4_open(&filesystem, partition_read, NULL, offer.partition_bytes) ||
 	    !ext4_lookup(&filesystem, "/hackios/20H392/ios-containers.img", &ios) ||
 	    ios.size != LANCELOT_IOS_BYTES || !ext4_read_file(&filesystem, &ios, 0, sizeof(header), header) ||

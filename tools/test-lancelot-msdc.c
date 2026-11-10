@@ -47,7 +47,7 @@ static uint32_t read_reg(void *ctx, uint32_t reg)
 		if (m->scenario == FIFO_STUCK) return 1u << 31;
 		if (m->phase != 2 || m->scenario == DATA_TIMEOUT) return 0;
 		if (m->scenario == OVERFLOW) return 200;
-		if (m->scenario == SHORT) return 64;
+		if (m->scenario == SHORT) return m->position < 64 ? 64 : 0;
 		return m->position < m->total ? (m->total - m->position < 128 ? m->total - m->position : 128) : 0;
 	case LM_INT:
 		if (m->phase == 1) {
@@ -170,7 +170,7 @@ static struct lancelot_msdc setup(struct mock *m, enum scenario scenario, int fa
 	m->interrupts = 0xa5a5ffff; m->cfg = 9 | 2 | (2u << 8); m->irq = 1;
 	m->ext[185] = 1; m->ext[192] = 8; m->ext[196] = 3; m->ext[214] = 0x60; m->ext[215] = 7;
 	return (struct lancelot_msdc){.ctx=m, .read=read_reg, .write=write_reg, .ticks=ticks,
-	    .timeout=2048, .rca=1, .read_fifo=fast ? burst : NULL, .critical_enter=enter, .critical_exit=leave};
+	    .timeout=8192, .rca=1, .read_fifo=fast ? burst : NULL, .critical_enter=enter, .critical_exit=leave};
 }
 static int verify(void *ctx)
 {
