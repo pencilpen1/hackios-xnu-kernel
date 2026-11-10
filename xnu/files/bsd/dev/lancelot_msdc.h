@@ -46,6 +46,7 @@ struct lancelot_msdc {
 	void (*write_fifo)(void *, const uint8_t *, unsigned); /* ordered TX word burst */
 	uint64_t (*critical_enter)(void *);
 	void (*critical_exit)(void *, uint64_t);
+	void (*idle_wait)(void *); /* optional yield: only card-ready/DAT0 polling, never FIFO */
 	uint32_t rca, last_command;
 	int recovery_status;
 	uint64_t commands_sent, multi_reads, recoveries;
@@ -67,6 +68,16 @@ static int
 lm_wait_clear(struct lancelot_msdc *m, uint32_t reg, uint32_t bits)
 {
 	return lm_wait_value(m, reg, bits, 0);
+}
+static int
+lm_wait_dat0(struct lancelot_msdc *m)
+{
+	uint64_t start = m->ticks(m->ctx);
+	while (!(m->read(m->ctx, LM_PS) & LM_DAT0)) {
+		if (m->ticks(m->ctx) - start >= m->timeout) return LM_TIMEOUT;
+		if (m->idle_wait) m->idle_wait(m->ctx);
+	}
+	return LM_OK;
 }
 /* Caller serializes commands and masks controller interrupts. CMD12 must be
  * issuable while the data engine is busy; all other commands require idle. */
@@ -101,7 +112,7 @@ lm_command(struct lancelot_msdc *m, uint32_t raw, uint32_t argument)
 	if (m->last_response & (LM_R1_ERRORS & ~0x80u)) return LM_IO;
 	if (m->last_response & 0x80) return LM_SWITCH_REJECTED;
 	if (((raw >> 7) & 7) == 7) {
-		status = lm_wait_value(m, LM_PS, LM_DAT0, LM_DAT0);
+		status = lm_wait_dat0(m);
 		if (status != LM_OK) return status;
 	}
 	return LM_OK;
@@ -118,6 +129,7 @@ lm_card_ready(struct lancelot_msdc *m)
 		if (state == 4 && (m->last_response & 0x100)) return LM_OK;
 		if (state != 4 && state != 7) return LM_IO;
 		if (m->ticks(m->ctx) - start >= m->timeout) return LM_TIMEOUT;
+		if (m->idle_wait) m->idle_wait(m->ctx);
 	}
 }
 static int
@@ -157,6 +169,7 @@ lm_data_read(struct lancelot_msdc *m, uint32_t raw, uint32_t argument,
 		return LM_CONFIG;
 	if ((m->critical_enter == NULL) != (m->critical_exit == NULL)) return LM_CONFIG;
 	uint64_t critical = m->critical_enter ? m->critical_enter(m->ctx) : 0;
+	bool masked = m->critical_exit != NULL;
 	m->last_int = m->last_response = 0; m->last_stage = 1; m->recovery_status = LM_OK;
 	uint32_t cfg = m->read(m->ctx, LM_CFG);
 	int status = LM_CONFIG;
@@ -193,17 +206,22 @@ lm_data_read(struct lancelot_msdc *m, uint32_t raw, uint32_t argument,
 			received += take;
 		}
 		if (m->last_int & LM_DATA_DONE) {
+			/* No more FIFO service after transfer completion. Let timer/IPI
+			 * interrupts run during final controller/card readiness. */
+			if (masked) { m->critical_exit(m->ctx, critical); masked = false; }
 			status = received == total ? lm_wait_clear(m, LM_STATUS, 3) : LM_IO;
 			break;
 		}
 		if (m->ticks(m->ctx) - start >= m->timeout) { status = LM_TIMEOUT; break; }
 	}
 done:
+	/* Recovery abandons the payload; STOP/CMD13 need no CPU interrupt mask. */
+	if (masked) { m->critical_exit(m->ctx, critical); masked = false; }
 	if (status != LM_OK && started) (void)lm_recover_read(m);
 	m->write(m->ctx, LM_INT, LM_EVENTS);
 	m->write(m->ctx, LM_INTEN, saved_interrupts);
 leave:
-	if (m->critical_exit) m->critical_exit(m->ctx, critical);
+	if (masked) m->critical_exit(m->ctx, critical);
 	return status;
 }
 static int
@@ -239,6 +257,7 @@ lancelot_msdc_write_sector(struct lancelot_msdc *m,uint32_t sector,const uint8_t
         return LM_CONFIG;
     if((m->critical_enter==NULL)!=(m->critical_exit==NULL))return LM_CONFIG;
     uint64_t saved=m->critical_enter?m->critical_enter(m->ctx):0;
+    bool masked=m->critical_exit!=NULL;
     uint32_t events=LM_EVENTS|(1u<<16),mask=m->read(m->ctx,LM_INTEN);
     int result=LM_CONFIG;bool started=false;
     m->last_int=m->last_response=0;m->last_stage=1;
@@ -267,15 +286,19 @@ lancelot_msdc_write_sector(struct lancelot_msdc *m,uint32_t sector,const uint8_t
     for(;;) {
         m->last_int=m->read(m->ctx,LM_INT);
         if(m->last_int&(LM_CMD_ERROR|LM_WRITE_ERROR)){result=LM_IO;break;}
-        if(m->last_int&LM_DATA_DONE){result=lm_wait_clear(m,LM_STATUS,3);break;}
+        if(m->last_int&LM_DATA_DONE){
+            if(masked){m->critical_exit(m->ctx,saved);masked=false;}
+            result=lm_wait_clear(m,LM_STATUS,3);break;
+        }
         if(m->ticks(m->ctx)-began>=m->timeout){result=LM_TIMEOUT;break;}
     }
     if(result==LM_OK)result=lm_card_ready(m);
 restore:
+    if(masked){m->critical_exit(m->ctx,saved);masked=false;}
     if(result!=LM_OK && started)(void)lm_recover_read(m);
     m->write(m->ctx,LM_INT,events);m->write(m->ctx,LM_INTEN,mask);
 leave:
-    if(m->critical_exit)m->critical_exit(m->ctx,saved);
+    if(masked)m->critical_exit(m->ctx,saved);
     return result;
 }
 static inline int
@@ -283,11 +306,14 @@ lancelot_msdc_flush(struct lancelot_msdc *m)
 {
     if(!m->media_write_enabled)return LM_CONFIG;
     if((m->critical_enter==NULL)!=(m->critical_exit==NULL))return LM_CONFIG;
-    uint64_t saved=m->critical_enter?m->critical_enter(m->ctx):0;
+    /* Flush has no FIFO payload. Serialize the controller and mask its own
+     * events, while allowing the CPU to service timers and reschedule. */
+    uint32_t mask=m->read(m->ctx,LM_INTEN);
+    m->write(m->ctx,LM_INTEN,mask&~LM_EVENTS);
     int result=lm_card_ready(m);
     if(result==LM_OK)result=lm_command(m,6u|(7u<<7),(3u<<24)|(32u<<16)|(1u<<8));
     if(result==LM_OK)result=lm_card_ready(m);
-    if(m->critical_exit)m->critical_exit(m->ctx,saved);
+    m->write(m->ctx,LM_INTEN,mask);
     return result;
 }
 #endif

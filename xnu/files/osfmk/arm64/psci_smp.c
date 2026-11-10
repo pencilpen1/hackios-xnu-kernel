@@ -37,6 +37,7 @@
 #include <kern/misc_protos.h>
 #include <kern/thread.h>
 #include <kern/sched_prim.h>
+#include <kern/lancelot_sched.h>
 #include <kern/processor.h>
 #include <libkern/kernel_mach_header.h>
 #include <machine/atomic.h>
@@ -96,6 +97,11 @@ _Static_assert(__builtin_offsetof(struct psci_smp_entry_note, vector) == 32 &&
     __builtin_offsetof(struct psci_smp_entry_note, final_el) == 64 &&
     __builtin_offsetof(struct psci_smp_entry_note, fault_esr) == 96, "entry assembly note offsets");
 static bool psci_smp_mtk;
+static uint64_t lancelot_sched_fast_cpus, lancelot_sched_slow_cpus;
+uint64_t lancelot_sched_capacity_mask(bool fast)
+{
+	return os_atomic_load(fast ? &lancelot_sched_fast_cpus : &lancelot_sched_slow_cpus, acquire);
+}
 static bool psci_smp_cache_enabled;
 static bool psci_smp_cache_test_enabled, psci_smp_cache_test_started;
 extern kern_return_t thread_terminate(thread_t);
@@ -142,6 +148,8 @@ psci_smp_capture_cache(void)
 void
 psci_smp_report_caches(void)
 {
+	if (psci_smp_mtk) printf("lancelot-sched: fast_mask=%llx slow_mask=%llx source=per_CPU_MIDR_MPIDR policy=idle_capacity fallback=all_CPUs bind=0\n",
+	    lancelot_sched_capacity_mask(true), lancelot_sched_capacity_mask(false));
 	if (!psci_smp_cache_enabled) return;
 	for (unsigned cpu = 0; cpu <= (unsigned)ml_get_max_cpu_number(); cpu++) {
 		struct psci_smp_cache_snapshot *s = &psci_smp_caches[cpu];
@@ -464,6 +472,11 @@ psci_smp_cpu_reached(uint32_t stage)
 void
 psci_smp_cpu_running(void)
 {
+	if (psci_smp_mtk && (unsigned)cpu_number() < 64) {
+		unsigned capacity = lsc_capacity_class(__builtin_arm_rsr64("MIDR_EL1"), __builtin_arm_rsr64("MPIDR_EL1"));
+		if (capacity) os_atomic_or(capacity == 2 ? &lancelot_sched_fast_cpus : &lancelot_sched_slow_cpus,
+		    UINT64_C(1) << cpu_number(), release);
+	}
 	if (psci_smp_cache_enabled) psci_smp_capture_cache();
 	psci_smp_cpu_reached(PSCI_SMP_CPU_RUNNING);
 	/* initCPU runs on the secondary with interrupts disabled. Publish the

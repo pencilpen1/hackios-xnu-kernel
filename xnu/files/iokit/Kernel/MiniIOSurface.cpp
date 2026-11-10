@@ -946,7 +946,7 @@ class IOSurfaceRootUserClient : public IOUserClient
 	IOExternalTrap                  fTraps[kSurfaceTrapCount];
 
 	struct minisurf_client_ref * findRef(uint32_t sid, bool detached);
-	struct minisurf_client_ref * addRef(MiniIOSurface * surface);
+	struct minisurf_client_ref * addRef(MiniIOSurface * surface, bool * known = NULL);
 	void dropRef(struct minisurf_client_ref * ref);
 	IOReturn returnSurface(struct minisurf_client_ref * ref, bool known, IOExternalMethodArguments * args);
 
@@ -1043,7 +1043,8 @@ IOSurfaceRootUserClient::free(void)
 	IOUserClient::free();
 }
 
-/* All three with the lock held. */
+/* All three enter and return with the lock held. addRef drops it while
+ * preparing mappings; its caller must retain the client across that wait. */
 struct minisurf_client_ref *
 IOSurfaceRootUserClient::findRef(uint32_t sid, bool detached)
 {
@@ -1056,18 +1057,51 @@ IOSurfaceRootUserClient::findRef(uint32_t sid, bool detached)
 }
 
 struct minisurf_client_ref *
-IOSurfaceRootUserClient::addRef(MiniIOSurface * surface)
+IOSurfaceRootUserClient::addRef(MiniIOSurface * surface, bool * known)
 {
-	struct minisurf_client_ref * ref;
-	IOMemoryMap * map;
+	struct minisurf_client_ref * ref = NULL;
+	IOMemoryMap * map = NULL, * pixelMap = NULL;
+	if (known != NULL) *known = false;
 	if (fClosing || fNextRefGeneration == UINT64_MAX) return NULL;
 
+	/* GPU preparation can own one root while waiting for a CPU writer on
+	 * another. That writer needs gSurfaceLock to unlock/close. Never keep
+	 * the table locked while waiting for a GPU reservation or creating VM
+	 * mappings. Hold the surface itself, not an fRefs pointer: concurrent
+	 * lookup, detach and close can replace or move the entire ref array. */
+	surfaceHold(surface);
+	IOLockUnlock(gSurfaceLock);
+	int mappingError = surface->maliCpuLease != NULL ? surface->maliCpuLease->lockMapping(false) : LMAL_OK;
+	bool needsPixelMap = surface->client != NULL && surface->clientTask != fTask;
+	if (mappingError == LMAL_OK) {
+		map = surface->memory->createMappingInTask(fTask, 0, kIOMapAnywhere);
+		if (map != NULL && needsPixelMap) {
+			pixelMap = surface->client->createMappingInTask(fTask, 0, kIOMapAnywhere);
+		}
+		if (surface->maliCpuLease != NULL) surface->maliCpuLease->unlockMapping();
+	}
+	IOLockLock(gSurfaceLock);
+	if (fClosing) goto out;
+	/* A competing lookup may have published a ref during our wait. Reuse
+	 * it, including its generation and CPU counts; discard only our maps. */
+	ref = findRef(surface->sid, false);
+	if (ref != NULL) {
+		if (known != NULL) *known = true;
+		goto out;
+	}
+	if (map == NULL || (needsPixelMap && pixelMap == NULL)) {
+		IOLog("MiniIOSurface: cannot map surface %u (%u bytes) into the client, lease error %d\n",
+		    surface->sid, surface->info.allocSize, mappingError);
+		goto out;
+	}
+	if (fNextRefGeneration == UINT64_MAX) goto out;
 	if (fRefCount == fRefCapacity) {
+		if (fRefCapacity > UINT32_MAX / 2) goto out;
 		uint32_t capacity = fRefCapacity ? fRefCapacity * 2 : 16;
 		struct minisurf_client_ref * refs = IONew(struct minisurf_client_ref, capacity);
 
 		if (refs == NULL) {
-			return NULL;
+			goto out;
 		}
 		if (fRefs != NULL) {
 			memcpy(refs, fRefs, fRefCount * sizeof(*refs));
@@ -1076,23 +1110,18 @@ IOSurfaceRootUserClient::addRef(MiniIOSurface * surface)
 		fRefs = refs;
 		fRefCapacity = capacity;
 	}
-	if (surface->maliCpuLease != NULL && surface->maliCpuLease->lockMapping(false) != LMAL_OK)
-		return NULL;
-	map = surface->memory->createMappingInTask(fTask, 0, kIOMapAnywhere);
-	if (surface->maliCpuLease != NULL) surface->maliCpuLease->unlockMapping();
-	if (map == NULL) {
-		IOLog("MiniIOSurface: cannot map surface %u (%u bytes) into the client\n", surface->sid, surface->info.allocSize);
-		return NULL;
-	}
 	ref = &fRefs[fRefCount++];
 	bzero(ref, sizeof(*ref));
 	ref->surface = surface;
 	ref->maliGeneration = ++fNextRefGeneration;
 	ref->map = map;
-	if (surface->client != NULL && surface->clientTask != fTask) {
-		ref->pixelMap = surface->client->createMappingInTask(fTask, 0, kIOMapAnywhere);
-	}
-	surfaceHold(surface);
+	ref->pixelMap = pixelMap;
+	return ref;                            /* transfer the temporary surface hold */
+
+out:
+	OSSafeReleaseNULL(map);
+	OSSafeReleaseNULL(pixelMap);
+	surfaceUnhold(surface);
 	return ref;
 }
 
@@ -1273,18 +1302,22 @@ IOSurfaceRootUserClient::methodCreate(IOExternalMethodArguments * args)
 	}
 
 	uint64_t mapped_at = mach_absolute_time();
+	bool known = false;
+	bool bigSurface = s->info.allocSize >= SURFACE_KEEP_FROM;
+	retain();
 	IOLockLock(gSurfaceLock);
-	ref = addRef(s);
+	ref = addRef(s, &known);
 	ret = ref ? returnSurface(ref, false, args) : kIOReturnNoMemory;
-	if (ref != NULL && ret != kIOReturnSuccess) {
+	if (ref != NULL && !known && ret != kIOReturnSuccess) {
 		dropRef(ref);
 	}
 	surfaceUnhold(s);                       /* the creator's hold; the client's own is in the ref */
 	IOLockUnlock(gSurfaceLock);
+	release();
 	mapped_at = mach_absolute_time() - mapped_at;
 	OSAddAtomic64((SInt64) (mach_absolute_time() - began), (SInt64 *) &gSurfaceMaking);
 	OSIncrementAtomic(&gSurfacesMade);
-	if (s->info.allocSize >= SURFACE_KEEP_FROM) {
+	if (bigSurface) {
 		/* the big ones (the window server's of the whole display): where the time to make one goes, every 5 s */
 		static uint64_t since, all, making, mapping;
 		static uint32_t count;
@@ -1326,6 +1359,7 @@ IOSurfaceRootUserClient::methodLookup(IOExternalMethodArguments * args)
 		return kIOReturnBadArgument;
 	}
 	sid = (uint32_t) args->scalarInput[0];
+	retain();
 	IOLockLock(gSurfaceLock);
 	ref = findRef(sid, false);
 	if (ref == NULL && sid != 0 && sid < MINISURF_TABLE_SIZE && gSurfaceTable[sid] != NULL) {
@@ -1338,6 +1372,7 @@ IOSurfaceRootUserClient::methodLookup(IOExternalMethodArguments * args)
 		ret = returnSurface(ref, false, args);
 	}
 	IOLockUnlock(gSurfaceLock);
+	release();
 	return ret;
 }
 
@@ -1369,14 +1404,16 @@ IOSurfaceRootUserClient::methodLookupFromPort(IOExternalMethodArguments * args)
 		OSSafeReleaseNULL(obj);
 		return kIOReturnBadArgument;
 	}
+	retain();
 	IOLockLock(gSurfaceLock);
 	ref = findRef(right->surface->sid, false);
 	known = ref != NULL;
 	if (ref == NULL) {
-		ref = addRef(right->surface);
+		ref = addRef(right->surface, &known);
 	}
 	ret = ref ? returnSurface(ref, known, args) : kIOReturnNoMemory;
 	IOLockUnlock(gSurfaceLock);
+	release();
 	if (right->surface->traced) {
 		char procname[32] = "?";
 		uint32_t format = right->surface->info.pixelFormat, nonzero = 0, first = 0, middle = 0;

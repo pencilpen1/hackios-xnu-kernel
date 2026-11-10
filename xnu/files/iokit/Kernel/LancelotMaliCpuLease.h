@@ -39,8 +39,9 @@ class LancelotMaliCpuLease : public OSObject {
     void *fBinding; /* retained VM-owned binding, installed only on fresh roots */
     IOAddressRange *fPages;
     uint32_t fPageCount, fCacheBits, fGpuCount, fReaders, fWriters, fCpuWaiters;
+    uint32_t fGpuWaiters, fCpuPriorityWaiters;
     uint32_t fIdleRootRetains;
-    uint64_t fLength, fNextCookie, fLastPair, fLastWriter;
+    uint64_t fLength, fNextCookie, fLastPair, fLastWriter, fCpuTicket, fGpuBarrier;
     struct { uint64_t cookie, pair; bool writer, published; } fSlots[SLOT_COUNT];
     struct { task_t task; uint32_t reads, writes; } fUsers[SLOT_COUNT];
     uint32_t fUserReads, fUserWrites;
@@ -161,7 +162,47 @@ class LancelotMaliCpuLease : public OSObject {
         IOLockWakeup(fGate, &fGpuCount, false);
         IOLockWakeup(fGate, &fReaders, false);
     }
-    bool cpuConflict(task_t own, bool legacy) const {
+    int addCpuWaiter(uint64_t *ticket) {
+        if (!ticket || fCpuWaiters == UINT32_MAX) return LMAL_EBUSY;
+        if (fCpuTicket == UINT64_MAX) {
+            if (fCpuWaiters || fGpuWaiters) return LMAL_EBUSY;
+            fCpuTicket = 0;
+        }
+        *ticket = ++fCpuTicket;
+        ++fCpuWaiters;
+        return LMAL_OK;
+    }
+    void removeCpuWaiter(uint64_t ticket) {
+        if (fGpuWaiters && ticket && ticket <= fGpuBarrier && fCpuPriorityWaiters)
+            --fCpuPriorityWaiters;
+        if (fCpuWaiters) --fCpuWaiters;
+        IOLockWakeup(fGate, &fReaders, false);
+        IOLockWakeup(fGate, &fGpuCount, false);
+    }
+    bool gpuTurnBlocksCpu(uint64_t ticket) const {
+        return fGpuWaiters && ticket > fGpuBarrier;
+    }
+    int addGpuWaiter() {
+        if (fGpuWaiters == UINT32_MAX) return LMAL_EBUSY;
+        if (!fGpuWaiters) {
+            /* CPU observers already queued keep their place. Readers arriving
+             * after this barrier wait until the pending GPU turn has begun. */
+            fGpuBarrier = fCpuTicket;
+            fCpuPriorityWaiters = fCpuWaiters;
+        }
+        ++fGpuWaiters;
+        return LMAL_OK;
+    }
+    void removeGpuWaiter() {
+        if (fGpuWaiters) --fGpuWaiters;
+        if (!fGpuWaiters) {
+            fGpuBarrier = 0;
+            fCpuPriorityWaiters = 0;
+        }
+        IOLockWakeup(fGate, &fGpuCount, false);
+        IOLockWakeup(fGate, &fReaders, false);
+    }
+    bool cpuConflict(task_t own, bool legacy, bool queued = false) const {
         uint32_t reads = fUserReads, writes = fUserWrites;
         if (legacy)
             for (uint32_t i = 0; i < SLOT_COUNT; ++i) if (fUsers[i].task == own) {
@@ -171,8 +212,21 @@ class LancelotMaliCpuLease : public OSObject {
          * root. Already-queued GPU cookies still complete. An existing user
          * writer may need GPU work to finish its own lock, so do not block
          * that dependency before it releases the logical write ownership. */
+        uint32_t cpuWaiters = queued ? fCpuPriorityWaiters : fCpuWaiters;
         return fReaders || fWriters || reads || writes ||
-            (legacy && fCpuWaiters && !fWriters && !fUserWrites);
+            (legacy && cpuWaiters && !fWriters && !fUserWrites);
+    }
+    /* Called with fGate held. A queued GPU turn remembers which CPU waiters
+     * arrived first and closes the reader gate only against later arrivals. */
+    int awaitGpuTurn(task_t own, bool legacy, uint64_t end, bool waitCpu) {
+        if (!cpuConflict(own, legacy) || fError) return LMAL_OK;
+        if (!waitCpu) return LMAL_EBUSY;
+        int ret = addGpuWaiter();
+        if (ret) return ret;
+        while (cpuConflict(own, legacy, true) && !fError)
+            if (!sleepUntil(&fReaders, end)) { ret = LMAL_ETIMEDOUT; break; }
+        removeGpuWaiter();
+        return ret;
     }
     static LancelotMaliCpuLease *rootFailure(LancelotMaliCpuLease *s, lmal_cpu_lease_why *why,
         uint32_t step, uint32_t detail, uint64_t value) {
@@ -263,7 +317,8 @@ public:
     bool canRecycle(IOBufferMemoryDescriptor *memory) {
         IOLockLock(fGate);
         bool safe=memory==fRoot && getRetainCount()==1 && fIdleRootRetains &&
-            fRoot->getRetainCount()==fIdleRootRetains && !fGpuCount && !fCpuWaiters && !fReaders && !fWriters &&
+            fRoot->getRetainCount()==fIdleRootRetains && !fGpuCount && !fCpuWaiters && !fGpuWaiters &&
+            !fCpuPriorityWaiters && !fReaders && !fWriters &&
             !fUserReads && !fUserWrites && !fFrozen && !fGpuRetain && !fError && !fWriteError && !fQuarantined &&
             objectValid(false,true) && cacheValid() &&
             lmal_cpu_vm_binding_verify(fObject,fBinding,this,false)==LMAL_OK;
@@ -283,7 +338,7 @@ public:
     }
     void unlockMapping() { IOLockUnlock(fGate); }
     int beginGpu(uint64_t remaining_ns, uint64_t *cookie, bool requireBlock = true, bool writer = true, bool waitCpu = true,
-        bool *firstGpu = NULL) {
+        bool *firstGpu = NULL, void (*firstGpuSync)(void *, size_t) = NULL) {
         if (firstGpu) *firstGpu = false;
         if (!cookie || !remaining_ns) return LMAL_EINVAL;
         *cookie = 0;
@@ -294,11 +349,8 @@ public:
         for (uint32_t i = 0; i < SLOT_COUNT; ++i)
             ownsUserLock |= fUsers[i].task == own && (fUsers[i].reads || fUsers[i].writes);
         if (requireBlock && ownsUserLock) { IOLockUnlock(fGate); return LMAL_ENOTSUP; }
-        if (!waitCpu && cpuConflict(own, !requireBlock) && !fError) {
-            IOLockUnlock(fGate); return LMAL_EBUSY;
-        }
-        while (cpuConflict(own, !requireBlock) && !fError)
-            if (!sleepUntil(&fReaders, end)) { IOLockUnlock(fGate); return LMAL_ETIMEDOUT; }
+        int turn = awaitGpuTurn(own, !requireBlock, end, waitCpu);
+        if (turn) { IOLockUnlock(fGate); return turn; }
         if (fError || fQuarantined) { int e = fError ? fError : LMAL_EIO; IOLockUnlock(fGate); return e; }
         uint32_t slot;
         for (slot = 0; slot < SLOT_COUNT && fSlots[slot].cookie; ++slot) {}
@@ -334,6 +386,10 @@ public:
                     IOLockUnlock(fGate); release(); return proof ? LMAL_EIO : LMAL_ENOTSUP;
                 }
             }
+            /* A second submitter may share this frozen root as soon as its
+             * cookie is visible. Complete the first PoC handoff and DSB
+             * under the gate, and charge it to the same preparation budget. */
+            if (firstGpuSync) firstGpuSync(cacheAddress(), fLength);
             /* CPU alias exclusion/refault is preparation, not a fresh GPU
              * budget. Exhaustion after preparing must unwind before the
              * cookie is published; no job/fence has been accepted yet. */
@@ -420,28 +476,28 @@ public:
     }
     int waitCpu(uint64_t remaining_ns) {
         IOLockLock(fGate);
-        if(fCpuWaiters==UINT32_MAX){IOLockUnlock(fGate);return LMAL_EBUSY;}
-        ++fCpuWaiters;
+        uint64_t ticket = 0;
+        int ret = addCpuWaiter(&ticket);
+        if (ret) { IOLockUnlock(fGate); return ret; }
         uint64_t end = deadline(remaining_ns);
-        int ret=LMAL_OK;
-        while (fGpuCount && !fError)
+        while ((fGpuCount || gpuTurnBlocksCpu(ticket)) && !fError)
             if (!sleepUntil(&fGpuCount, end)) {ret=LMAL_ETIMEDOUT;break;}
         if(!ret)ret=fError ? fError : fQuarantined ? LMAL_EIO : fWriteError;
-        --fCpuWaiters;IOLockWakeup(fGate,&fReaders,false);
+        removeCpuWaiter(ticket);
         IOLockUnlock(fGate); return ret;
     }
     int beginCpuRead(uint64_t remaining_ns) {
         IOLockLock(fGate);
-        if(fCpuWaiters==UINT32_MAX){IOLockUnlock(fGate);return LMAL_EBUSY;}
-        ++fCpuWaiters;
+        uint64_t ticket = 0;
+        int ret = addCpuWaiter(&ticket);
+        if (ret) { IOLockUnlock(fGate); return ret; }
         uint64_t end = deadline(remaining_ns);
-        int ret=LMAL_OK;
-        while ((fGpuCount || fWriters || fUserWrites) && !fError)
+        while ((fGpuCount || fWriters || fUserWrites || gpuTurnBlocksCpu(ticket)) && !fError)
             if (!sleepUntil(&fGpuCount, end)) {ret=LMAL_ETIMEDOUT;break;}
         if(!ret && (fError || fWriteError || fQuarantined || fReaders == UINT32_MAX))
             ret=fError ? fError : fWriteError ? fWriteError : LMAL_EBUSY;
         if(!ret){++fReaders;retain();}
-        --fCpuWaiters;IOLockWakeup(fGate,&fReaders,false);
+        removeCpuWaiter(ticket);
         IOLockUnlock(fGate); return ret;
     }
     void endCpuRead() {
@@ -454,13 +510,20 @@ public:
     }
     int beginCpuWrite(uint64_t remaining_ns) {
         IOLockLock(fGate);
+        uint64_t ticket = 0;
+        int waiter = addCpuWaiter(&ticket);
+        if (waiter) { IOLockUnlock(fGate); return waiter; }
         uint64_t end = deadline(remaining_ns);
-        while ((fGpuCount || fReaders || fWriters || fUserReads || fUserWrites) && !fError)
-            if (!sleepUntil(&fReaders, end)) { IOLockUnlock(fGate); return LMAL_ETIMEDOUT; }
+        int ret = LMAL_OK;
+        while ((fGpuCount || fReaders || fWriters || fUserReads || fUserWrites || gpuTurnBlocksCpu(ticket)) && !fError)
+            if (!sleepUntil(&fReaders, end)) { ret = LMAL_ETIMEDOUT; break; }
+        if (ret) { removeCpuWaiter(ticket); IOLockUnlock(fGate); return ret; }
         if (fError || fQuarantined) {
-            int e = fError ? fError : LMAL_EIO; IOLockUnlock(fGate); return e;
+            int e = fError ? fError : LMAL_EIO;
+            removeCpuWaiter(ticket); IOLockUnlock(fGate); return e;
         }
         fWriters = 1; retain();
+        removeCpuWaiter(ticket);
         IOLockUnlock(fGate); return LMAL_OK;
     }
     void endCpuWrite() {
@@ -475,6 +538,9 @@ public:
     int beginUserCpu(task_t task, bool writer, uint64_t remaining_ns) {
         if (!task || task != current_task()) return LMAL_EPERM;
         IOLockLock(fGate);
+        uint64_t ticket = 0;
+        int waiter = addCpuWaiter(&ticket);
+        if (waiter) { IOLockUnlock(fGate); return waiter; }
         uint64_t end = deadline(remaining_ns);
         for (;;) {
             uint32_t ownWrites = 0, ownReads = 0;
@@ -482,16 +548,19 @@ public:
                 if (fUsers[i].task == task) { ownWrites = fUsers[i].writes; ownReads = fUsers[i].reads; }
             /* Mixed modes cannot wait for a lock held by this same task. */
             if ((writer && ownReads) || (!writer && ownWrites)) {
-                IOLockUnlock(fGate); return LMAL_EBUSY;
+                removeCpuWaiter(ticket); IOLockUnlock(fGate); return LMAL_EBUSY;
             }
             bool conflict = fGpuCount || fWriters || (fUserWrites > ownWrites) ||
-                (writer && (fReaders || fUserReads));
+                (writer && (fReaders || fUserReads)) ||
+                (gpuTurnBlocksCpu(ticket) && !ownReads && !ownWrites);
             if (!conflict || fError) break;
-            if (!sleepUntil(&fReaders, end)) { IOLockUnlock(fGate); return LMAL_ETIMEDOUT; }
+            if (!sleepUntil(&fReaders, end)) {
+                removeCpuWaiter(ticket); IOLockUnlock(fGate); return LMAL_ETIMEDOUT;
+            }
         }
         if (fError || fQuarantined || (!writer && fWriteError)) {
             int e = fError ? fError : fWriteError ? fWriteError : LMAL_EIO;
-            IOLockUnlock(fGate); return e;
+            removeCpuWaiter(ticket); IOLockUnlock(fGate); return e;
         }
         uint32_t slot = SLOT_COUNT, empty = SLOT_COUNT;
         /* An earlier empty slot must not split one task into two ownership
@@ -502,12 +571,12 @@ public:
         }
         if (slot == SLOT_COUNT) slot = empty;
         if (slot == SLOT_COUNT || (writer ? fUserWrites : fUserReads) == UINT32_MAX) {
-            IOLockUnlock(fGate); return LMAL_EBUSY;
+            removeCpuWaiter(ticket); IOLockUnlock(fGate); return LMAL_EBUSY;
         }
         if (!fUsers[slot].task) { fUsers[slot].task = task; task_reference(task); }
         if (writer) { ++fUsers[slot].writes; ++fUserWrites; }
         else { ++fUsers[slot].reads; ++fUserReads; }
-        retain(); IOLockUnlock(fGate); return LMAL_OK;
+        retain(); removeCpuWaiter(ticket); IOLockUnlock(fGate); return LMAL_OK;
     }
     void endUserCpu(task_t task, bool writer) {
         IOLockLock(fGate);
@@ -536,7 +605,8 @@ public:
         IOLockUnlock(fGate); return proof;
     }
     virtual void free() APPLE_KEXT_OVERRIDE {
-        if (fGpuCount || fCpuWaiters || fReaders || fWriters || fUserReads || fUserWrites || fGpuRetain || fFrozen ||
+        if (fGpuCount || fCpuWaiters || fGpuWaiters || fCpuPriorityWaiters || fReaders || fWriters ||
+            fUserReads || fUserWrites || fGpuRetain || fFrozen ||
             (fHolder && fHolder->fRedirUPL)) {
             /* Retains normally make this unreachable. Fail closed on an
              * ownership bug rather than auto-commit a live UPL/descriptors. */
@@ -568,6 +638,8 @@ public:
         if (!root) return true;
         if (fHeld) return false;
         uint32_t i = 0;
+        /* All GPU submission paths order these same gate objects, including
+         * HakiosSurfaceHandoff. Memory descriptor addresses are not the key. */
         while (i < fCount && (uintptr_t)fRoots[i] < (uintptr_t)root) ++i;
         if (i < fCount && fRoots[i] == root) return true;
         if (fCount == MAX_ROOTS) return false;

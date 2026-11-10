@@ -5,6 +5,7 @@
  * separately opt-in and restricted by lancelot_data_disk.inc; no other CPU.
  */
 #include <kern/locks.h>
+#include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <libkern/libkern.h>
 #include <machine/machine_routines.h>
@@ -47,6 +48,8 @@ static int block_major = -1;
 static uint64_t counter_frequency, sector_reads, io_errors, logical_reads, logical_bytes;
 static uint64_t pio_us, file_read_us, lock_wait_us, initial_cfg, bus_width;
 static uint64_t max_read_blocks = 1, active_clock_hz, mode_fallbacks;
+static uint64_t mmc_mask_began, mmc_mask_total, mmc_mask_max, mmc_mask_count;
+static uint64_t mmc_idle_wait_count;
 static uint32_t image_read_diagnostics;
 static struct lmd_observer mmc_observer;
 /* Immutable after the first transport failure; publish without console I/O
@@ -140,6 +143,7 @@ static uint64_t mmc_enter(__unused void *ctx) {
     os_atomic_store(&mmc_observer.phase,LMD_PHASE_MASK_IRQ,relaxed);
     uint64_t state=__builtin_arm_rsr64("DAIF");
     __builtin_arm_wsr("DAIFSet",DAIFSC_IRQF|DAIFSC_FIQF);
+    mmc_mask_began=__builtin_arm_rsr64("CNTVCT_EL0");
     os_atomic_store(&mmc_observer.phase,LMD_PHASE_PIO,relaxed);
     return state;
 }
@@ -148,8 +152,28 @@ static void mmc_leave(__unused void *ctx, uint64_t state) {
     /* ml_set_interrupts_enabled(TRUE) can run ast_taken_kernel() before
      * enabling IRQs. Restore the full caller state without entering that
      * scheduler path while the native controller mutex is still held. */
+    uint64_t elapsed=__builtin_arm_rsr64("CNTVCT_EL0")-mmc_mask_began;
     __builtin_arm_wsr64("DAIF",state);
+    os_atomic_add(&mmc_mask_total,elapsed,relaxed);
+    os_atomic_inc(&mmc_mask_count,relaxed);
+    if(elapsed>os_atomic_load(&mmc_mask_max,relaxed))os_atomic_store(&mmc_mask_max,elapsed,relaxed);
     os_atomic_store(&mmc_observer.phase,LMD_PHASE_IRQ_RESTORED,relaxed);
+}
+static void mmc_idle_wait(__unused void *ctx) {
+    /* Called with the controller mutex held but no live FIFO payload. The
+     * remaining width-negotiation/early callers may still mask interrupts. */
+    if(ml_get_interrupts_enabled()) {
+        os_atomic_inc(&mmc_idle_wait_count,relaxed);
+        delay_for_interval(100,NSEC_PER_USEC);
+    }
+}
+void lancelot_mmc_report_latency(void);
+void lancelot_mmc_report_latency(void) {
+    if(!counter_frequency)return;
+    printf("lancelot-mmc-sched: masks=%llu total_us=%llu max_us=%llu card_yields=%llu batch=%llu\n",
+        os_atomic_load(&mmc_mask_count,relaxed),elapsed_us(0,os_atomic_load(&mmc_mask_total,relaxed)),
+        elapsed_us(0,os_atomic_load(&mmc_mask_max,relaxed)),
+        os_atomic_load(&mmc_idle_wait_count,relaxed),max_read_blocks);
 }
 static void mmc_report_native_failure(void) {
     if(!os_atomic_load(&mmc_native_failure_ready,acquire) ||
@@ -398,6 +422,7 @@ lancelot_emmc_init(void)
 	controller.ticks = mmc_ticks; controller.timeout = frequency / 2; /* 500 ms maximum per phase */
 	controller.read_fifo = mmc_fifo_words; controller.write_fifo = mmc_fifo_write_words;
 	controller.critical_enter = mmc_enter; controller.critical_exit = mmc_leave;
+	controller.idle_wait = mmc_idle_wait;
 	controller.rca = offer.rca;
 	initial_cfg = mmc_read_register(NULL, LM_CFG);
 	uint32_t width = (mmc_read_register(NULL, LM_BUS_CFG) >> 16) & 3;
@@ -409,7 +434,9 @@ lancelot_emmc_init(void)
 		printf("lancelot-emmc: native superblock does not match firmware digest\n");
 		failed = true; return;
 	}
-	uint32_t tune = 1, wanted_width = offer.max_bus_width, wanted_blocks = LM_MAX_BLOCKS;
+	/* At 48 MHz SDR a 64 KiB masked PIO transfer already exceeds 1 ms
+	 * before software overhead. Split at 8 KiB to bound timer/IPI latency. */
+	uint32_t tune = 1, wanted_width = offer.max_bus_width, wanted_blocks = 16;
 	(void)PE_parse_boot_argn("lancelot_mmc_tune", &tune, sizeof(tune));
 	(void)PE_parse_boot_argn("lancelot_mmc_width", &wanted_width, sizeof(wanted_width));
 	(void)PE_parse_boot_argn("lancelot_mmc_blocks", &wanted_blocks, sizeof(wanted_blocks));

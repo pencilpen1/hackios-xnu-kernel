@@ -508,6 +508,10 @@ struct hkmt_wait_observation {
     uint64_t sleep_ns, max_sleep_ns;
     uint32_t polls, sleeps;
 };
+#include "lancelot_mali_trace.h"
+static uint32_t mali_trace;
+static struct lm_trace_gate hkmt_slow_gate;
+static uint64_t hkmt_slow_jobs, hkmt_slow_reports;
 
 static bool
 hkmt_poll_job(uint32_t at, uint32_t mask, uint32_t want,
@@ -967,16 +971,25 @@ lancelot_hakios_mali_submit(uint64_t chain, bool fragment)
 	lck_mtx_unlock(&hkmt_lock);
 	lck_mtx_unlock(&mali_job_lock);
     hkmt_job.completed_ns=clock_ns(NULL);hkmt_job.elapsed_ns=hkmt_job.completed_ns-hkmt_job.started_ns;
-    if(hkmt_job.jm.end_ns-hkmt_job.jm.start_ns>=UINT64_C(10000000)) {
+    bool slow=hkmt_job.jm.end_ns-hkmt_job.jm.start_ns>=UINT64_C(10000000);
+    if(slow)__atomic_fetch_add(&hkmt_slow_jobs,1,__ATOMIC_RELAXED);
+    /* Diagnostics run before completion/fence callbacks: every blur pass
+     * must not pay for four console lines while holding mali_lock. Mode 2
+     * retains bounded samples; hardware errors are always reported. */
+    if(status || (slow && lm_trace_job(&hkmt_slow_gate,mali_trace,
+        entered,hkmt_job.jm.start_ns,hkmt_job.completed_ns,false))) {
+        __atomic_fetch_add(&hkmt_slow_reports,1,__ATOMIC_RELAXED);
         cpu_profile_copy(&cpu_after);
         uint64_t worker_cpu_ended=thread_ns(NULL);
-        printf("lancelot-hakios-cpu: seq=%llu at=%llu sample_ns=%llu age_us=%llu valid_mask=%#x hz_valid=%#x ll_hz=%llu big_hz=%llu c0=%u c1=%u c2=%u c3=%u c4=%u c5=%u c6=%u c7=%u worker_cpu_us=%llu cpu_scope=scheduler_window hz_scope=PLL_mux_derived\n",
+        printf("lancelot-hakios-cpu: seq=%llu at=%llu sample_ns=%llu age_us=%llu valid_mask=%#x hz_valid=%#x ll_hz=%llu big_hz=%llu worker_cpu_us=%llu\n",
             hkmt_exec_seq,hkmt_job.completed_ns/1000,cpu_before.sampled_ns,
             cpu_before.sampled_ns&&hkmt_job.started_ns>=cpu_before.sampled_ns?(hkmt_job.started_ns-cpu_before.sampled_ns)/1000:UINT64_MAX,
             cpu_before.valid_mask,cpu_before.hz_valid_mask,cpu_before.hz[0],cpu_before.hz[1],
-            cpu_before.busy_bps[0],cpu_before.busy_bps[1],cpu_before.busy_bps[2],cpu_before.busy_bps[3],
-            cpu_before.busy_bps[4],cpu_before.busy_bps[5],cpu_before.busy_bps[6],cpu_before.busy_bps[7],
             worker_cpu_ended>=worker_cpu_began?(worker_cpu_ended-worker_cpu_began)/1000:0);
+        printf("lancelot-hakios-load: seq=%llu c0=%u c1=%u c2=%u c3=%u c4=%u c5=%u c6=%u c7=%u scope=scheduler_window\n",
+            hkmt_exec_seq,
+            cpu_before.busy_bps[0],cpu_before.busy_bps[1],cpu_before.busy_bps[2],cpu_before.busy_bps[3],
+            cpu_before.busy_bps[4],cpu_before.busy_bps[5],cpu_before.busy_bps[6],cpu_before.busy_bps[7]);
         printf("lancelot-hakios-cpu-after: seq=%llu at=%llu sample_ns=%llu valid_mask=%#x hz_valid=%#x ll_hz=%llu big_hz=%llu c0=%u c1=%u c2=%u c3=%u c4=%u c5=%u c6=%u c7=%u\n",
             hkmt_exec_seq,hkmt_job.completed_ns/1000,cpu_after.sampled_ns,cpu_after.valid_mask,cpu_after.hz_valid_mask,
             cpu_after.hz[0],cpu_after.hz[1],cpu_after.busy_bps[0],cpu_after.busy_bps[1],cpu_after.busy_bps[2],cpu_after.busy_bps[3],
@@ -1035,8 +1048,6 @@ static struct {
 } mali_queue[MALI_QUEUE];
 /* boot-arg mali_trace=1: a line for every job, "tl: j SEQ f|v q QUEUED b BEGAN e ENDED" in us of
  * mach_absolute_time, beside touch_lat's lines of the display's and the Metal driver's */
-static uint32_t mali_trace;
-#include "lancelot_mali_trace.h"
 static unsigned mali_queue_head, mali_queue_count;
 static uint64_t mali_queued_seq, mali_done_seq;
 static bool mali_worker_started;
@@ -1254,6 +1265,13 @@ int lancelot_hakios_mali_profile(uint64_t sequence,uint64_t times[4],uint32_t *h
     lck_mtx_unlock(&mali_queue_lock);return result;
 }
 
+/* Cumulative CPU cache-maintenance ranges, not GPU/DRAM hardware traffic.
+ * Use bounded lines in the existing five-second status: one long combined
+ * line loses the trailing DRAM fields in the boot log transport. */
+static uint64_t hkmt_cache_bytes[2], hkmt_cache_ns[2];
+#include "lancelot_dram_profile.inc"
+extern void lancelot_mmc_report_latency(void);
+
 static void
 mali_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -1262,9 +1280,21 @@ mali_thread(__unused void *parameter, __unused wait_result_t result)
 		lck_mtx_lock(&mali_wait_lock);
 		(void)lck_mtx_sleep_deadline(&mali_wait_lock,LCK_SLEEP_DEFAULT,(event_t)&mali_wait_event,THREAD_UNINT,nap);
 		lck_mtx_unlock(&mali_wait_lock);
+        struct lmd_clock dram=lmd_kernel_snapshot();
+        lancelot_mmc_report_latency();
+        printf("lancelot-hakios-diag: slow_jobs=%llu reports=%llu mode=%u\n",
+            __atomic_load_n(&hkmt_slow_jobs,__ATOMIC_RELAXED),
+            __atomic_load_n(&hkmt_slow_reports,__ATOMIC_RELAXED),mali_trace);
 		printf("mali: step %u of 6; user space says %u%s; %u clients, %u buffers, %u job chains (%u failed), %u pictures shown\n",
 		    reached, user_said, user_said == 1 ? " -- a program ran a job on the GPU" : "", gHakiosMaliClients, gHakiosMaliBuffers,
 		    gHakiosMaliSubmits, gHakiosMaliFailed, gHakiosMaliShown);
+		printf("mali-cache: cache_dev_bytes=%llu cache_cpu_bytes=%llu cache_dev_us=%llu cache_cpu_us=%llu\n",
+            __atomic_load_n(&hkmt_cache_bytes[0],__ATOMIC_RELAXED),
+            __atomic_load_n(&hkmt_cache_bytes[1],__ATOMIC_RELAXED),
+            __atomic_load_n(&hkmt_cache_ns[0],__ATOMIC_RELAXED)/1000,
+            __atomic_load_n(&hkmt_cache_ns[1],__ATOMIC_RELAXED)/1000);
+		printf("mali-dram: dram_valid=%u dram_mtps=%u dram_channels=%u dram_shuffle=%u dram_error=%d\n",
+            dram.valid,dram.mtps,dram.channels,dram.shuffle,dram.error);
 		lck_mtx_lock(&kept_lock);
 		for (uint32_t i = kept_next > KEPT_LINES ? kept_next - KEPT_LINES : 0; i < kept_next; i++) {
 			printf("kept: %s\n", kept_lines[i % KEPT_LINES]);
@@ -1337,6 +1367,14 @@ static int hkmt_dvfs_guard(void)
 
 void lancelot_hakios_cache_sync(void *address,size_t length,bool forCpu)
 {
+    uint64_t began=mali_trace?clock_ns(NULL):0;
     if(forCpu)for_cpu(NULL,address,length);
     else for_device(NULL,address,length);
+    if(mali_trace) {
+        uint64_t ended=clock_ns(NULL);
+        unsigned direction=forCpu?1:0;
+        __atomic_add_fetch(&hkmt_cache_bytes[direction],length,__ATOMIC_RELAXED);
+        if(began && ended>=began)
+            __atomic_add_fetch(&hkmt_cache_ns[direction],ended-began,__ATOMIC_RELAXED);
+    }
 }

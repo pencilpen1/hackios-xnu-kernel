@@ -42,6 +42,8 @@ for key in ("kernel", "root", "loader", "boot", "mu", "board"):
     assert path.stat().st_size == item["bytes"] and sha(path) == item["sha256"], key
 for name, digest in candidate["source_inputs"].items():
     assert sha(ROOT / "xnu/files" / name) == digest, name
+for name, digest in candidate.get("source_controls", {}).items():
+    assert sha(ROOT / name) == digest, name
 proof_files = (args.tests_result.resolve(), C.parent / "regressions-w1/result.json", C.parent / "static-hfs-w1/result.json")
 if args.gpu_tests_result:
     proof_files += (args.gpu_tests_result.resolve(),)

@@ -1006,7 +1006,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint6
 {
 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
 	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
-	uint64_t entered=began, gap_us=0;
+	uint64_t entered=began, gap_us=0, beatWait=0;
 	uint32_t layers = 0;
 	MiniIOSurface * recorded = NULL;
 	bool report;
@@ -1022,35 +1022,10 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint6
 			gpuReady = false;
 		}
 	}
-	/* Same root order as GPU lease acquisition. Hold reader ownership through
-	 * ALL draw/helper/record work; a later writer cannot enter after waitCpu. */
-	for (unsigned layer = 0; gpuReady && layer < SWAP_LAYERS; layer++) {
-		if (!queueReaders.add(surfaces[layer], (uint64_t)SWAP_GPU_MS * 1000000)) {
-			gpuReady = false;
-			break;
-		}
-		LancelotMaliCpuLease *lease = surfaces[layer] ? surfaces[layer]->maliCpuLease : NULL;
-		if (!readers.add(lease)) gpuReady = false;
-	}
-	if (gpuReady && readers.acquire((uint64_t)SWAP_GPU_MS * 1000000) != LMAL_OK)
-		gpuReady = false;
-	fStatWaiting += mach_absolute_time() - began;
-	if (!gpuReady) {
-		readers.releaseReaders();
-		IOLockLock(fSwapLock);
-		fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
-		fSwapsWaiting--;
-		fStatLost++;
-		IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
-		IOLockUnlock(fSwapLock);
-		queueReaders.releaseReaders();
-		IOLog("lancelot-present-drop: swap=%u at=%llu queue_us=%llu gpu_wait_us=%llu\n",
-		    swapWord(swap,SWAP_ID),micros(mach_absolute_time()),entered>=submitted?micros(entered-submitted):0,
-		    micros(mach_absolute_time()-entered));
-		return; /* no pixel algorithm, clearing, copying or record ran */
-	}
-	began = ready = mach_absolute_time();
-	if (gOnTheBeat) {
+	/* Pacing reads no pixels. Let the GPU use these retained surfaces
+	 * until the refresh delay ends, then acquire both reader gates. */
+	began = mach_absolute_time();
+	if (gpuReady && gOnTheBeat) {
 		uint64_t period, aim, next;
 
 		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
@@ -1070,10 +1045,40 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint6
 			clock_delay_until(next);
 			fBeat = next;
 			fStatOnBeat++;
-			fStatBeatWait += mach_absolute_time() - began;
+			beatWait = mach_absolute_time() - began;
+			fStatBeatWait += beatWait;
 			began = mach_absolute_time();
 		}
 	}
+	/* Same root order as GPU lease acquisition. Hold reader ownership through
+	 * ALL draw/helper/record work; a later writer cannot enter after waitCpu. */
+	for (unsigned layer = 0; gpuReady && layer < SWAP_LAYERS; layer++) {
+		if (!queueReaders.add(surfaces[layer], (uint64_t)SWAP_GPU_MS * 1000000)) {
+			gpuReady = false;
+			break;
+		}
+		LancelotMaliCpuLease *lease = surfaces[layer] ? surfaces[layer]->maliCpuLease : NULL;
+		if (!readers.add(lease)) gpuReady = false;
+	}
+	if (gpuReady && readers.acquire((uint64_t)SWAP_GPU_MS * 1000000) != LMAL_OK)
+		gpuReady = false;
+	fStatWaiting += mach_absolute_time() - entered - beatWait;
+	if (!gpuReady) {
+		readers.releaseReaders();
+		IOLockLock(fSwapLock);
+		fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
+		fSwapsWaiting--;
+		fStatLost++;
+		IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
+		IOLockUnlock(fSwapLock);
+		queueReaders.releaseReaders();
+		IOLog("lancelot-present-drop: swap=%u at=%llu queue_us=%llu gpu_wait_us=%llu\n",
+		    swapWord(swap,SWAP_ID),micros(mach_absolute_time()),entered>=submitted?micros(entered-submitted):0,
+		    micros(mach_absolute_time()-entered-beatWait));
+		return; /* no pixel algorithm, clearing, copying or record ran */
+	}
+	began = ready = mach_absolute_time();
+
 	shown = began;
 	/* its turn has come: the swap after it may be handed over */
 	IOLockLock(fSwapLock);
@@ -1226,7 +1231,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint6
 	if(total_us>=250000 || gap_us>=1000000)
 		IOLog("lancelot-present-latency: swap=%u at=%llu gap_us=%llu queue_us=%llu gpu_wait_us=%llu beat_us=%llu draw_us=%llu total_us=%llu\n",
 		    swapWord(swap,SWAP_ID),micros(drawn),gap_us,entered>=submitted?micros(entered-submitted):0,
-		    ready>=entered?micros(ready-entered):0,shown>=ready?micros(shown-ready):0,
+		    ready>=entered+beatWait?micros(ready-entered-beatWait):0,micros(beatWait),
 		    drawn>=shown?micros(drawn-shown):0,total_us);
 }
 

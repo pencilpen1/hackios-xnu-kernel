@@ -47,9 +47,13 @@ else:
         raise SystemExit("Existing path is not this task's isolated Wi-Fi source")
     # Reuse only our own build directory, never the user's development source.
     shutil.copytree(ROOT / "xnu/files", source, dirs_exist_ok=True)
+    run("scheduler-overlay", [sys.executable, ROOT / "tools/apply-lancelot-scheduler.py", source])
 
 inputs = {p.relative_to(ROOT / "xnu/files").as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
           for p in (ROOT / "xnu/files").rglob("*") if p.is_file()}
+control_paths = [ROOT / "xnu/apply.sh", ROOT / "xnu/redwood.patch", ROOT / "xnu/lancelot.patch",
+                 *sorted((ROOT / "tools").glob("apply-lancelot-*.py"))]
+controls = {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in control_paths}
 env = {**os.environ, "XNU_SRC": str(source), "PYTHONDONTWRITEBYTECODE": "1"}
 run("kernel", ["bash", args.workspace / "xnu-build.sh", "-j" + str(args.jobs), "build"], env)
 kernel = source / "BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837"
@@ -59,6 +63,8 @@ target = out / "mach.lancelot"
 shutil.copy2(kernel, target)
 record = {"passed": True, "full_kernel_compile_link": True, "hardware_verified": False,
           "source": str(source), "inputs": inputs, "runs": runs,
+          "overlay_controls": controls,
+          "scheduler_source_sha256": hashlib.sha256((source / "osfmk/kern/sched_prim.c").read_bytes()).hexdigest(),
           "kernel": {"path": str(target), "bytes": target.stat().st_size,
                      "sha256": hashlib.sha256(target.read_bytes()).hexdigest()}}
 (out / "result.json").write_text(json.dumps(record, indent=2) + "\n")

@@ -3,9 +3,9 @@
  * The service name and lancelot task authorization are adapted in LancelotMali.cpp.
  */
 /*
- * LancelotHakiosMali: the Infinix's Mali-G52 for programs to draw with.
+ * LancelotHakiosMali: lancelot's Mali-G52 for programs to draw with.
  *
- * bsd/dev/lancelot_hakios_mali.c brings the GPU up (boot-arg mali=1) and, once a job has run through its
+ * bsd/dev/lancelot_hakios_mali.inc brings the GPU up (lancelot_hakios=1) and, once a job has run through its
  * page tables, starts this service. A program that opens it speaks the interface of Linux's
  * panfrost DRM driver, the one Mesa's panfrost knows: every request is a call of the user client
  * with the request's number as the selector and its structure passed in and back -- as RedwoodGPU
@@ -14,11 +14,10 @@
  *
  * What there is: parameters, buffers (made, entered into the GPU's address space, told their
  * address, mapped, given back), and job chains. A buffer is wired kernel memory, zero when made and
- * write-combined, so what the program writes goes to memory where the GPU reads it. A job chain is
- * run to its end before the call returns, so waiting for a buffer has nothing left to wait for, and
- * the synchronisation objects Mesa asks about can all be answered "signalled" in the program
- * (tools/mesa/redwood-drm). Not here yet: jobs that overlap, an address space for each program,
- * interrupts, buffers shared between programs.
+ * write-combined for private BOs. Imported IOSurface pixels keep their owned WB
+ * mapping and explicit cache handoff. Submissions return after FIFO admission;
+ * BO sequences and surface fences become complete only after execution and
+ * retirement. The hardware still executes one chain at a time in shared AS0.
  */
 
 #include <IOKit/IOLib.h>
@@ -693,23 +692,29 @@ IOReturn LancelotHakiosMaliUserClient::submitQueued(drm_panfrost_submit *q)
     auto*fence=work->fence;
     uint64_t end=lmq_clock()+LMAL_MAX_WAIT_NS,absolute;nanoseconds_to_absolutetime(end,&absolute);
     uint64_t preparedAt=lmq_clock();
-    int prepared=LM_OK;uint32_t backoffs=0;
-    for(;;) {
-        if(fClosing || lmq_clock()>=end){prepared=fClosing?LM_ENODEV:LM_ETIMEDOUT;break;}
-        prepared=handoff.acquire(end,false);
-        if(prepared!=LM_EBUSY)break;
-        prepared=handoff.resetPrepared();if(prepared)break;
-        ++backoffs;
-        IOLockUnlock(gHakiosMaliLock);IOSleep(1);IOLockLock(gHakiosMaliLock);
+    /* HakiosPreparePins keeps every BO/surface alive while the per-root gate
+     * sleeps. Completion never takes this client lock, so release it instead
+     * of rolling all previously acquired roots back every millisecond. */
+    IOLockUnlock(gHakiosMaliLock);
+    int prepared=handoff.acquire(end,true);
+    IOLockLock(gHakiosMaliLock);
+    if(!prepared && (fClosing || lmq_clock()>=end))prepared=fClosing?LM_ENODEV:LM_ETIMEDOUT;
+    if(prepared) {
+        int reset=handoff.resetPrepared();if(reset)prepared=reset;
+        IOLog("lancelot-hakios-admission: error=%d stage=surface wait_us=%llu pins=%u roots=%u\n",
+            prepared,(lmq_clock()-preparedAt)/1000,q->bo_handle_count,handoff.count());
+        IODelete(handles,uint32_t,q->bo_handle_count);return lmq_return(prepared);
     }
-    if(prepared){IODelete(handles,uint32_t,q->bo_handle_count);return lmq_return(prepared);}
     uint64_t preparationUs=(lmq_clock()-preparedAt)/1000;
     work->preparationUs=preparationUs;
-    if(backoffs)IOLog("lancelot-hakios-contention: backoffs=%u wait_us=%llu pins=%u\n",backoffs,preparationUs,q->bo_handle_count);
+    if(preparationUs>10000)IOLog("lancelot-hakios-contention: mode=fair_wait wait_us=%llu pins=%u roots=%u\n",
+        preparationUs,q->bo_handle_count,handoff.count());
     IOLockLock(lmq_surface_lock);
     for(;;) {
         bool busy=false;
-        for(uint32_t i=0;i<q->bo_handle_count;i++){auto*s=buffer(handles[i])->surface;if(s&&s->maliQueueReaders)busy=true;}
+        /* A CPU lease already excludes these readers. Requiring both gates
+         * would reverse the presenter's acquisition order. */
+        for(uint32_t i=0;i<q->bo_handle_count;i++){auto*s=buffer(handles[i])->surface;if(s&&!s->maliCpuLease&&s->maliQueueReaders)busy=true;}
         if(!busy)break;
         if(lmq_clock()>=end){IOLockUnlock(lmq_surface_lock);IODelete(handles,uint32_t,q->bo_handle_count);return kIOReturnTimeout;}
         IOLockSleepDeadline(lmq_surface_lock,&lmq_surface_changed,absolute,THREAD_UNINT);

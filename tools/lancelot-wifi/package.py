@@ -33,6 +33,8 @@ private = read(args.private_bundle / "result.json")
 assert baseline["device"] == "lancelot" and kernel["passed"] and mu["passed"] and private["device"] == "lancelot"
 for name, expected in kernel["inputs"].items():
     assert sha(ROOT / "xnu/files" / name) == expected, ("Kernel source changed since build", name)
+for name, expected in kernel.get("overlay_controls", {}).items():
+    assert sha(ROOT / name) == expected, ("Kernel patch control changed since build", name)
 memory_map = "Platforms/Xiaomi/lancelotPkg/Library/MemoryMapLib/MemoryMapLib.c"
 assert mu["overlay"]["repository_port_inputs"][memory_map] == sha(ROOT / "uefi/files" / memory_map)
 old_root = args.accepted_repository / baseline["root"]["path"]
@@ -174,7 +176,7 @@ record = {"passed": True, "device": "lancelot", "round": args.round,
           "baseline_entries_preserved": len(baseline_entries), "original_root_bytes_preserved": True,
           "wifi_firmware_compressed": True, "early_touch_firmware_raw": True, "firmware_sha256": private["files"],
           "source_worktree": str(ROOT), "kernel_build": str(args.kernel_result), "mu_build": str(args.mu_result),
-          "source_inputs": kernel["inputs"], "runs": runs,
+          "source_inputs": kernel["inputs"], "source_controls": kernel.get("overlay_controls", {}), "runs": runs,
           "hardware_verified": False, "deployed": False, "committed": False}
 (out / "result.json").write_text(json.dumps(record, indent=2) + "\n")
 print("LOCAL WI-FI TEST PAIR READY", out, flush=True)

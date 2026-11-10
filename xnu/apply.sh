@@ -33,4 +33,5 @@ cp -a "$HERE/files/." .
 python3 "$HERE/../tools/apply-lancelot-data-hfs.py" "$DIR"
 python3 "$HERE/../tools/apply-lancelot-boot-log.py" "$DIR"
 python3 "$HERE/../tools/apply-lancelot-sgi-observation.py" "$DIR"
+python3 "$HERE/../tools/apply-lancelot-scheduler.py" "$DIR"
 echo "apply.sh: $DIR: $TAG + $(grep -c '^diff --git' "$HERE/redwood.patch") changed and $(find "$HERE/files" -type f | wc -l) new files"

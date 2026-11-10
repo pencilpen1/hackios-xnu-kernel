@@ -4,8 +4,17 @@
  * donor BOs remain WC and do not enter this handoff.
  */
 extern "C" void lancelot_hakios_cache_sync(void *, size_t, bool);
+/* Only the pixel subrange is mapped into the GPU. The leading shared-state
+ * page remains CPU-owned; invalidating it could discard concurrent seed or
+ * property updates through the kernel's cache-view alias. Keep full-root VM
+ * exclusion, but limit both PoC operations to the actual GPU-visible pages. */
+static void hakios_first_gpu_sync(void *address,size_t length) {
+    if(length>PAGE_SIZE)
+        lancelot_hakios_cache_sync((uint8_t *)address+PAGE_SIZE,length-PAGE_SIZE,false);
+}
 static void hakios_last_gpu_sync(void *address,size_t length) {
-    lancelot_hakios_cache_sync(address,length,true);
+    if(length>PAGE_SIZE)
+        lancelot_hakios_cache_sync((uint8_t *)address+PAGE_SIZE,length-PAGE_SIZE,true);
 }
 class HakiosSurfaceHandoff {
     struct Entry { LancelotMaliCpuLease *lease; uint64_t cookie; };
@@ -28,23 +37,23 @@ public:
     int acquire(uint64_t end,bool waitCpu = true) {
         for(uint32_t i=1;i<fCount;i++) {
             Entry e=fEntries[i];uint32_t j=i;
-            while(j && (uintptr_t)fEntries[j-1].lease->root()>(uintptr_t)e.lease->root()) {
+            /* Match LancelotMaliReadGroup and both other GPU submission
+             * paths: the gate/lease address is the shared lock order. */
+            while(j && (uintptr_t)fEntries[j-1].lease>(uintptr_t)e.lease) {
                 fEntries[j]=fEntries[j-1];--j;
             }
             fEntries[j]=e;
         }
         for(uint32_t i=0;i<fCount;i++) {
             uint64_t now=lmq_clock();if(!now||now>=end)return LMAL_ETIMEDOUT;
-            bool firstGpu=false;
-            int error=fEntries[i].lease->beginGpu(end-now,&fEntries[i].cookie,false,true,waitCpu,&firstGpu);
+            int error=fEntries[i].lease->beginGpu(end-now,&fEntries[i].cookie,false,true,waitCpu,NULL,
+                hakios_first_gpu_sync);
             if(error)return error;
-            if(firstGpu)lancelot_hakios_cache_sync(fEntries[i].lease->cacheAddress(),
-                fEntries[i].lease->root()->getLength(),false);
         }
         return LMAL_OK;
     }
-    /* Nothing has been enqueued. Drop every partial reservation before the
-     * client lock is released so another producer can finish its CPU work. */
+    /* Nothing has been enqueued. Drop every partial reservation after the
+     * client lock is reacquired, before any handle can be published. */
     int resetPrepared() {
         int result=LMAL_OK;
         for(uint32_t i=fCount;i>0;i--) {
