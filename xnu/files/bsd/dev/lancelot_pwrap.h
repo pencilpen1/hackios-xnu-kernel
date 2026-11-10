@@ -18,6 +18,8 @@ struct lancelot_pwrap_handoff {
 	void (*peer_release)(void *);
 };
 /* Register once, before GPU/PMIC init. No board proof is installed yet. */
+/* Idempotent MT6768 board proof, shared by GPU and WLAN before first WACS2 use. */
+int lancelot_pwrap_ensure_board_handoff(void);
 int lancelot_pwrap_register_handoff(const struct lancelot_pwrap_handoff *);
 /* All current/future XNU WACS2 callers use this single lock, never private locks.
  * Thread context, IRQs enabled. Nonrecursive. Lock order: driver -> WACS2 -> peer;

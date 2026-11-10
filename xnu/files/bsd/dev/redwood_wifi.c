@@ -4102,6 +4102,7 @@ static bool(*const steps[])(void) = {
 void
 redwood_wifi_stop(void)
 {
+	if (lancelot_touch_platform()) { lancelot_connsys_stop(); return; }
 	/* (a radio that is still on its way up is let get there first, or fail: half a minute at the most) */
 	for (unsigned ms = 0; whole_runs && ms < 40000; ms += 10) {
 		sleep_ms(10);
@@ -4130,6 +4131,7 @@ redwood_wifi_stop(void)
 void
 redwood_wifi_quiesce(void)
 {
+	if (lancelot_touch_platform()) { lancelot_connsys_quiesce(); return; }
 	redwood_apple80211_summary();           /* (also when the run is ended from the phone: five fingers) */
 	if (!dsp_started || dirty) {
 		return;

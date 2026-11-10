@@ -63,6 +63,10 @@ def render(profile, environment=None):
                         ('lancelot_touch', '3'), ('root_apfs', 'lancelot_ios')]:
         if values.get(key) != wanted:
             raise ValueError('Continuous lancelot boot requires ' + key + '=' + wanted)
+    if values.get('wifi', '0') not in ('0', '1'):
+        raise ValueError('Native lancelot Wi-Fi requires wifi=0 or wifi=1')
+    if 'connsys_step' in values and values['connsys_step'] not in tuple(map(str, range(1, 18))):
+        raise ValueError('CONNSYS diagnostic step must be 1 through 17')
     if values.get('lancelot_mali') not in ('1', '3', '4'):
         raise ValueError('Unsupported Mali service mode')
     if values.get('lancelot_gpu_dvfs', '0') not in ('0', '1', '2'):

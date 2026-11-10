@@ -51,6 +51,7 @@ __pycache__/
 !/xnuloader/lancelot.h
 !/xnuloader/lancelot_ubuntu.h
 !/xnuloader/lancelot_pmic.h
+!/xnuloader/lancelot_wifi.h
 !/xnuloader/lancelot_gpu_prepare.h
 !/xnuloader/lancelot_gpu_features.h
 !/xnuloader/lancelot_gpu_dma.h

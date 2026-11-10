@@ -119,6 +119,7 @@ def main():
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--runtime", action="store_true", help="automatically follow firmware LLOG1 into XNU KLOG2")
     ap.add_argument("--quiet", action="store_true", help="save all bytes without echoing the phone's log to the terminal")
+    ap.add_argument("--stop-file", type=Path, help="stop between complete snapshots when this local file appears")
     ap.add_argument("--live-window", action="store_true", help="start duration only after catching up to the live KLOG2 tail; call after desktop readiness is confirmed")
     ap.add_argument("--startup-wait", type=float, default=1800, help="maximum seconds to wait for KLOG2/live-tail catch-up when using --live-window")
     ap.add_argument("--io-on-stall",action="store_true",help="one read-only I/O query after the runtime log stops growing")
@@ -151,6 +152,9 @@ def main():
             output.flush()
         note("starting " + ("XNU KLOG2" if args.runtime else "LLOG1") + " capture")
         while time.monotonic() < deadline:
+            if args.stop_file and args.stop_file.exists():
+                note("graceful stop requested; the previous USB snapshot is complete")
+                break
             try:
                 def command(*parts):
                     # Duration limits starting another snapshot, not finishing

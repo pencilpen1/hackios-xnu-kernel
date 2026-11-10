@@ -304,6 +304,7 @@ redwood_input_init(void)
 	lancelot_mali_init();          /* explicit mode=1: SPM only, no GPU/PMIC access */
 	redwood_net_init();
 	redwood_adreno_init();
-	redwood_wifi_init();
+	if (lancelot_touch_platform()) lancelot_connsys_init();
+	else redwood_wifi_init();
 	redwood_adsp_init();
 }

@@ -50,6 +50,8 @@ extern void redwood_adreno_quiesce(void);
 extern void redwood_adreno_stop(void);
 extern void redwood_adreno_minute(void);
 extern void redwood_wifi_stop(void);
+extern void lancelot_wifi_revoke(void);
+extern bool lancelot_connsys_return_ready(void);
 extern void redwood_wifi_quiesce(void);
 extern void redwood_adsp_stop(void);
 extern void redwood_adsp_quiesce(void);
@@ -438,6 +440,11 @@ loader_log_append_msgbuf(void)
 void
 loader_return(void)
 {
+    lancelot_wifi_revoke(); /* gate WLAN producers before the established CPU/GPU return sequence */
+    if (!lancelot_connsys_return_ready()) {
+        loader_log_puts("lancelot-wifi: ordinary return deferred; WLAN producer/DMA still active\n");
+        return;
+    }
     /* Drain before stopping CPUs; IRQ/panic paths cannot manufacture it. */
     (void)lm_gpu_return_prepare();
 #if defined(GENERIC_PSCI_SMP)

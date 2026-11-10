@@ -82,6 +82,9 @@ void redwood_adreno_init(void);         /* boot-arg adreno=N: the first N steps 
 void redwood_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
 void redwood_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */
 void redwood_adreno_minute(void);       /* once a minute: a line about how warm the GPU is, if it is in use */
+void lancelot_connsys_init(void);
+void lancelot_connsys_stop(void);
+void lancelot_connsys_quiesce(void);
 void redwood_wifi_init(void);           /* boot-arg wifi=1: the phone's Wi-Fi; wifi_step=N: the first N steps of it */
 void redwood_adsp_init(void);           /* boot-arg adsp=1: the phone's audio DSP started and linked; adsp_step=N: the first N steps */
 void redwood_wifi_stop(void);           /* where a run ends in order: the Wi-Fi DSP, if it was started, shut down */

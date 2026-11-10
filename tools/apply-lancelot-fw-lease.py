@@ -65,7 +65,8 @@ def main():
     preserved={};port_inputs={}
     # Repository copies capture the reviewed lancelot firmware behavior. Source
     # worktrees remain untouched; their original hashes are still audited.
-    for name in ['Platforms/Xiaomi/lancelotPkg/DeviceBuild.py',P+'Drivers/MsdcDxe/MsdcDxe.c']:
+    for name in ['Platforms/Xiaomi/lancelotPkg/DeviceBuild.py',P+'Drivers/MsdcDxe/MsdcDxe.c',
+                 'Platforms/Xiaomi/lancelotPkg/Library/MemoryMapLib/MemoryMapLib.c']:
         preserved[name]=sha(src/name)
         overlay=ROOT/'uefi/files'/name
         selected=overlay if overlay.is_file() else src/name

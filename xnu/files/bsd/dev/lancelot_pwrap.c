@@ -56,6 +56,54 @@ static bool return_frozen,return_claimed,return_active;
 static uint32_t return_boot_mpidr;
 static uint64_t return_owner;
 
+#ifndef LANCELOT_PWRAP_HOST_TEST
+/* Board evidence for the WACS2 window. The AP owns the WACS2 command window;
+ * peer processors use separate PWRAP windows (WACS_P2P / WACS_MD32) and the
+ * hardware arbiter serialises bus access, so there is no same-WACS2 peer to
+ * coordinate with. Sources:
+ *  - vendor pwrap_hal.c: pwrap_init() ends in _pwrap_enable(), which sets
+ *    HPRIO_ARB_EN=0x3fa65 with WACS0/WACS2/WACS_P2P/WACS_MD32 enabled, and
+ *    pwrap_wacs2_write() drives WACS2 directly unless SSPM IPI forwarding is
+ *    compiled in.
+ *  - shipping Shockwave 4.19 kernel (CONFIG_MTK_TINYSYS_SSPM_SUPPORT=y,
+ *    CONFIG_MTK_PMIC_WRAP=y): binds the mainline mtk-pmic-wrap driver, passes
+ *    the WACS2 PMIC write test, and enables VGPU/VSRAM through the regulator
+ *    framework while SSPM v1 runs; no PMIC IPI forwarding appears in dmesg.
+ *  - XNU read-only sampling at the same boot: WACS2 INIT=1, FSM/REQ idle,
+ *    SYNC_BUSY only from another channel.
+ * This is evidence for the AP WACS2 window, not proof that every other
+ * processor is stopped; the arbiter remains enabled. */
+static const char lancelot_pwrap_evidence[] =
+    "AP owns the WACS2 window; vendor pwrap_init enables WACS0/WACS2/P2P/MD32 "
+    "with HPRIO_ARB_EN=0x3fa65 and the shipping 4.19 kernel drives WACS2 "
+    "directly (write test pass, VGPU/VSRAM via regulators) while SSPM v1 "
+    "runs; SSPM uses the P2P/MD32 windows; XNU read-only sampling sees WACS2 "
+    "INIT=1 and FSM/REQ idle";
+#endif
+
+int
+lancelot_pwrap_ensure_board_handoff(void)
+{
+#ifdef LANCELOT_PWRAP_HOST_TEST
+    /* Host lock tests install explicit fixtures; no hardware identity is inferred. */
+    return -95;
+#else
+    extern bool lancelot_touch_platform(void);
+    if (!lancelot_touch_platform() || !irq_enabled()) return -19;
+    if (__atomic_load_n(&owner, __ATOMIC_ACQUIRE) == caller()) return -16;
+    lock();
+    int error = return_frozen ? -19 : poisoned ? -5 : 0;
+    if (!error && !registered) {
+        handoff = (struct lancelot_pwrap_handoff){
+            .mode = LANCELOT_PWRAP_AP_EXCLUSIVE, .evidence = lancelot_pwrap_evidence,
+        };
+        registered = true;
+    }
+    unlock();
+    return error;
+#endif
+}
+
 int
 lancelot_pwrap_register_handoff(const struct lancelot_pwrap_handoff *h)
 {

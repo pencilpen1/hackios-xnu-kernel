@@ -1,0 +1,40 @@
+{
+  "repository": "https://github.com/oosexgang/hakios-xnu-kernel",
+  "branch": "mtk",
+  "commit": "620c77507a17ad23ac5a40bad900abe9ed4d7740",
+  "files": [
+    {
+      "source": "xnu/files/bsd/dev/redwood_connsys.c",
+      "destination": "xnu/files/bsd/dev/lancelot_connsys.c",
+      "source_sha256": "f2301ca68d8b3339c29f9051f3c23d47716096e52738840c58e4631fcab7d6a1"
+    },
+    {
+      "source": "xnu/files/bsd/dev/redwood_mtkwifi.c",
+      "destination": "xnu/files/bsd/dev/lancelot_wifi.c",
+      "source_sha256": "924ed881322b49cbd3b6a9f7a22d9f33a22642756117dd0aa379b932d06fb1ef"
+    },
+    {
+      "source": "xnu/files/bsd/dev/redwood_wpa.c",
+      "destination": "xnu/files/bsd/dev/lancelot_wifi_wpa.c",
+      "source_sha256": "5c2f899744a1eb21c966f28ce77631c220d9f7d6c7419f505dd1ad33c85cde98"
+    },
+    {
+      "source": "xnu/files/bsd/sys/redwood_wpa.h",
+      "destination": "xnu/files/bsd/sys/lancelot_wifi_wpa.h",
+      "source_sha256": "316a85484ece7297bcb462ea533ad1cb45451fd89612e61bfd711c8fae971a5f"
+    }
+  ],
+  "port_device": "lancelot",
+  "port_soc": "MT6768",
+  "runtime_validation": {
+    "round": "W7",
+    "date": "2026-11-10",
+    "security": "WPA2-PSK/CCMP",
+    "5ghz_channel": 149,
+    "5ghz_authentication_association_and_key_install_ms": 203,
+    "5ghz_bidirectional_tcp": "verified in kernel log",
+    "2_4ghz_web_access": "user verified",
+    "5ghz_web_access": "user verified",
+    "2_4ghz_to_5ghz_reconnect": "user verified"
+  }
+}

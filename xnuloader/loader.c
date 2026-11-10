@@ -10,6 +10,7 @@
  *   - exits boot services, turns the MMU off and jumps to the kernel entry
  */
 #include "efi.h"
+#include "../xnu/files/bsd/dev/lancelot_wifi_contract.h"
 #include "identity.h"         /* who iOS shall think we are: from the iPhone's own device tree (mkidentity.py) */
 #include "../xnu/files/bsd/dev/lancelot_smp.h"
 #include "../xnu/files/bsd/dev/lancelot_mali_boot_receipt.h"
@@ -2572,6 +2573,8 @@ install_exception_hook(void)
 struct payload_info {
 	const uint8_t *kernel;
 	uint32_t kernel_size;
+	const uint8_t *wifi_board;
+	uint32_t wifi_board_size;
 	const uint8_t *ramdisk;
 	uint32_t ramdisk_size;
 	const uint8_t *bootdisk;        /* optional small md0; ramdisk then becomes md1 */
@@ -2646,6 +2649,10 @@ parse_payload(struct payload_info *pi, int verbose)
 		} else if (str_eq(e->name, "kernel")) {
 			pi->kernel = p + sizeof(*e);
 			pi->kernel_size = e->size;
+		} else if (str_eq(e->name, "wifi-board")) {
+			if (pi->wifi_board) return 0;
+			pi->wifi_board = p + sizeof(*e);
+			pi->wifi_board_size = e->size;
 		} else if (str_eq(e->name, "cmdline")) {
 			pi->cmdline = text;
 		} else if (str_eq(e->name, "physbase")) {
@@ -2744,6 +2751,8 @@ set_result(const char *what, uint64_t a, uint64_t b)
 	last_result[n] = 0;
 	log_len = saved;
 }
+
+#include "lancelot_wifi.h"
 
 /* Every range of the firmware's memory map of 1 MB or more, and the total of each type. */
 static void
@@ -2899,6 +2908,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		print("unexpected kernel layout\n");
 		return 0;
 	}
+	if (!lancelot_wifi_loader_prepare(&pi)) return 0;
 	if (!choose_window(&pi)) {
 		return 0;
 	}
@@ -3220,6 +3230,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_prop_u32(&w, "#size-cells", 2);
 
 	dt_begin(&w, "chosen");
+	if (loader_wifi_handoff.flags == LW_RESERVED)
+		dt_prop(&w, "lancelot-wifi", &loader_wifi_handoff, sizeof(loader_wifi_handoff));
 	if (PLAT == &platform_lancelot && more_cores)
 		dt_prop(&w, "lancelot-smp", &smp_offer, sizeof(smp_offer));
 	if (PLAT == &platform_lancelot && mtk_usb_offer[0] && kernel_mpidr == this_mpidr)
@@ -3256,6 +3268,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_prop_u64(&w, "unique-chip-id", 0x000052445730001ULL);
 	dt_prop_u32(&w, "chip-id", 0x8015);
 	dt_prop_u32(&w, "board-id", 0x06);
+	/* MobileGestalt uses this identity value for UDID. The native radio
+	 * uses its separate per-device LAA in chosen/lancelot-wifi. */
 	dt_prop(&w, "mac-address-wifi0", wifi_address, sizeof(wifi_address));
 	dt_prop(&w, "mac-address-bluetooth0", bluetooth_address, sizeof(bluetooth_address));
 	dt_prop(&w, "boot-manifest-hash", manifest_hash, sizeof(manifest_hash));

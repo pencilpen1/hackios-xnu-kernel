@@ -294,9 +294,9 @@ get(struct apple80211req *request)
 	switch (request->req_type) {
 	case 43:
 	case 44: {                              /* the driver's and the hardware's name: the text alone, in 256 bytes */
-		static const char name[256] = "redwood: ath11k for the WCN6750";
-
-		return give(request, name, sizeof(name));
+		static const char legacy[256] = "redwood: ath11k for the WCN6750";
+        static const char lancelot[256] = "lancelot: MT6768 CONNAC AXI / MT6631";
+        return give(request, lancelot_touch_platform() ? lancelot : legacy, sizeof(legacy));
 	}
 	case 12: {
 		/*
@@ -309,9 +309,11 @@ get(struct apple80211req *request)
 		uint8_t bits[13] = { 0 };
 		static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
 
-		for (unsigned i = 0; i < sizeof(has); i++) {
-			bits[has[i] / 8] |= (uint8_t)(1u << (has[i] % 8));
-		}
+        static const uint8_t native[] = { 2, 3, 9, 10, 14 }; /* AES/CCMP, legacy timing, WPA2 */
+        const uint8_t *capabilities = lancelot_touch_platform() ? native : has;
+        unsigned count = lancelot_touch_platform() ? sizeof(native) : sizeof(has);
+        for (unsigned i = 0; i < count; i++)
+            bits[capabilities[i] / 8] |= (uint8_t)(1u << (capabilities[i] % 8));
 		return give(request, bits, sizeof(bits));
 	}
 	case 19: {                              /* the radio's power: one radio. Until the driver is up it counts as on: it */

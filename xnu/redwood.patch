@@ -65,7 +65,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 index 44274016a4cf..9cd24b42caca 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,50 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,54 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -103,6 +103,10 @@ index 44274016a4cf..9cd24b42caca 100644
 +bsd/dev/redwood_camera.c	standard
 +bsd/dev/redwood_mic.c		standard
 +bsd/dev/redwood_wifi.c		standard
++bsd/dev/lancelot_wifi_platform.c	standard
++bsd/dev/lancelot_connsys.c	standard
++bsd/dev/lancelot_wifi.c	standard
++bsd/dev/lancelot_wifi_wpa.c	standard
 +bsd/dev/redwood_adsp.c		standard
 +bsd/dev/redwood_image.c		standard
 +bsd/dev/redwood_virtio_blk.c	standard
