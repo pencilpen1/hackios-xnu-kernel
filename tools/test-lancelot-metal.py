@@ -11,12 +11,12 @@ O.mkdir(parents=True)
 sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
 sources={}
 core=R/'tools/lancelot-metal/src/metal'
-for name in ['rwm.h','cmdbuf.cpp','command.cpp','run.cpp','buffer.cpp','drawable.cpp','drawable.h','texture.cpp']:
+for name in ['rwm.h','cmdbuf.cpp','command.cpp','run.cpp','compute.cpp','buffer.cpp','drawable.cpp','drawable.h','texture.cpp','import.cpp']:
     p=core/name;shutil.copy2(p,O/name);sources[p.relative_to(R).as_posix()]=sha(p)
 for p in [R/'tools/lancelot-metal/tests/core_test.cpp',R/'tools/lancelot-metal/tests/completion_before.inc',
           R/'tools/lancelot-metal/tests/boot_test.c',R/'tools/lancelot-metal/src/metal/boot_policy.h',
           R/'tools/lancelot-metal/tests/drawable_test.cpp',R/'xnu/files/iokit/Kernel/lancelot_mali_uapi.h',
-          R/'tools/lancelot-metal/tests/texture_test.cpp',
+          R/'tools/lancelot-metal/tests/texture_test.cpp',R/'tools/lancelot-metal/tests/compute_ownership_test.cpp',
           R/'xnu/files/iokit/Kernel/lancelot_mali_queue_uapi.h',
           R/'tools/lancelot-metal/src/lancelot_metal_init.inc',R/'tools/mesa-lancelot/air/air_metal.h',Path(__file__)]:
     shutil.copy2(p,O/p.name);sources[p.relative_to(R).as_posix()]=sha(p)
@@ -36,6 +36,7 @@ size_t IOSurfaceGetBytesPerElement(IOSurfaceRef);size_t IOSurfaceGetAllocSize(IO
 void*IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef,size_t);size_t IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef,size_t);
 size_t IOSurfaceGetWidthOfPlane(IOSurfaceRef,size_t);size_t IOSurfaceGetHeightOfPlane(IOSurfaceRef,size_t);
 size_t IOSurfaceGetBytesPerElementOfPlane(IOSurfaceRef,size_t);uint32_t IOSurfaceGetSeed(IOSurfaceRef);
+uint32_t IOSurfaceGetPixelFormat(IOSurfaceRef);uint32_t IOSurfaceGetID(IOSurfaceRef);const char *getprogname(void);
 }
 ''',
                   'sys/sysctl.h':'#pragma once\n#include <stddef.h>\nstatic inline int sysctlbyname(const char*,void*,size_t*,void*,size_t){return 0;}\n'}.items():
@@ -73,7 +74,11 @@ for cc in ['g++','clang++']:
     texture=O/(cc+'-texture')
     commands += [('texture-build',[cc,'-std=c++20','-O1','-g','-Wall','-Wextra','-Werror',
         '-fsanitize=address,undefined','-pthread','-I'+str(O/'host'),'-I'+str(O),
-        O/'texture_test.cpp',O/'texture.cpp','-o',texture]),('texture-run',[texture])]
+        O/'texture_test.cpp',O/'texture.cpp',O/'import.cpp','-o',texture]),('texture-run',[texture])]
+    compute_test=O/(cc+'-compute-ownership')
+    commands += [('compute-ownership-build',[cc,'-std=c++20','-O1','-g','-Wall','-Wextra','-Werror',
+        '-fsanitize=address,undefined','-I'+str(O/'host'),'-I'+str(O),O/'compute_ownership_test.cpp',O/'compute.cpp','-o',compute_test]),
+        ('compute-ownership-run',[compute_test])]
     for stage,command in commands:
         p=subprocess.run(list(map(str,command)),capture_output=True,timeout=90,
              env={**os.environ,'ASAN_OPTIONS':'detect_leaks=1','UBSAN_OPTIONS':'halt_on_error=1'})

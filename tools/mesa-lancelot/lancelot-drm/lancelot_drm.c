@@ -44,8 +44,26 @@ void lancelot_diag_anchor(void){
 }
 #endif
 static _Thread_local uint64_t last_submit_sequence;
+static _Thread_local uint64_t rejected_submit_epoch, last_accepted_sequence;
+static _Thread_local int rejected_submit_error;
 uint64_t lancelot_drm_last_submit(void){return last_submit_sequence;}
 uint64_t lancelot_drm_last_seq(void){return last_submit_sequence;}
+/* Gallium draw/flush callbacks return void. Keep a rejection observable until
+ * the enclosing Metal work checks it; a later successful batch cannot erase it.
+ * Submissions execute synchronously on the calling thread, across fd aliases. */
+int lancelot_drm_submit_status(uint64_t *epoch,uint64_t *accepted) {
+ if(epoch)*epoch=rejected_submit_epoch;
+ if(accepted)*accepted=last_accepted_sequence;
+ return rejected_submit_error;
+}
+static int submit_result(int result,uint64_t sequence) {
+ if(result) {
+  rejected_submit_error=errno?errno:EIO;
+  ++rejected_submit_epoch;
+  errno=rejected_submit_error;
+ } else last_submit_sequence=last_accepted_sequence=sequence;
+ return result;
+}
 
 struct view {void *addr;size_t size;struct view *next;};
 struct mapping {uint32_t handle;uintptr_t base;uint64_t size;bool closing,cpu_unmapped;struct view *views;struct mapping *next;};
@@ -208,27 +226,27 @@ int lancelot_drm_submit_access(int fd,const struct drm_panfrost_submit*p,const u
  last_submit_sequence=0;
  if(!p||!readonly||!p->bo_handle_count||p->bo_handle_count>LMAL_MAX_SUBMIT_BOS||
     !p->bo_handles||p->in_sync_count>LMAL_MAX_SUBMIT_SYNCS||(p->in_sync_count&&!p->in_syncs)){
-  errno=EINVAL;return -1;
+  errno=EINVAL;return submit_result(-1,0);
  }
- struct device*d=get(fd);if(!d)return -1;
+ struct device*d=get(fd);if(!d)return submit_result(-1,0);
  struct lmal_submit_access q={.submit={.jc=p->jc,.requirements=p->requirements,
   .bo_count=p->bo_handle_count,.bo_handles=p->bo_handles,.in_sync_count=p->in_sync_count,
   .in_syncs=p->in_syncs,.out_sync=p->out_sync,.timeout_ns=LMAL_MAX_WAIT_NS},.bo_readonly=(uintptr_t)readonly};
  /* Negotiate once at open. Never retry a failed submission: it may have run. */
- int r=(d->caps&LMAL_CAP_SUBMIT_ACCESS)?call(d,LMAL_SELECTOR_SUBMIT_ACCESS,&q,sizeof(q)):
+ int r=(d->caps&(LMAL_CAP_SUBMIT_ACCESS|LMAL_CAP_SURFACE_READ_HINT))?call(d,LMAL_SELECTOR_SUBMIT_ACCESS,&q,sizeof(q)):
   call(d,LMAL_SELECTOR_SUBMIT,&q.submit,sizeof(q.submit));
- if(!r)last_submit_sequence=q.submit.sequence;
- put(d);return r;
+ int saved_errno=errno;put(d);errno=saved_errno;
+ return submit_result(r,q.submit.sequence);
 }
 int drmIoctl(int fd,unsigned long request,void*arg){
- if(!arg){errno=EINVAL;return -1;}
+ if(!arg){errno=EINVAL;return request==DRM_IOCTL_PANFROST_SUBMIT?submit_result(-1,0):-1;}
  if(request==DRM_IOCTL_PANFROST_GET_PARAM){struct drm_panfrost_get_param*p=arg;if(p->pad){errno=EINVAL;return -1;}struct lmal_get_param q={.param=p->param};int r=fdcall(fd,LMAL_SELECTOR_GET_PARAM,&q,sizeof(q));if(!r)p->value=q.value;return r;}
  if(request==DRM_IOCTL_PANFROST_CREATE_BO){struct drm_panfrost_create_bo*p=arg;if(p->flags&~(PANFROST_BO_NOEXEC|PANFROST_BO_HEAP)){errno=EINVAL;return -1;}struct lmal_bo_create q={.size=p->size,.flags=LMAL_BO_READ|LMAL_BO_WRITE|LMAL_BO_FIXED_BACKING|((p->flags&PANFROST_BO_NOEXEC)?LMAL_BO_NOEXEC:LMAL_BO_EXEC)|((p->flags&PANFROST_BO_HEAP)?LMAL_BO_HEAP:0)};int r=fdcall(fd,LMAL_SELECTOR_BO_CREATE,&q,sizeof(q));if(!r){if(!q.handle||q.actual_size<p->size||q.actual_size>UINT32_MAX){errno=EPROTO;return -1;}p->handle=q.handle;p->offset=q.gpu_va;p->size=(uint32_t)q.actual_size;}return r;}
  if(request==DRM_IOCTL_PANFROST_GET_BO_OFFSET){struct drm_panfrost_get_bo_offset*p=arg;struct lmal_bo_query q={.handle=p->handle};int r=fdcall(fd,LMAL_SELECTOR_BO_QUERY,&q,sizeof(q));if(!r)p->offset=q.gpu_va;return r;}
  if(request==DRM_IOCTL_PANFROST_MMAP_BO){errno=ENOTSUP;return -1;} /* No mmap device on Darwin. */
  if(request==DRM_IOCTL_PANFROST_WAIT_BO){struct drm_panfrost_wait_bo*p=arg;struct lmal_bo_wait q={.handle=p->handle,.flags=LMAL_BO_WAIT_READ|LMAL_BO_WAIT_WRITE,.absolute_monotonic_ns=p->timeout_ns};return fdcall(fd,LMAL_SELECTOR_BO_WAIT,&q,sizeof(q));}
  if(request==DRM_IOCTL_PANFROST_MADVISE){struct drm_panfrost_madvise*p=arg;if(p->madv!=PANFROST_MADV_WILLNEED&&p->madv!=PANFROST_MADV_DONTNEED){errno=EINVAL;return -1;}struct lmal_bo_query q={.handle=p->handle};int r=fdcall(fd,LMAL_SELECTOR_BO_QUERY,&q,sizeof(q));if(!r)p->retained=1;return r;}
-  if(request==DRM_IOCTL_PANFROST_SUBMIT){last_submit_sequence=0;struct drm_panfrost_submit*p=arg;if(p->bo_handle_count>LMAL_MAX_SUBMIT_BOS||p->in_sync_count>LMAL_MAX_SUBMIT_SYNCS||!p->bo_handle_count||!p->bo_handles||(p->in_sync_count&&!p->in_syncs)){errno=EINVAL;return -1;}struct lmal_submit q={.jc=p->jc,.requirements=p->requirements,.bo_count=p->bo_handle_count,.bo_handles=p->bo_handles,.in_sync_count=p->in_sync_count,.in_syncs=p->in_syncs,.out_sync=p->out_sync,.timeout_ns=LMAL_MAX_WAIT_NS};int r=fdcall(fd,LMAL_SELECTOR_SUBMIT,&q,sizeof(q));if(!r)last_submit_sequence=q.sequence;return r;}
+  if(request==DRM_IOCTL_PANFROST_SUBMIT){last_submit_sequence=0;struct drm_panfrost_submit*p=arg;if(p->bo_handle_count>LMAL_MAX_SUBMIT_BOS||p->in_sync_count>LMAL_MAX_SUBMIT_SYNCS||!p->bo_handle_count||!p->bo_handles||(p->in_sync_count&&!p->in_syncs)){errno=EINVAL;return submit_result(-1,0);}struct lmal_submit q={.jc=p->jc,.requirements=p->requirements,.bo_count=p->bo_handle_count,.bo_handles=p->bo_handles,.in_sync_count=p->in_sync_count,.in_syncs=p->in_syncs,.out_sync=p->out_sync,.timeout_ns=LMAL_MAX_WAIT_NS};int r=fdcall(fd,LMAL_SELECTOR_SUBMIT,&q,sizeof(q));return submit_result(r,q.sequence);}
  if(request==DRM_IOCTL_GEM_CLOSE)return drmCloseBufferHandle(fd,((struct drm_gem_close*)arg)->handle);
  errno=ENOTSUP;return -1;
 }

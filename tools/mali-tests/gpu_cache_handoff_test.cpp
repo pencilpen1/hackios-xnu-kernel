@@ -6,6 +6,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include "actual-wait-state.h"
 #define LMAL_OK 0
 #define LMAL_EINVAL (-22)
 #define LMAL_ENOTSUP (-95)
@@ -56,7 +57,8 @@ struct Lease {
     bool objectValid(bool,bool=false){return true;}
     bool blockedProof(){return proof;}
     bool prefaultCache(){return cacheReady;}
-    int awaitGpuTurn(task_t,bool,uint64_t,bool){return 0;}
+    int awaitGpuTurn(task_t,bool,uint64_t,bool,lmal_cpu_wait_state *wait=nullptr,bool=true){assert(!wait);return 0;}
+    void captureWaitLocked(lmal_cpu_wait_state *wait,uint32_t,task_t){assert(!wait);}
     void retain(){++refs;}
     void release(){assert(refs);--refs;}
     void *cacheAddress(){return cache;}

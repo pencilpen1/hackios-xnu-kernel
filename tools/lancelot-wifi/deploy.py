@@ -20,6 +20,8 @@ ap.add_argument("--serial", required=True)
 ap.add_argument("--out", type=Path, required=True)
 ap.add_argument("--tests-result", type=Path, required=True)
 ap.add_argument("--gpu-tests-result", type=Path)
+ap.add_argument("--regressions-result", type=Path, help="Explicit regression receipt for non-Wi-Fi rounds")
+ap.add_argument("--hfs-result", type=Path, help="HFS verification receipt for this linked kernel")
 args = ap.parse_args()
 C, O = args.candidate.resolve(), args.out.resolve()
 assert O.is_relative_to(C.parent) and O != C
@@ -44,7 +46,9 @@ for name, digest in candidate["source_inputs"].items():
     assert sha(ROOT / "xnu/files" / name) == digest, name
 for name, digest in candidate.get("source_controls", {}).items():
     assert sha(ROOT / name) == digest, name
-proof_files = (args.tests_result.resolve(), C.parent / "regressions-w1/result.json", C.parent / "static-hfs-w1/result.json")
+proof_files = (args.tests_result.resolve(),
+               (args.regressions_result or C.parent / "regressions-w1/result.json").resolve(),
+               (args.hfs_result or C.parent / "static-hfs-w1/result.json").resolve())
 if args.gpu_tests_result:
     proof_files += (args.gpu_tests_result.resolve(),)
     for name, digest in read(args.gpu_tests_result)["sources"].items():

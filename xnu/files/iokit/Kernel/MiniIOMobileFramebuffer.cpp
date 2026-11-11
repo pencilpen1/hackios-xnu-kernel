@@ -446,6 +446,13 @@ IOMobileFramebuffer::start(IOService * provider)
 			}
 		}
 	}
+	uint32_t lancelotGpu=0;
+	if(PE_parse_boot_argn("lancelot_hakios",&lancelotGpu,sizeof(lancelotGpu)) && lancelotGpu==1) {
+		setProperty("lancelot-panel-width",fPanelWidth,32);
+		setProperty("lancelot-panel-height",fPanelHeight,32);
+		setProperty("lancelot-render-width",fWidth,32);
+		setProperty("lancelot-render-height",fHeight,32);
+	}
 	fColumn = IONewZero(uint32_t, fPanelWidth);
 	fColumnWeight = IONewZero(uint16_t, fPanelWidth);
 	fDiff = gDiff != 0;
@@ -814,6 +821,8 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	if (px1 <= px0 || py1 <= py0) {
 		return;
 	}
+	bool unscaled=px1-px0==sw && py1-py0==sh && px0>=0 && (uint32_t)px1<=fPanelWidth;
+	if(unscaled)filter=false;
 	/* (blending, a row of the picture mixed from two: room for it, for every one who draws rows) */
 	if (filter && fBlendRowSize < (uint32_t) sw) {
 		if (fBlendRow != NULL) {
@@ -844,7 +853,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	if (cx0 >= cx1 || py1 <= 0 || py0 >= (int32_t) fPanelHeight) {
 		return;
 	}
-	for (int32_t x = cx0; x < cx1; x++) {
+	for (int32_t x = cx0; !unscaled && x < cx1; x++) {
 		if (filter) {
 			int64_t at = sample_at(x - px0, sw, px1 - px0);
 
@@ -867,7 +876,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	job.cx0 = cx0;
 	job.cx1 = cx1;
 	job.filter = filter;
-	job.unscaled = px1 - px0 == sw && py1 - py0 == sh && px0 >= 0 && (uint32_t) px1 <= fPanelWidth;
+	job.unscaled = unscaled;
 	if (fThreads <= 1 || fDiff || fHelpersStarted + 1 < fThreads) {
 		drawRows(&job, py0, py1, fBlendRow);
 		return;
@@ -963,6 +972,9 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
 
 		fSwapSurfaces[slot][layer] = sid != 0 ? MiniIOSurfaceCopy(sid) : NULL;
+        if(fSwapSurfaces[slot][layer] && !MiniIOSurfaceDisplayRetain(fSwapSurfaces[slot][layer])) {
+            MiniIOSurfaceDrop(fSwapSurfaces[slot][layer]);fSwapSurfaces[slot][layer]=NULL;
+        }
 	}
 	fSwapsWaiting++;
 	IOLockWakeup(fSwapLock, fSwap, true);
@@ -993,6 +1005,7 @@ IOMobileFramebuffer::presenter(void)
 		show(swap, surfaces, submitted);
 		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 			if (surfaces[layer] != NULL) {
+				MiniIOSurfaceDisplayRelease(surfaces[layer]);
 				MiniIOSurfaceDrop(surfaces[layer]);
 			}
 		}
@@ -1260,6 +1273,7 @@ class IOMobileFramebufferUserClient : public IOUserClient
 public:
 	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
+	virtual IOService * getService(void) APPLE_KEXT_OVERRIDE;
 	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
 	virtual void free(void) APPLE_KEXT_OVERRIDE;
 	virtual IOReturn registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
@@ -1289,6 +1303,14 @@ IOMobileFramebufferUserClient::start(IOService * provider)
 	fLock = IOLockAlloc();
 	fVSyncCall = thread_call_allocate(&IOMobileFramebufferUserClient::vsyncFired, this);
 	return fLock != NULL && fVSyncCall != NULL;
+}
+
+IOService *
+IOMobileFramebufferUserClient::getService(void)
+{
+	/* IOConnectGetService retains this result. The IOUserClient default
+	 * returns NULL, hiding the panel/render geometry from its connection. */
+	return fOwner;
 }
 
 IOReturn

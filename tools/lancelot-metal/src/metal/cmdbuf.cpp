@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/sysctl.h>
+#include <unistd.h>
 
 namespace {
 
@@ -101,7 +102,7 @@ say_first_drawn(struct rwm_work *const *works, unsigned count, const char *(*lab
 		seen_ids[seen_n++] = sid0;
 		snprintf(line, sizeof(line), "!rwm surface %u first drawn: %u draws (%u clearing, to %.2f %.2f %.2f %.2f), first %s",
 			 sid0, draws, clears, cc[0], cc[1], cc[2], cc[3], label);
-		sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+		sysctlbyname("kern.lancelot_hakios.say", NULL, NULL, line, strlen(line));
 	}
 }
 
@@ -122,6 +123,8 @@ extern "C" void
 rwm_command_begin(struct rwm_command *c)
 {
 	memset(c, 0, sizeof(*c));
+	static uint64_t trace_next;
+	c->trace_id=__atomic_add_fetch(&trace_next,1,__ATOMIC_RELAXED);
 	c->born = rwm_ns();
 	c->born_cpu = rwm_thread_cpu_ns();
 	c->status = RWM_CB_ENQUEUED;    /* nothing is pending yet */
@@ -147,9 +150,9 @@ rwm_command_commit(struct rwm_command *c, struct rwm_work *const *works, unsigne
 	static __thread bool bound;
 
 	if (!rwm_worker_on()) {
-		rwm_perf.made_cbs++;
-		rwm_perf.made_ns += rwm_ns() - c->born;
-		rwm_perf.made_cpu += rwm_thread_cpu_ns() - c->born_cpu;
+		__atomic_fetch_add(&rwm_perf.made_cbs,1,__ATOMIC_RELAXED);
+		__atomic_fetch_add(&rwm_perf.made_ns,rwm_ns() - c->born,__ATOMIC_RELAXED);
+		__atomic_fetch_add(&rwm_perf.made_cpu,rwm_thread_cpu_ns() - c->born_cpu,__ATOMIC_RELAXED);
 	}
 	if (!bound) {
 		bound = true;
@@ -191,12 +194,14 @@ rwm_command_run(struct rwm_command *c, struct rwa_device *device, struct rwm_wor
 		return RWM_RUN_COPYIN_FAILED;
 	}
 	const uint64_t began = rwm_ns();
+	uint64_t began_cpu=rwm_thread_cpu_ns();
 	uint64_t waited = 0;
 	int ran;
 
-	rwm_perf.recording += began - c->born;
-	if (rwm_perf.last_end != 0 && began > rwm_perf.last_end) {
-		rwm_perf.between += began - rwm_perf.last_end;
+	__atomic_fetch_add(&rwm_perf.recording,began - c->born,__ATOMIC_RELAXED);
+	uint64_t last_end=__atomic_load_n(&rwm_perf.last_end,__ATOMIC_RELAXED);
+	if (last_end != 0 && began > last_end) {
+		__atomic_fetch_add(&rwm_perf.between,began - last_end,__ATOMIC_RELAXED);
 	}
 	__atomic_store_n(&c->status, RWM_CB_COMMITTED, __ATOMIC_RELEASE);
 	/* its copies in -- here, unless the driver's worker made them at -commit --, the draws, dispatches and copies in
@@ -212,12 +217,17 @@ rwm_command_run(struct rwm_command *c, struct rwa_device *device, struct rwm_wor
 
 	const uint64_t now = rwm_ns(), took = now - began;
 
-	rwm_perf.last_end = now;
-	rwm_perf.cbs++;
-	rwm_perf.wait += waited;
-	rwm_perf.encode += took - waited;
-	if (took > rwm_perf.worst) {
-		rwm_perf.worst = took;
+	rwm_perf_max(&rwm_perf.last_end,now);
+	__atomic_fetch_add(&rwm_perf.cbs,1,__ATOMIC_RELAXED);
+	__atomic_fetch_add(&rwm_perf.wait,waited,__ATOMIC_RELAXED);
+	__atomic_fetch_add(&rwm_perf.encode,took - waited,__ATOMIC_RELAXED);
+	rwm_perf_max(&rwm_perf.worst,took);
+	static uint64_t last_report;
+	uint64_t prior=__atomic_load_n(&last_report,__ATOMIC_RELAXED);
+	if(ran || (took>=16000000 && now>=prior+1000000000 && __atomic_compare_exchange_n(&last_report,&prior,now,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED))) {
+		char line[256];uint64_t cpu=rwm_thread_cpu_ns();
+		snprintf(line,sizeof(line),"lancelot-metal-submit: pid=%d cb=%llu seq=%llu at=%llu wall_us=%llu cpu_us=%llu wait_us=%llu works=%u error=%d",getpid(),(unsigned long long)c->trace_id,(unsigned long long)c->seq,(unsigned long long)(now/1000),(unsigned long long)(took/1000),(unsigned long long)(cpu>=began_cpu?(cpu-began_cpu)/1000:0),(unsigned long long)(waited/1000),count,ran);
+		sysctlbyname("kern.lancelot_hakios.say",NULL,NULL,line,strlen(line));
 	}
 	rwm_perf_report(now);
 	return ran;
@@ -287,8 +297,8 @@ rwm_command_wait_completed(struct rwm_command *c, struct rwa_device *device, cha
 
 		/* its own last job, and nothing after it */
 		int error = air->wait_seq != nullptr ? air->wait_seq(c->seq, 5000000000ll) : ENOTSUP;
-		rwm_perf.completed_waits++;
-		rwm_perf.completed_ns += rwm_ns() - from;
+		__atomic_fetch_add(&rwm_perf.completed_waits,1,__ATOMIC_RELAXED);
+		__atomic_fetch_add(&rwm_perf.completed_ns,rwm_ns() - from,__ATOMIC_RELAXED);
 		if (error != 0) {
 			snprintf(why, why_size, "GPU job %llu did not finish (error %d)",
 				 (unsigned long long)c->seq, error);

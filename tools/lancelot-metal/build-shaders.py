@@ -2,12 +2,12 @@
 from pathlib import Path
 import argparse,hashlib,json,subprocess,struct
 P=Path(__file__).resolve().parent
-ap=argparse.ArgumentParser();ap.add_argument('--out',required=True,type=Path);a=ap.parse_args()
+ap=argparse.ArgumentParser();ap.add_argument('--out',required=True,type=Path);ap.add_argument('--effects',action='store_true');a=ap.parse_args()
 a.out.mkdir(parents=True,exist_ok=False)
 functions=[];inputs={}
 tag=lambda name,data:name+struct.pack('<H',len(data))+data
-for source,kind in [('vertex',0),('fragment',1),('fill',2)]:
-    path=P/'tests/shaders'/(source+'.ll');inputs[str(path)]=hashlib.sha256(path.read_bytes()).hexdigest()
+for source,kind in ([('gaussian',2),('scale',2)] if a.effects else [('vertex',0),('fragment',1),('fill',2)]):
+    path=P/('src/shaders' if a.effects else 'tests/shaders')/(source+'.ll');inputs[str(path)]=hashlib.sha256(path.read_bytes()).hexdigest()
     bc=a.out/(source+'.bc');subprocess.run(['llvm-as',path,'-o',bc],check=True)
     raw=bc.read_bytes()
     if raw[:4]==struct.pack('<I',0x0b17c0de):
@@ -33,7 +33,7 @@ header=bytearray(88);header[:4]=b'MTLB'
 struct.pack_into('<6H',header,4,1,2,7,0x8200,16,7)
 funcs=88;pub=funcs+len(table);priv=pub+len(public);bc=priv+len(private);total=bc+len(modules)
 struct.pack_into('<9Q',header,16,total,funcs,len(table),pub,len(public),priv,len(private),bc,len(modules))
-binary=a.out/'lancelot-test.metallib';binary.write_bytes(header+table+public+private+modules)
+binary=a.out/('lancelot-effects.metallib' if a.effects else 'lancelot-test.metallib');binary.write_bytes(header+table+public+private+modules)
 record={'passed':True,'inputs':inputs,'functions':[{'name':'lancelot_'+s,'type':k,'module_bytes':len(b)}for s,k,b in functions],
         'artifact':str(binary),'bytes':total,'sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),
         'only_repository_authored_shader_sources':True,'device_verified':False}

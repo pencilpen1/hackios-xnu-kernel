@@ -35,7 +35,7 @@ bool busy;                              /* a job taken off the queue and not yet
 void
 say(const char *line)
 {
-	sysctlbyname("kern.redwood.say", NULL, NULL, (void *)line, strlen(line));
+	sysctlbyname("kern.lancelot_hakios.say", NULL, NULL, (void *)line, strlen(line));
 }
 
 void *
@@ -65,9 +65,9 @@ main_loop(void *)
 		if (rwm_trace()) {
 			rwm_trace_line("e", j.context);
 		}
-		rwm_perf.worker_cbs++;
-		rwm_perf.worker_ns += rwm_ns() - from;
-		rwm_perf.worker_cpu += rwm_thread_cpu_ns() - from_cpu;
+		__atomic_fetch_add(&rwm_perf.worker_cbs,1,__ATOMIC_RELAXED);
+		__atomic_fetch_add(&rwm_perf.worker_ns,rwm_ns() - from,__ATOMIC_RELAXED);
+		__atomic_fetch_add(&rwm_perf.worker_cpu,rwm_thread_cpu_ns() - from_cpu,__ATOMIC_RELAXED);
 		pthread_mutex_lock(&lock);
 		busy = false;
 		pthread_cond_broadcast(&done);
@@ -103,7 +103,7 @@ rwm_worker_on(void)
 }
 
 /*
- * The window server's two busiest threads on the two Cortex-A75s (kern.redwood.bind_cpu: logical processors 1 and 2):
+ * The window server's two busiest threads on the two Cortex-A75s (kern.lancelot_hakios.bind_cpu: logical processors 1 and 2):
  * CoreAnimation's render thread, the one that commits, on 1, and this worker on 2 -- with boot-arg bigcore=1 only:
  * since 26 October a thread bound to one core waited for that core more than it ran (runs 194, 195).
  */
@@ -116,7 +116,7 @@ rwm_bind_big(int cpu)
 		wanted = strcmp(getprogname(), "backboardd") == 0 && rwm_boot_arg("bigcore=1");
 	}
 	if (wanted) {
-		(void)sysctlbyname("kern.redwood.bind_cpu", NULL, NULL, &cpu, sizeof(cpu));
+		(void)sysctlbyname("kern.lancelot_hakios.bind_cpu", NULL, NULL, &cpu, sizeof(cpu));
 	}
 }
 
@@ -127,7 +127,7 @@ rwm_trace(void)
 	static int on = -1;
 
 	if (on < 0) {
-		on = (rwm_boot_arg("mali_trace=1") || rwm_boot_arg("rwm_trace=1")) && strcmp(getprogname(), "backboardd") == 0;
+		on = rwm_boot_arg("mali_trace=1") || rwm_boot_arg("mali_trace=2") || rwm_boot_arg("rwm_trace=1");
 	}
 	return on;
 }
@@ -168,8 +168,8 @@ rwm_worker_submit(rwm_job_fn run, void *context)
 		while (queued >= rwm_queue_depth()) {
 			pthread_cond_wait(&done, &lock);
 		}
-		rwm_perf.queue_waits++;
-		rwm_perf.queue_ns += rwm_ns() - from;
+		__atomic_fetch_add(&rwm_perf.queue_waits,1,__ATOMIC_RELAXED);
+		__atomic_fetch_add(&rwm_perf.queue_ns,rwm_ns() - from,__ATOMIC_RELAXED);
 	}
 	if (rwm_trace()) {
 		rwm_trace_line("c", context);
@@ -206,8 +206,8 @@ rwm_worker_drain(const char *what)
 		while (queued != 0 || busy) {
 			pthread_cond_wait(&done, &lock);
 		}
-		rwm_perf.drains++;
-		rwm_perf.drain_ns += rwm_ns() - from;
+		__atomic_fetch_add(&rwm_perf.drains,1,__ATOMIC_RELAXED);
+		__atomic_fetch_add(&rwm_perf.drain_ns,rwm_ns() - from,__ATOMIC_RELAXED);
 		if (++told <= 6) {
 			char line[160];
 
@@ -237,8 +237,8 @@ rwm_worker_wait(const volatile bool *flag)
 	while (!*flag) {
 		pthread_cond_wait(&done, &lock);
 	}
-	rwm_perf.processed_waits++;
-	rwm_perf.processed_ns += rwm_ns() - from;
+	__atomic_fetch_add(&rwm_perf.processed_waits,1,__ATOMIC_RELAXED);
+	__atomic_fetch_add(&rwm_perf.processed_ns,rwm_ns() - from,__ATOMIC_RELAXED);
 	pthread_mutex_unlock(&lock);
 }
 

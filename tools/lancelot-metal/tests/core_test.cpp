@@ -17,6 +17,8 @@ static struct rwm_air air;
 static int fence_error, finish_error, draw_error, blit_error, copyin_error, copyback_error;
 static unsigned waits, finishes, draws, blits, copies, destroyed;
 static uint64_t queued_sequence, ticks;
+static uint64_t rejection_epoch, accepted_sequence;
+static bool reject_draw, reject_flush;
 static bool map_fails, small_buffer, async_on;
 static std::mutex barrier;
 static std::condition_variable changed;
@@ -46,6 +48,7 @@ extern "C" int rwm_texture_sync_surface(rwm_texture *, char *why, size_t n) {
     if(copyback_error)snprintf(why,n,"copy-back error");return copyback_error;
 }
 extern "C" int rwm_run_draw(const rwm_draw *, char *why, size_t n) {
+    if(reject_draw){++rejection_epoch;accepted_sequence=42;}
     draws++;if(draw_error)snprintf(why,n,"draw error");return draw_error;
 }
 extern "C" int rwm_run_blit(const rwm_blit *, char *why, size_t n) {
@@ -66,7 +69,8 @@ static int wait_sequence(uint64_t seq, int64_t timeout) {
 static int finish(rwa_device *d,char *why,size_t n) {
     assert(d==&device);finishes++;if(finish_error)snprintf(why,n,"finish error");return finish_error;
 }
-static uint64_t flush(rwa_device *d) { assert(d==&device);return queued_sequence; }
+static uint64_t flush(rwa_device *d) { assert(d==&device);if(reject_flush)++rejection_epoch;return queued_sequence; }
+static int submit_status(uint64_t *epoch,uint64_t *accepted) {*epoch=rejection_epoch;*accepted=accepted_sequence;return rejection_epoch?ETIMEDOUT:0;}
 static int surface_seq(uint32_t,uint64_t) { return 0; }
 static int dispatch(rwa_compute *,const rwa_bindings *,const unsigned[3],const unsigned[3],char *,size_t) { return 0; }
 static rwa_buffer *buffer_create(rwa_device *d,size_t n,char *,size_t) {
@@ -79,9 +83,11 @@ static uint64_t buffer_gpu_address(rwa_buffer *) { return 0x60004000; }
 static void reset(void) {
     fence_error=finish_error=draw_error=blit_error=copyin_error=copyback_error=0;
     waits=finishes=draws=blits=copies=destroyed=0;queued_sequence=0;
+    rejection_epoch=accepted_sequence=0;reject_draw=reject_flush=false;
     map_fails=small_buffer=false;
     air={};air.wait_seq=wait_sequence;air.finish=finish;air.flush_seq=flush;
     air.surface_seq=surface_seq;air.dispatch=dispatch;
+    air.submit_status=submit_status;
     air.buffer_create=buffer_create;air.buffer_map=buffer_map;air.buffer_size=buffer_size;
     air.buffer_destroy=buffer_destroy;air.buffer_gpu_address=buffer_gpu_address;
 }
@@ -146,6 +152,21 @@ static void test_buffers(void) {
     map_fails=false;small_buffer=true;assert(!rwm_buffer_new(&device,0,64,why,sizeof(why)) && destroyed==3);
     puts("PASS native buffer wrapper: one Mesa backend, GPU VA, allocation mapping bounds and cleanup");
 }
+static void test_gallium_rejection(void) {
+    char why[256]={};rwm_work draw{},later{};draw.kind=RWM_WORK_DRAW;later.kind=RWM_WORK_BLIT;
+    rwm_work *works[]={&draw,&later};uint64_t seq=0,waited=0;
+    reset();air.submit_status=nullptr;reject_draw=true;
+    assert(!rwm_run_works(&device,works,2,false,false,&seq,&waited,why,sizeof(why)) && blits==1);
+    reset();reject_draw=true;rwm_command command{};rwm_command_begin(&command);
+    assert(rwm_command_run(&command,&device,works,2,why,sizeof(why))==RWM_RUN_SUBMIT_FAILED);
+    assert(rwm_command_status(&command)==RWM_CB_ERROR && !blits && waits==1 && !command.seq);
+    assert(strstr(why,"Mesa submission rejected"));
+    reset();reject_flush=true;
+    assert(rwm_run_works(&device,works,1,false,false,&seq,&waited,why,sizeof(why))==RWM_RUN_SUBMIT_FAILED && !seq);
+    reset();rejection_epoch=4;accepted_sequence=42;
+    assert(!rwm_run_works(&device,works,1,false,false,&seq,&waited,why,sizeof(why)) && !waits);
+    puts("PASS hidden Gallium rejection: old void callbacks falsely succeed; current draw/flush rejection fails Metal, drains accepted work, skips later commands, isolates old errors");
+}
 int main(int argc,char**) {
     async_on=argc>1;
     if(async_on) {
@@ -155,5 +176,5 @@ int main(int argc,char**) {
         char why[128];assert(rwm_command_run(&c,&device,list,1,why,sizeof(why))==RWM_RUN_COPYIN_FAILED);
         puts("PASS async copy-in failure cannot execute or complete");return 0;
     }
-    test_completion();test_run();test_buffers();
+    test_completion();test_run();test_buffers();test_gallium_rejection();
 }

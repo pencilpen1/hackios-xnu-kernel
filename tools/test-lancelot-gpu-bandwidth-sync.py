@@ -47,6 +47,8 @@ callbacks = handoff[handoff.index('extern "C" void lancelot_hakios_cache_sync'):
 for variant in ["before", "current"]:
     directory = out / variant
     directory.mkdir()
+    begin=lease.index('struct lmal_cpu_wait_state {');end=lease.index('\n};',begin)+4
+    (directory/'actual-wait-state.h').write_text(lease[begin:end]+'\n')
     prepare = (ROOT / "tools/mali-tests/gpu_prepare_before_sync.inc").read_text() if variant == "before" else method(lease, "int beginGpu(")
     prefix = (ROOT / "tools/mali-tests/presenter_before_pacing.inc").read_text() if variant == "before" else display[show_begin:show_end]
     (directory / "actual-gpu-prepare.inc").write_text(prepare)

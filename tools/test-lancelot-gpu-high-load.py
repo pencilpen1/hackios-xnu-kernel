@@ -26,11 +26,13 @@ surface=(R/'xnu/files/iokit/Kernel/MiniIOSurface.h').read_text(encoding='utf-8')
 begin=surface.index('class LancelotMaliQueueReadGroup {');end=surface.index('\n};',begin)+4
 (out/'actual-presenter-read-group.h').write_text(surface[begin:end]+'\n',encoding='utf-8')
 lease=(R/'xnu/files/iokit/Kernel/LancelotMaliCpuLease.h').read_text(encoding='utf-8')
+state_begin=lease.index('struct lmal_cpu_wait_state {');state_end=lease.index('\n};',state_begin)+4
+(out/'actual-wait-state.h').write_text(lease[state_begin:state_end]+'\n')
 methods=[]
 for signature in ['int addCpuWaiter(uint64_t *ticket)','void removeCpuWaiter(uint64_t ticket)',
                   'bool gpuTurnBlocksCpu(uint64_t ticket) const','int addGpuWaiter()',
-                  'void removeGpuWaiter()','bool cpuConflict(task_t own, bool legacy, bool queued = false) const',
-                  'int awaitGpuTurn(task_t own, bool legacy, uint64_t end, bool waitCpu)',
+                  'void removeGpuWaiter()','bool cpuConflict(task_t own, bool legacy, bool queued = false,',
+                  'int awaitGpuTurn(task_t own, bool legacy, uint64_t end, bool waitCpu,',
                   'int waitCpu(uint64_t remaining_ns)','int beginCpuRead(uint64_t remaining_ns)','void endCpuRead()',
                   'int beginCpuWrite(uint64_t remaining_ns)','void endCpuWrite()',
                   'int beginUserCpu(task_t task, bool writer, uint64_t remaining_ns)',
@@ -47,6 +49,9 @@ handoff=(R/'xnu/files/iokit/Kernel/lancelot_hakios_surface_handoff.inc').read_te
 begin=handoff.index('class HakiosSurfaceHandoff {');end=handoff.index('\n};',begin)+4
 (out/'actual-hakios-surface-handoff.inc').write_text(
     handoff[handoff.index('extern "C" void lancelot_hakios_cache_sync'):end]+'\n',encoding='utf-8')
+client=(R/'xnu/files/iokit/Kernel/lancelot_hakios_client.inc').read_text()
+begin=client.index('class HakiosSubmitRoles {');end=client.index('\n};',begin)+4
+(out/'actual-hakios-submit-roles.h').write_text(client[begin:end]+'\n')
 begin=lease.index('class LancelotMaliReadGroup {');end=lease.index('\n};',begin)+4
 (out/'actual-cpu-read-group.inc').write_text(lease[begin:end]+'\n',encoding='utf-8')
 runs=[]

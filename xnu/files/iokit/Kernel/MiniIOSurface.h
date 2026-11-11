@@ -127,6 +127,7 @@ public:
 	struct minisurf_plane           planes[MINISURF_MAX_PLANES];
 	OSDictionary *                  values;
 	uint32_t                        useCount[2];
+	uint32_t                        displayUseCount; /* queued/presenting framebuffer copies */
 	uint32_t                        purgeable;
 	bool                            traced;         /* made by a program of boot-arg surftrace_of: its ports are said too */
 
@@ -161,6 +162,8 @@ public:
  * A surface found or made here is held until MiniIOSurfaceDrop().
  */
 MiniIOSurface * MiniIOSurfaceCopy(uint32_t sid);
+bool MiniIOSurfaceDisplayRetain(MiniIOSurface *surface);
+void MiniIOSurfaceDisplayRelease(MiniIOSurface *surface);
 /*
  * What making and freeing surfaces has cost since this was last asked: how many, microseconds
  * each; how many got memory that was kept from one before.

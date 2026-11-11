@@ -59,7 +59,7 @@ int lm_transport_open(uintptr_t *out) {
  c->asynchronous=(caps.flags&LMAL_CAP_ASYNC_SUBMIT)!=0;
  c->max_bo_bytes=caps.max_bo_bytes?caps.max_bo_bytes:LMAL_MAX_BO_BYTES;
  if(c->max_bo_bytes>LMQ_MAX_BO_BYTES){legacy_transport_close(c->connection);free(c);errno=EPROTO;return -1;}
- c->access=(caps.flags&LMAL_CAP_SUBMIT_ACCESS)!=0;
+ c->access=(caps.flags&(LMAL_CAP_SUBMIT_ACCESS|LMAL_CAP_SURFACE_READ_HINT))!=0;
  c->pair=(caps.flags&(LMAL_CAP_SUBMIT_PAIR_SYNC|LMAL_CAP_CHECK_PAIR_SYNC))==(LMAL_CAP_SUBMIT_PAIR_SYNC|LMAL_CAP_CHECK_PAIR_SYNC);
  if(pthread_mutex_init(&c->lock,NULL)){legacy_transport_close(c->connection);free(c);errno=ENOMEM;return -1;}
  fprintf(stderr,"lancelot-transport: queued=%u async_submit=%u access=%u pair=%u max_bo_bytes=%llu\n",

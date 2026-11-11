@@ -846,25 +846,8 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 
 - (instancetype)initWithAcceleratorPort:(io_service_t)port
 {
-	/*
-	 * No device for SpringBoard. With one, SiriUIActivation's set-up (SiriUICore -> MPSImage) makes
-	 * a Metal Performance Shaders kernel without asking MPSSupportsMTLDevice first; MPS knows only
-	 * Apple's GPUs, has no MPSDevice for this one, and ends the process (MPSKernel.mm:95, "[%@
-	 * initWithDevice:] Failed to get MPSDevice."), so launchd restarts SpringBoard every six seconds
-	 * and the screen stays black. SpringBoard draws nothing with Metal itself -- the window server
-	 * composites it -- and with nil Siri leaves MPS alone, as it did before metal=1. Refused here
-	 * rather than from src/inject_sb.c because asking Metal from that library's constructor means
-	 * loading this bundle inside dyld's initializers, which SpringBoard did not survive.
-	 * Boot-arg sbmtl=1 gives SpringBoard the device as well.
-	 */
-	if (strcmp(getprogname(), "SpringBoard") == 0 &&
-	    !(rwm_boot_arg("sbmtl=1"))) {
-		rw_print("no device for SpringBoard (Metal Performance Shaders would end it)\n");
-		/* not released: -[_MTLDevice dealloc] on an object whose -init never ran hands
-		   libdispatch a null queue (signal 11 under _MTLCreateSystemDefaultDevice). Metal asks
-		   once per process, so this is one small object. */
-		return nil;
-	}
+	extern void lancelot_mps_prepare(void);
+	lancelot_mps_prepare();
 	/*
 	 * Nor for the widgets' renderers: chronod (and the widgets' own extensions) draw with RenderBox,
 	 * which, given a device, wants a drawable this driver does not make outside the window server --
@@ -1047,7 +1030,7 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 
 		snprintf(line, sizeof(line), "!rwm %s: %s; the nearest specialized one instead",
 		         [[descriptor label] UTF8String], [[mine localizedDescription] UTF8String] ?: "(no reason)");
-		sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+		sysctlbyname("kern.lancelot_hakios.say", NULL, NULL, line, strlen(line));
 		mine = nil;
 		rw_plib_allow_near = YES;
 		state = [self redwoodRenderPipelineWithDescriptor:descriptor error:&mine];
@@ -1058,7 +1041,7 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 
 		snprintf(line, sizeof(line), "!rwm %s: %s", [[descriptor label] UTF8String] ?: "(no label)",
 		         [[mine localizedDescription] UTF8String] ?: "(no reason)");
-		sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+		sysctlbyname("kern.lancelot_hakios.say", NULL, NULL, line, strlen(line));
 		rw_print("%s\n", line + 1);
 	}
 	if (cacheable && state != nil) {
@@ -1069,8 +1052,8 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 		[built_by_label setObject:state forKey:label];
 		pthread_mutex_unlock(&built_lock);
 	}
-	rw_perf.pipes++;
-	rw_perf.compile += rw_ns() - built;
+	__atomic_fetch_add(&rw_perf.pipes,1,__ATOMIC_RELAXED);
+	__atomic_fetch_add(&rw_perf.compile,rw_ns() - built,__ATOMIC_RELAXED);
 	if (rw_ns() - built > 200000000ull) {
 		/* a pipeline that held the window server up for a fifth of a second or more: which one */
 		char line[200];
@@ -1079,7 +1062,7 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 		         [[[descriptor label] stringByReplacingOccurrencesOfString:@"com.apple.coreanimation."
 		                                                         withString:@""] UTF8String] ?: "?",
 		         (rw_ns() - built) / 1000000ull, state == nil ? " (failed)" : "", getprogname());
-		sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+		sysctlbyname("kern.lancelot_hakios.say", NULL, NULL, line, strlen(line));
 	}
 	if (error != NULL) {
 		*error = mine;
@@ -1100,7 +1083,7 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 
 	snprintf(line, sizeof(line), "!rwm tile pipeline %s: not supported",
 	         [[descriptor label] UTF8String] ?: "(no label)");
-	sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+	sysctlbyname("kern.lancelot_hakios.say", NULL, NULL, line, strlen(line));
 	return [self fail:error with:@"tile render pipelines: not on this GPU"];
 }
 
@@ -2473,6 +2456,7 @@ rw_in_place(void *context, struct rwa_device *device, IOSurfaceRef surface, unsi
 
 - (struct rwa_texture *)mesaTexture { return rwm_texture_mesa(_core); }
 - (struct rwm_texture *)redwoodCore { return _core; }
+- (uint32_t)lancelotInPlaceSurface { return rwm_texture_in_place(_core); }
 
 /* over a texture of the core's that is made already (src/metal/import.cpp), which it takes: freed with
  * this object, and at once when this object cannot be made */
@@ -3477,7 +3461,7 @@ redwood_clear_semaphore_debt(id commandBuffer)
 		char line[80];
 
 		snprintf(line, sizeof(line), "!rwm blit encoder made (%d) in %s", told, getprogname());
-		sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+		sysctlbyname("kern.lancelot_hakios.say", NULL, NULL, line, strlen(line));
 	}
 	return [[[RedwoodMetalBlitEncoder alloc] initWithRedwoodCommandBuffer:self] autorelease];
 }
@@ -3634,7 +3618,7 @@ rw_say_blit(unsigned kind, const unsigned size[3], id from, id to)
 
 		snprintf(line, sizeof(line), "!rwm blit %u: %ux%u from %s to %s (surface %u)", kind, size[0], size[1],
 		         object_getClassName(from), object_getClassName(to), core != NULL ? rwm_texture_in_place(core) : 0);
-		sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+		sysctlbyname("kern.lancelot_hakios.say", NULL, NULL, line, strlen(line));
 	}
 }
 

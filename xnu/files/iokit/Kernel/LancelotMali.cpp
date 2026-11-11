@@ -171,7 +171,7 @@ lmal_authorized_task(task_t task)
 	char name[sizeof(gLancelotClientName)];
 	bzero(name, sizeof(name));
 	proc_name(proc_pid(p), name, sizeof(name));
-	if (strncmp(name, gLancelotClientName, sizeof(name)) != 0) {
+	if (strncmp(name, gLancelotClientName, sizeof(name)) != 0 && strcmp(name, "SpringBoard") != 0) {
 		return false;
 	}
 	printf("LancelotMali: non-root client %s pid=%d admitted by the boot argument\n", name, proc_pid(p));

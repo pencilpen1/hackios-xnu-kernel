@@ -2,6 +2,8 @@
 #include "lancelot_drm.c"
 static uint64_t issued,finished,now_ns=UINT64_C(5000000000);
 static unsigned queries,transport_waits;
+static uint32_t advertised_roles,last_submit_selector;
+static _Thread_local bool reject_submit;
 static uint64_t missing_token,error_token,protocol_token,slow_token,failed_token;
 uint64_t lancelot_diag_ns(void){return now_ns;}
 void lancelot_diag_anchor(void){}
@@ -11,8 +13,13 @@ int lm_transport_map(uintptr_t c,uint32_t h,uintptr_t *a,uint64_t *n){(void)c;(v
 int lm_transport_unmap(uintptr_t c,uint32_t h,uintptr_t a){(void)c;(void)h;(void)a;return 0;}
 int lm_transport_call(uintptr_t c,uint32_t selector,void *data,size_t size){
  assert(c==123);struct lmal_header*h=data;assert(h->size==size);
- if(selector==LMAL_SELECTOR_GET_CAPS){((struct lmal_caps*)data)->flags=LMAL_CAP_JOB_PROFILE|LMAL_CAP_ASYNC_SUBMIT;return 0;}
+ if(selector==LMAL_SELECTOR_GET_CAPS){((struct lmal_caps*)data)->flags=LMAL_CAP_JOB_PROFILE|LMAL_CAP_ASYNC_SUBMIT|advertised_roles;return 0;}
  if(selector==LMAL_SELECTOR_SYNCOBJ_WAIT||selector==LMAL_SELECTOR_BO_WAIT){transport_waits++;return 0;}
+ if(selector==LMAL_SELECTOR_SUBMIT||selector==LMAL_SELECTOR_SUBMIT_ACCESS){
+  last_submit_selector=selector;
+  if(selector==LMAL_SELECTOR_SUBMIT_ACCESS)assert(((struct lmal_submit_access*)data)->bo_readonly);
+  struct lmal_submit *q=data;if(reject_submit)h->result=LMAL_ETIMEDOUT;else q->sequence=42;return 0;
+ }
  assert(selector==LMAL_SELECTOR_JOB_PROFILE);queries++;
  struct lmal_job_profile*q=data;assert(size==sizeof(*q));uint64_t token=q->sequence;
  if(token==missing_token||token>issued){h->result=LMAL_EINVAL;return 0;}
@@ -25,8 +32,42 @@ int lm_transport_call(uintptr_t c,uint32_t selector,void *data,size_t size){
  return 0;
 }
 static struct device*peek(int fd){struct device*d=get(fd);assert(d);return d;}
+static void *other_thread(void *unused){
+ (void)unused;uint64_t epoch=99,seq=99;assert(!lancelot_drm_submit_status(&epoch,&seq)&&!epoch&&!seq);
+ assert(drmIoctl(-1,DRM_IOCTL_PANFROST_SUBMIT,NULL)==-1);
+ assert(lancelot_drm_submit_status(&epoch,&seq)==EINVAL&&epoch==1&&!seq);return NULL;
+}
+static void test_submit_observation(int fd){
+ uint32_t handle=1,ro=0;struct drm_panfrost_submit p={.jc=0x1000,.bo_handle_count=1,.bo_handles=(uintptr_t)&handle};
+ uint64_t epoch=0,seq=0;assert(!lancelot_drm_submit_status(&epoch,&seq));
+ assert(!lancelot_drm_submit_access(fd,&p,&ro));assert(!lancelot_drm_submit_status(&epoch,&seq)&&seq==42&&!epoch);
+ reject_submit=true;assert(lancelot_drm_submit_access(fd,&p,&ro)==-1&&errno==ETIMEDOUT);
+ assert(lancelot_drm_submit_status(&epoch,&seq)==ETIMEDOUT&&epoch==1&&seq==42&&!lancelot_drm_last_seq());
+ reject_submit=false;assert(!drmIoctl(fd,DRM_IOCTL_PANFROST_SUBMIT,&p));
+ assert(lancelot_drm_submit_status(&epoch,&seq)==ETIMEDOUT&&epoch==1&&seq==42);
+ pthread_t thread;assert(!pthread_create(&thread,NULL,other_thread,NULL));assert(!pthread_join(thread,NULL));
+ assert(lancelot_drm_submit_status(&epoch,&seq)==ETIMEDOUT&&epoch==1);
+ reject_submit=true;assert(drmIoctl(fd,DRM_IOCTL_PANFROST_SUBMIT,&p)==-1);
+ assert(lancelot_drm_submit_status(&epoch,&seq)==ETIMEDOUT&&epoch==2);
+ reject_submit=false;assert(lancelot_drm_submit_access(-1,&p,&ro)==-1&&errno==EBADF);
+ assert(lancelot_drm_submit_status(&epoch,&seq)==EBADF&&epoch==3);
+ puts("PASS actual DRM submit observation: access/ioctl failures remain visible across later success; accepted sequence retained; other threads isolated");
+}
+static void test_role_negotiation(void){
+ uint32_t handle=1,ro=1;struct drm_panfrost_submit p={.jc=0x1000,.bo_handle_count=1,.bo_handles=(uintptr_t)&handle};
+ const uint32_t capabilities[]={0,LMAL_CAP_SUBMIT_ACCESS,LMAL_CAP_SURFACE_READ_HINT};
+ for(unsigned i=0;i<3;i++){
+  advertised_roles=capabilities[i];int fd=drmOpenWithType("panfrost",NULL,DRM_NODE_RENDER);assert(fd>=0);
+  assert(!lancelot_drm_submit_access(fd,&p,&ro));
+  assert(last_submit_selector==(i?LMAL_SELECTOR_SUBMIT_ACCESS:LMAL_SELECTOR_SUBMIT));
+  assert(!drmClose(fd));
+ }
+ advertised_roles=0;puts("PASS roles negotiated independently from RO PTE capability; legacy submits unchanged");
+}
 int main(void){
+ test_role_negotiation();
  int fd=drmOpenWithType("panfrost",NULL,DRM_NODE_RENDER);assert(fd>=0);issued=2;
+ test_submit_observation(fd);
  struct lm_completed_batch b={.ctx=0xabc,.seq=7,.vtq=1,.fsq=2,.at_ns=100000,.submit_end_ns=200000,
   .draws=2,.w=1080,.h=2400,.x1=1079,.y1=2399,.rts=1,.format={42},.modifier={0x123}};
  b.mix.pair[0]=(struct lm_shader_pair){21,22,2};b.mix.vs[0].id=21;b.mix.fs[0].id=22;

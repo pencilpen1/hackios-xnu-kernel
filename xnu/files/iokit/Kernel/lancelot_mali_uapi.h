@@ -215,6 +215,8 @@ struct lmal_submit {
 #define LMAL_CAP_ASYNC_SUBMIT UINT32_C(32) /* submit returns an enqueue token; syncobj/BO waits report completion */
 #define LMAL_CAP_FENCE_SNAPSHOT UINT32_C(64) /* bridge retains the current fence without waiting */
 #define LMAL_CAP_JOB_PROFILE UINT32_C(128) /* read-only completed JM timing by FIFO token */
+#define LMAL_CAP_SURFACE_READ_HINT UINT32_C(256) /* accepts access metadata for IOSurface logical lock arbitration;
+                                               * full CPU alias exclusion/cache handoff stays active, no RO PTE promise */
 #define LMAL_CAP_QUEUED_DRM UINT32_C(8) /* real FIFO/fence bridge; old SUBMIT wire is unchanged */
 #define LMAL_ACCESS_READONLY UINT32_C(1)
 struct lmal_submit_access {

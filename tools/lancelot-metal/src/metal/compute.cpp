@@ -112,8 +112,20 @@ rwm_compute_dispatch(struct rwm_compute_state *s, const unsigned long groups[3],
 	}
 	d->texture_count = s->texture_count;
 	for (unsigned i = 0; i < s->texture_count; i++) {
-		d->textures[i] = s->textures[i].core != nullptr ? rwm_texture_mesa(s->textures[i].core) : nullptr;
+		auto *core=s->textures[i].core;
+		d->textures[i] = core != nullptr ? rwm_texture_mesa(core) : nullptr;
 		rwm_work_keep(w, s->textures[i].object);
+		unsigned access=rwm_air()->compute_texture_access ? rwm_air()->compute_texture_access(s->compute,i) : 0;
+		if(core && (access&1u)) {
+			w->copy_in[w->copy_in_count++]=core;
+			uint32_t surface=rwm_texture_in_place(core);
+			if(surface)w->sampled[w->sampled_count++]=surface;
+		}
+		if(core && (access&2u)) {
+			if(w->target_count==8){rwm_print("compute writes more than eight surfaces; dispatch refused\n");return false;}
+			w->targets[w->target_count++]=core;
+			w->target_surface[w->target_surface_count++]=rwm_texture_in_place(core);
+		}
 	}
 	d->sampler_count = s->sampler_count;
 	for (unsigned i = 0; i < s->sampler_count; i++) {

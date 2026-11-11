@@ -70,6 +70,7 @@
 #include "util/half_float.h"
 #include "util/os_time.h"
 #include "util/u_inlines.h"
+#include "util/u_framebuffer.h"
 #include "util/u_gen_mipmap.h"
 #ifdef __APPLE__
 #include <sys/sysctl.h>
@@ -95,6 +96,7 @@
 struct rwa_device {
    struct pipe_screen *screen;
    struct pipe_context *pipe;
+   struct pipe_framebuffer_state framebuffer;
 
    /* NIR's options for this screen, asked once: the translator needs them to know what
     * the consumer can be handed (what it may leave for the backend to lower).
@@ -144,6 +146,41 @@ struct rwa_device {
     */
    struct rwa_buffer *encoded;
 };
+
+/* The Gallium context and this cache each own surface/resource references.
+ * Keep the active framebuffer between draws. Unbinding after every draw made
+ * panfrost_set_framebuffer_state clear ctx->batch twice for the same target.
+ * A texture being destroyed explicitly drops a matching cached framebuffer. */
+static uint64_t rwa_framebuffer_counters[8];
+static void
+rwa_framebuffer_bind(struct rwa_device *device,const struct pipe_framebuffer_state *fb,bool flush_switch)
+{
+   ++rwa_framebuffer_counters[0];
+   if(util_framebuffer_state_equal(&device->framebuffer,fb)) {
+      ++rwa_framebuffer_counters[1];return;
+   }
+   ++rwa_framebuffer_counters[2];
+   if(flush_switch && (device->framebuffer.nr_cbufs || device->framebuffer.zsbuf)) {
+      uint64_t began=os_time_get_nano();
+      device->pipe->flush(device->pipe,NULL,0);
+      ++rwa_framebuffer_counters[3];rwa_framebuffer_counters[4]+=os_time_get_nano()-began;
+   }
+   uint64_t began=os_time_get_nano();
+   device->pipe->set_framebuffer_state(device->pipe,fb);
+   util_copy_framebuffer_state(&device->framebuffer,fb);
+   rwa_framebuffer_counters[5]+=os_time_get_nano()-began;
+}
+static void
+rwa_framebuffer_forget(struct rwa_device *device,struct pipe_surface *surface)
+{
+   if(!surface)return;
+   bool bound=device->framebuffer.zsbuf==surface;
+   for(unsigned i=0;i<device->framebuffer.nr_cbufs;i++)bound|=device->framebuffer.cbufs[i]==surface;
+   if(bound) {
+      ++rwa_framebuffer_counters[6];
+      rwa_framebuffer_bind(device,&(struct pipe_framebuffer_state){0},false);
+   }
+}
 
 /*
  * WHAT AN MTLArgumentEncoder LEAVES BEHIND, which is a record and not bytes.
@@ -690,6 +727,8 @@ rwa_device_close(struct rwa_device *device)
    RWA_GUARD();
    if (!device)
       return;
+
+   rwa_framebuffer_bind(device,&(struct pipe_framebuffer_state){0},false);
    if (device->default_sampler)
       device->pipe->delete_sampler_state(device->pipe, device->default_sampler);
    for (unsigned t = 0; t < PIPE_MAX_TEXTURE_TYPES; t++) {
@@ -1613,6 +1652,14 @@ rwa_draw_profile(uint64_t out[7])
    memset(rwa_draw_ns, 0, sizeof(rwa_draw_ns));
 }
 
+void
+rwa_state_profile(uint64_t out[8])
+{
+   RWA_GUARD();
+   memcpy(out,rwa_framebuffer_counters,sizeof(rwa_framebuffer_counters));
+   memset(rwa_framebuffer_counters,0,sizeof(rwa_framebuffer_counters));
+}
+
 struct rwa_texture *
 rwa_texture_create(struct rwa_device *device, const struct rwa_texture_shape *shape,
                    char *why, size_t why_size)
@@ -1653,6 +1700,7 @@ rwa_texture_destroy(struct rwa_texture *texture)
    RWA_GUARD();
    if (!texture)
       return;
+   rwa_framebuffer_forget(texture->device,texture->rt);
    argbuf_scrub(texture->device, NULL, texture, NULL);
    /* The view first: it holds a reference of its own on the resource. Nothing has to
     * be unbound here, because rwa_dispatch unbinds every texture it bound once its
@@ -1913,6 +1961,7 @@ rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color, un
       fb.nr_cbufs = i + 1;
       fb.width = t->res->width0;
       fb.height = t->res->height0;
+      fb.samples = MAX2(t->res->nr_samples,1u);
    }
    if (depth && depth->res) {
       if (!depth->rt)
@@ -1921,6 +1970,7 @@ rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color, un
       if (!fb.width) {
          fb.width = depth->res->width0;
          fb.height = depth->res->height0;
+         fb.samples = MAX2(depth->res->nr_samples,1u);
       }
    }
    if (!fb.width)
@@ -1934,7 +1984,7 @@ rwa_render_clear(struct rwa_device *device, struct rwa_texture *const *color, un
       mask |= PIPE_CLEAR_DEPTH;
    if (clear_stencil && fb.zsbuf && format_has_stencil(depth->res->format))
       mask |= PIPE_CLEAR_STENCIL;
-   pipe->set_framebuffer_state(pipe, &fb);
+   rwa_framebuffer_bind(device,&fb,false);
    if (mask)
       pipe->clear(pipe, mask, NULL, &clear, clear_depth ? (double)*clear_depth : 0.0,
                   clear_stencil ? *clear_stencil & 0xff : 0);
@@ -4275,11 +4325,19 @@ rwa_dispatch(struct rwa_compute *compute, const struct rwa_bindings *bindings,
                                why_size);
 }
 
-int
-rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bindings,
+unsigned
+rwa_compute_texture_access(const struct rwa_compute *compute, unsigned index)
+{
+   if (!compute || index >= RWA_MAX_TEXTURES) return 0;
+   const struct rwa_slot *slot = &compute->slots[index];
+   return (slot->read || slot->sampled ? 1u : 0u) | (slot->write ? 2u : 0u);
+}
+
+static int
+rwa_dispatch_buffers_impl(struct rwa_compute *compute, const struct rwa_bindings *bindings,
                      const struct rwa_buffer_bind *table, unsigned table_count,
                      const unsigned groups[3], const unsigned group_size[3],
-                     char *why, size_t why_size)
+                     char *why, size_t why_size, bool wait)
 {
    RWA_GUARD();
    struct rwa_device *device = compute->device;
@@ -4361,9 +4419,29 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
     * and call it a result. rwa_finish is for a caller that wants to wait again, or to
     * wait for work dispatched through another pipeline of the same device.
     */
-   int rc = finish_or_say_why(device, true, "dispatch", why, why_size);
+   int rc = 0;
+   if (wait) rc = finish_or_say_why(device, true, "dispatch", why, why_size);
+   else if (pipe->memory_barrier) pipe->memory_barrier(pipe, PIPE_BARRIER_ALL);
    unbind_stage(device, PIPE_SHADER_COMPUTE, &bound);
    return rc;
+}
+
+int
+rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bindings,
+    const struct rwa_buffer_bind *table, unsigned table_count,
+    const unsigned groups[3], const unsigned group_size[3], char *why, size_t why_size)
+{
+   if (!compute) return -1;
+   return rwa_dispatch_buffers_impl(compute,bindings,table,table_count,groups,group_size,why,why_size,true);
+}
+
+int
+rwa_dispatch_buffers_deferred(struct rwa_compute *compute, const struct rwa_bindings *bindings,
+    const struct rwa_buffer_bind *table, unsigned table_count,
+    const unsigned groups[3], const unsigned group_size[3], char *why, size_t why_size)
+{
+   if (!compute) return -1;
+   return rwa_dispatch_buffers_impl(compute,bindings,table,table_count,groups,group_size,why,why_size,false);
 }
 
 /*
@@ -4372,6 +4450,12 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
  * its completion handlers do and the display does (MiniIOSurfaceDrawn).
  */
 extern uint64_t lancelot_drm_last_seq(void) __attribute__((weak_import));
+extern int lancelot_drm_submit_status(uint64_t *, uint64_t *) __attribute__((weak_import));
+int rwa_submit_status(uint64_t *epoch, uint64_t *accepted) {
+   if (epoch) *epoch = 0;
+   if (accepted) *accepted = 0;
+   return lancelot_drm_submit_status ? lancelot_drm_submit_status(epoch, accepted) : 0;
+}
 extern int lancelot_drm_wait_seq(uint64_t seq, int64_t relative_ns) __attribute__((weak_import));
 
 /* panfrost's batch submissions since the last call: count and nanoseconds */
@@ -4388,7 +4472,7 @@ rwa_submit_profile(uint64_t out[5])
          snprintf(line, sizeof(line), "!rwm pipelines: %llu made, %llu ms translating, %llu ms compiling",
                   (unsigned long long)rwa_pipelines_made, (unsigned long long)(rwa_pipelines_translate_ns / 1000000),
                   (unsigned long long)(rwa_pipelines_compile_ns / 1000000));
-         sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+         sysctlbyname("kern.lancelot_hakios.say", NULL, NULL, line, strlen(line));
          rwa_pipelines_made = rwa_pipelines_translate_ns = rwa_pipelines_compile_ns = 0;
       }
    }
@@ -7454,10 +7538,8 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 
    uint64_t t2 = os_time_get_nano();
    rwa_draw_ns[1] += t2 - t1;
-   /* The framebuffer, from the caller's own textures. create_surface wants a context,
-    * so it is a draw-time cost and not a pipeline one, and it is released again below
-    * before the caller may destroy the textures under it.
-    */
+   /* Surface views are owned by the textures and retained by the bound
+    * framebuffer. Reuse that binding until an attachment or its shape changes. */
    struct pipe_surface *surf[PIPE_MAX_COLOR_BUFS] = { 0 };
    struct pipe_surface *zsurf = NULL;
    /* pipe_framebuffer_state.samples is filled in although nothing here reads it: both
@@ -7514,16 +7596,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       const char *flag = getenv("RWA_FLUSH_ON_SWITCH");
       flush_on_switch = flag == NULL || strcmp(flag, "0") != 0;
    }
-   if (flush_on_switch) {
-      static struct pipe_surface *last_cbuf, *last_zs;
-      if ((fb.nr_cbufs ? fb.cbufs[0] : NULL) != last_cbuf || fb.zsbuf != last_zs) {
-         if (last_cbuf || last_zs)
-            pipe->flush(pipe, NULL, 0);
-         last_cbuf = fb.nr_cbufs ? fb.cbufs[0] : NULL;
-         last_zs = fb.zsbuf;
-      }
-   }
-   pipe->set_framebuffer_state(pipe, &fb);
+   rwa_framebuffer_bind(device,&fb,flush_on_switch);
 
    /* The viewport, and now its z as well. Gallium's window depth is
     * clip_z/w * scale[2] + translate[2], and with clip_halfz (the rasterizer state
@@ -7753,12 +7826,8 @@ unbind:
    unbind_stage(device, PIPE_SHADER_FRAGMENT, &fbound);
    if (!render->generated_vertex)
       unbind_stage(device, PIPE_SHADER_VERTEX, &vbound);
-   /* The framebuffer is released before the caller's next call, which may be
-    * rwa_texture_destroy on one of these attachments: a context still holding a surface
-    * of a freed resource is the same trap as a bound sampler state (rwa_sampler_destroy).
-    * The surfaces themselves are the textures' own (rwa_texture.rt) and stay.
-    */
-   pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
+   /* The framebuffer owns references; destroying a bound texture explicitly
+    * unbinds it in rwa_texture_destroy. Keep the batch available to the next draw. */
    rwa_draw_ns[5] += os_time_get_nano() - t5;
    rwa_draw_ns[6]++;
    return rc;

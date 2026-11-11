@@ -61,6 +61,6 @@ rwm_print(const char *fmt, ...)
 		vsnprintf(line + at, sizeof(line) - at, fmt, ap);
 		va_end(ap);
 		line[strcspn(line, "\n")] = 0;
-		sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+		sysctlbyname("kern.lancelot_hakios.say", NULL, NULL, line, strlen(line));
 	}
 }

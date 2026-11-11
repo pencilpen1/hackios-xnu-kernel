@@ -32,10 +32,10 @@ output = args.out or REPO / 'out/lancelot' / ('metal-runtime-' + datetime.now(ti
 output = output.resolve()
 output.mkdir(parents=True, exist_ok=False)
 digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
-paths = [reference / 'userland/src' / name for name in ['init.c', 'inject.c', 'redwood_input.h', 'redwood_gl.h']]
+paths = [reference / 'userland/src' / name for name in ['init.c', 'inject.c', 'inject_sb.c', 'sb_startup_20h392.h', 'redwood_input.h', 'redwood_gl.h']]
 paths += [reference / 'userland/libmini' / name for name in ['mini.c', 'mini.h', 'start.S']]
 paths += [REPO / 'tools/lancelot-data' / name for name in ['apply-init.py', 'lancelot_data_init.inc']]
-paths += [HERE / name for name in ['apply-init.py', 'apply-inject.py', 'src/lancelot_metal_init.inc']]
+paths += [HERE / name for name in ['apply-init.py', 'apply-inject.py', 'src/lancelot_metal_init.inc', 'src/gpu_present.m', 'src/present_policy.h', 'src/present_cache_hook.h', 'apply-springboard.py']]
 inputs = {str(path): digest(path) for path in paths}
 inputs[str(Path(__file__))] = digest(Path(__file__))
 for path in paths:
@@ -43,10 +43,11 @@ for path in paths:
     directory = output / group
     directory.mkdir(exist_ok=True)
     shutil.copy2(path, directory / path.name)
-for name in ['mini.c', 'mini.h', 'start.S', 'redwood_input.h', 'redwood_gl.h']:
+for name in ['mini.c', 'mini.h', 'start.S', 'sb_startup_20h392.h', 'redwood_input.h', 'redwood_gl.h']:
     shutil.copy2(output / 'base' / name, output / name)
 shutil.copy2(output / 'data/lancelot_data_init.inc', output / 'lancelot_data_init.inc')
 shutil.copy2(output / 'metal/lancelot_metal_init.inc', output / 'lancelot_metal_init.inc')
+shutil.copy2(output / 'metal/present_policy.h', output / 'present_policy.h')
 flags = ['-arch', 'arm64', '-Os', '-static', '-nostdlib', '-ffreestanding', '-fno-stack-protector',
          '-fno-builtin', '-Wall', '-Wextra', '-I' + str(output)]
 runs = []
@@ -85,7 +86,11 @@ dynamic = ['-arch', 'arm64', '-isysroot', str(sdk), '-O1', '-dynamiclib', '-inst
 run('prior-inject-build', [compiler, *dynamic, '-o', output / 'prior-inject.dylib', output / 'base/inject.c'])
 if args.prior_injection:
     assert digest(output / 'prior-inject.dylib') == digest(args.prior_injection), '20H392 injection baseline did not reproduce'
-run('inject-build', [compiler, *dynamic, '-o', output / 'libredwood.dylib', output / 'inject.c'])
+run('inject-build', [compiler, *dynamic, '-fblocks', '-framework', 'Foundation', '-framework', 'Metal', '-framework', 'IOSurface',
+    '-o', output / 'libredwood.dylib', output / 'inject.c', output / 'metal/gpu_present.m'])
+run('springboard-patch',['python3','-B',output/'metal/apply-springboard.py',output/'base/inject_sb.c',output/'inject_sb.c'])
+sbflags=list(dynamic);sbflags[sbflags.index('/redwood/lib/libredwood.dylib')]='/redwood/lib/libredwood-sb.dylib'
+run('springboard-build',[compiler,*sbflags,'-o',output/'libredwood-sb.dylib',output/'inject_sb.c'])
 assert all(digest(Path(path)) == expected for path, expected in inputs.items())
 
 def metadata(path):
@@ -93,6 +98,7 @@ def metadata(path):
 
 record = {'passed': True, 'inputs': inputs, 'runs': runs, 'init': metadata(output / 'init'),
           'injection': metadata(output / 'libredwood.dylib'),
+          'springboard_injection':metadata(output/'libredwood-sb.dylib'),
           'prior_init_reproduced': True if args.prior_init else None,
           'prior_injection_reproduced': True if args.prior_injection else None,
           'existing_20H392_hooks_preserved': True, 'original_reference_sources_unchanged': True,

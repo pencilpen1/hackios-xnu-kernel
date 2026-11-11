@@ -28,6 +28,16 @@ struct lmal_cpu_lease_why {
     uint32_t stage, first, bits, mismatch, final_first, final_bits, final_mismatch, pages;
 };
 
+/* Captured under the lease gate only after admission fails. No polling. */
+struct lmal_cpu_wait_state {
+    uint64_t at_ns, bytes, cpu_ticket, gpu_barrier;
+    uint32_t phase, gpu_count, readers, writers, user_reads, user_writes;
+    uint32_t cpu_waiters, gpu_waiters, priority_waiters, frozen, quarantined;
+    int32_t requester_pid, error;
+    uint32_t owners_total, owners_saved;
+    struct { int32_t pid; uint32_t reads, writes, requester; } owners[8];
+};
+
 class LancelotMaliCpuLease : public OSObject {
     OSDeclareDefaultStructors(LancelotMaliCpuLease);
     enum { SLOT_COUNT = 64 }; /* up to the donor FIFO's queued reservations */
@@ -202,7 +212,7 @@ class LancelotMaliCpuLease : public OSObject {
         IOLockWakeup(fGate, &fGpuCount, false);
         IOLockWakeup(fGate, &fReaders, false);
     }
-    bool cpuConflict(task_t own, bool legacy, bool queued = false) const {
+    bool cpuConflict(task_t own, bool legacy, bool queued = false, bool writer = true) const {
         uint32_t reads = fUserReads, writes = fUserWrites;
         if (legacy)
             for (uint32_t i = 0; i < SLOT_COUNT; ++i) if (fUsers[i].task == own) {
@@ -213,20 +223,44 @@ class LancelotMaliCpuLease : public OSObject {
          * writer may need GPU work to finish its own lock, so do not block
          * that dependency before it releases the logical write ownership. */
         uint32_t cpuWaiters = queued ? fCpuPriorityWaiters : fCpuWaiters;
-        return fReaders || fWriters || reads || writes ||
+        /* IOSurface read locks can span a CGImage's lifetime. A GPU texture
+         * reader does not change those pixels. Permit that logical sharing,
+         * while beginGpu still revokes ALL CPU aliases before any DMA starts.
+         * Kernel cache-view readers, every CPU writer and queued observers
+         * retain their existing exclusion and fairness rules. */
+        return fReaders || fWriters || ((writer || !legacy) && reads) || writes ||
             (legacy && cpuWaiters && !fWriters && !fUserWrites);
     }
     /* Called with fGate held. A queued GPU turn remembers which CPU waiters
      * arrived first and closes the reader gate only against later arrivals. */
-    int awaitGpuTurn(task_t own, bool legacy, uint64_t end, bool waitCpu) {
-        if (!cpuConflict(own, legacy) || fError) return LMAL_OK;
+    int awaitGpuTurn(task_t own, bool legacy, uint64_t end, bool waitCpu, lmal_cpu_wait_state *wait = NULL, bool writer = true) {
+        if (!cpuConflict(own, legacy, false, writer) || fError) return LMAL_OK;
         if (!waitCpu) return LMAL_EBUSY;
         int ret = addGpuWaiter();
         if (ret) return ret;
-        while (cpuConflict(own, legacy, true) && !fError)
-            if (!sleepUntil(&fReaders, end)) { ret = LMAL_ETIMEDOUT; break; }
+        while (cpuConflict(own, legacy, true, writer) && !fError)
+            if (!sleepUntil(&fReaders, end)) { ret = LMAL_ETIMEDOUT;captureWaitLocked(wait,1,own);break; }
         removeGpuWaiter();
         return ret;
+    }
+    void captureWaitLocked(lmal_cpu_wait_state *out, uint32_t phase, task_t own) const {
+        if (!out) return;
+        *out = {};
+        out->at_ns=nowNs();out->bytes=fLength;out->phase=phase;
+        out->requester_pid=task_pid(own);out->error=fError;
+        out->gpu_count=fGpuCount;out->readers=fReaders;out->writers=fWriters;
+        out->user_reads=fUserReads;out->user_writes=fUserWrites;
+        out->cpu_waiters=fCpuWaiters;out->gpu_waiters=fGpuWaiters;out->priority_waiters=fCpuPriorityWaiters;
+        out->cpu_ticket=fCpuTicket;out->gpu_barrier=fGpuBarrier;
+        out->frozen=fFrozen;out->quarantined=fQuarantined;
+        for(uint32_t i=0;i<SLOT_COUNT;i++)if(fUsers[i].task && (fUsers[i].reads || fUsers[i].writes)) {
+            ++out->owners_total;
+            if(out->owners_saved<8) {
+                auto &owner=out->owners[out->owners_saved++];
+                owner.pid=task_pid(fUsers[i].task);owner.reads=fUsers[i].reads;owner.writes=fUsers[i].writes;
+                owner.requester=fUsers[i].task==own;
+            }
+        }
     }
     static LancelotMaliCpuLease *rootFailure(LancelotMaliCpuLease *s, lmal_cpu_lease_why *why,
         uint32_t step, uint32_t detail, uint64_t value) {
@@ -338,7 +372,7 @@ public:
     }
     void unlockMapping() { IOLockUnlock(fGate); }
     int beginGpu(uint64_t remaining_ns, uint64_t *cookie, bool requireBlock = true, bool writer = true, bool waitCpu = true,
-        bool *firstGpu = NULL, void (*firstGpuSync)(void *, size_t) = NULL) {
+        bool *firstGpu = NULL, void (*firstGpuSync)(void *, size_t) = NULL, lmal_cpu_wait_state *wait = NULL) {
         if (firstGpu) *firstGpu = false;
         if (!cookie || !remaining_ns) return LMAL_EINVAL;
         *cookie = 0;
@@ -349,12 +383,14 @@ public:
         for (uint32_t i = 0; i < SLOT_COUNT; ++i)
             ownsUserLock |= fUsers[i].task == own && (fUsers[i].reads || fUsers[i].writes);
         if (requireBlock && ownsUserLock) { IOLockUnlock(fGate); return LMAL_ENOTSUP; }
-        int turn = awaitGpuTurn(own, !requireBlock, end, waitCpu);
-        if (turn) { IOLockUnlock(fGate); return turn; }
+        if(wait)*wait={};
+        int turn = awaitGpuTurn(own, !requireBlock, end, waitCpu,wait,writer);
+        if (turn) { if(!wait || !wait->phase)captureWaitLocked(wait,1,own);IOLockUnlock(fGate);return turn; }
         if (fError || fQuarantined) { int e = fError ? fError : LMAL_EIO; IOLockUnlock(fGate); return e; }
         uint32_t slot;
         for (slot = 0; slot < SLOT_COUNT && fSlots[slot].cookie; ++slot) {}
         if (slot == SLOT_COUNT || fNextCookie == UINT64_MAX) {
+            captureWaitLocked(wait,2,own);
             IOLockUnlock(fGate); return LMAL_EBUSY;
         }
         if (fGpuCount && requireBlock && !fFrozen) {
@@ -362,7 +398,7 @@ public:
         }
         if (!fGpuCount) {
             uint64_t before = nowNs();
-            if (!before || before >= end) { IOLockUnlock(fGate); return LMAL_ETIMEDOUT; }
+            if (!before || before >= end) { captureWaitLocked(wait,3,own);IOLockUnlock(fGate);return LMAL_ETIMEDOUT; }
             if (!cacheValid()) { IOLockUnlock(fGate); return LMAL_EIO; }
             bool blockable = objectValid(false, true) &&
                 lmal_cpu_vm_binding_verify(fObject, fBinding, this, false) == LMAL_OK;

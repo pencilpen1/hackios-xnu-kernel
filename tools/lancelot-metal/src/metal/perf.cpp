@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/sysctl.h>
+#include <unistd.h>
 
 struct rwm_perf rwm_perf;
 
@@ -22,7 +23,9 @@ namespace {
 void
 say(const char *line)
 {
-	sysctlbyname("kern.redwood.say", NULL, NULL, (void *)line, strlen(line));
+	char tagged[512];
+	int n=snprintf(tagged,sizeof(tagged),"lancelot-metal-perf: p=%d n=%.16s t=%llu %s",getpid(),getprogname(),(unsigned long long)(rwm_ns()/1000),line);
+	if(n>0)sysctlbyname("kern.lancelot_hakios.say",NULL,NULL,tagged,strlen(tagged));
 }
 
 /* one of the compiler library's profile calls, if it is loaded and has it (not part of the contract) */
@@ -90,54 +93,65 @@ rwm_ns(void)
 extern "C" void
 rwm_perf_report(uint64_t now)
 {
-	struct rwm_perf &p = rwm_perf;
+	uint64_t since=__atomic_load_n(&rwm_perf.since,__ATOMIC_RELAXED);
+	if(!since){__atomic_compare_exchange_n(&rwm_perf.since,&since,now,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED);return;}
+	if(now<since || now-since<5000000000ull || !__atomic_compare_exchange_n(&rwm_perf.since,&since,now,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED))return;
+	struct rwm_perf p={};
+	p.cbs=__atomic_exchange_n(&rwm_perf.cbs,0,__ATOMIC_RELAXED);
+	p.draws=__atomic_exchange_n(&rwm_perf.draws,0,__ATOMIC_RELAXED);
+	p.encode=__atomic_exchange_n(&rwm_perf.encode,0,__ATOMIC_RELAXED);
+	p.wait=__atomic_exchange_n(&rwm_perf.wait,0,__ATOMIC_RELAXED);
+	p.worst=__atomic_exchange_n(&rwm_perf.worst,0,__ATOMIC_RELAXED);
+	p.pipes=__atomic_exchange_n(&rwm_perf.pipes,0,__ATOMIC_RELAXED);
+	p.compile=__atomic_exchange_n(&rwm_perf.compile,0,__ATOMIC_RELAXED);
+	p.recording=__atomic_exchange_n(&rwm_perf.recording,0,__ATOMIC_RELAXED);
+	p.between=__atomic_exchange_n(&rwm_perf.between,0,__ATOMIC_RELAXED);
+	p.copyins=__atomic_exchange_n(&rwm_perf.copyins,0,__ATOMIC_RELAXED);
+	p.copyin_bytes=__atomic_exchange_n(&rwm_perf.copyin_bytes,0,__ATOMIC_RELAXED);
+	p.copyin_ns=__atomic_exchange_n(&rwm_perf.copyin_ns,0,__ATOMIC_RELAXED);
+	p.queue_waits=__atomic_exchange_n(&rwm_perf.queue_waits,0,__ATOMIC_RELAXED);
+	p.queue_ns=__atomic_exchange_n(&rwm_perf.queue_ns,0,__ATOMIC_RELAXED);
+	p.processed_waits=__atomic_exchange_n(&rwm_perf.processed_waits,0,__ATOMIC_RELAXED);
+	p.processed_ns=__atomic_exchange_n(&rwm_perf.processed_ns,0,__ATOMIC_RELAXED);
+	p.completed_waits=__atomic_exchange_n(&rwm_perf.completed_waits,0,__ATOMIC_RELAXED);
+	p.completed_ns=__atomic_exchange_n(&rwm_perf.completed_ns,0,__ATOMIC_RELAXED);
+	p.drains=__atomic_exchange_n(&rwm_perf.drains,0,__ATOMIC_RELAXED);
+	p.drain_ns=__atomic_exchange_n(&rwm_perf.drain_ns,0,__ATOMIC_RELAXED);
+	p.worker_cbs=__atomic_exchange_n(&rwm_perf.worker_cbs,0,__ATOMIC_RELAXED);
+	p.worker_ns=__atomic_exchange_n(&rwm_perf.worker_ns,0,__ATOMIC_RELAXED);
+	p.worker_cpu=__atomic_exchange_n(&rwm_perf.worker_cpu,0,__ATOMIC_RELAXED);
+	p.made_cbs=__atomic_exchange_n(&rwm_perf.made_cbs,0,__ATOMIC_RELAXED);
+	p.made_ns=__atomic_exchange_n(&rwm_perf.made_ns,0,__ATOMIC_RELAXED);
+	p.made_cpu=__atomic_exchange_n(&rwm_perf.made_cpu,0,__ATOMIC_RELAXED);
 	char line[320];
-	const uint64_t span = now - p.since, cbs = p.cbs ? p.cbs : 1;
+	const uint64_t span=now-since;
 
-	if (p.since == 0) {
-		p.since = now;
-		return;
-	}
-	if (span < 5000000000ull) {
-		return;
-	}
-	snprintf(line, sizeof(line), "rwm perf %llus: %llu cb (%.1f/s), %llu draws, cpu %.1f ms/cb, "
-		 "gpu wait %.1f ms/cb, worst cb %.1f ms, %llu pipelines in %.0f ms; recording %.1f, between %.1f ms/cb; "
-		 "%llu copied in, %llu KB, %.1f ms",
-		 span / 1000000000ull, p.cbs, p.cbs * 1e9 / span, p.draws, p.encode / 1e6 / cbs, p.wait / 1e6 / cbs,
-		 p.worst / 1e6, p.pipes, p.compile / 1e6, p.recording / 1e6 / cbs, p.between / 1e6 / cbs, p.copyins,
-		 p.copyin_bytes >> 10, p.copyin_ns / 1e6);
-	say(line);
-	snprintf(line, sizeof(line), "rwm waits: queue full x%llu %.0f ms, until processed x%llu %.0f ms, "
-		 "until completed x%llu %.0f ms; the worker %.1f ms a buffer", p.queue_waits, p.queue_ns / 1e6,
-		 p.processed_waits, p.processed_ns / 1e6, p.completed_waits, p.completed_ns / 1e6,
-		 p.worker_cbs ? p.worker_ns / 1e6 / p.worker_cbs : 0.0);
-	{
-		size_t at = strlen(line);
-
-		snprintf(line + at, sizeof(line) - at, " (running %.1f of them)",
-			 p.worker_cbs ? p.worker_cpu / 1e6 / p.worker_cbs : 0.0);
-	}
-	say(line);
-	snprintf(line, sizeof(line), "rwm making: %llu buffers, %.1f ms each from made to committed, the maker running %.1f of them",
-		 p.made_cbs, p.made_cbs ? p.made_ns / 1e6 / p.made_cbs : 0.0, p.made_cbs ? p.made_cpu / 1e6 / p.made_cbs : 0.0);
-	say(line);
+	snprintf(line,sizeof(line),"cb=%llu draws=%llu wall_us=%llu wait_us=%llu max_us=%llu",p.cbs,p.draws,p.encode/1000,p.wait/1000,p.worst/1000);say(line);
+	snprintf(line,sizeof(line),"window_us=%llu pipes=%llu compile_us=%llu",span/1000,p.pipes,p.compile/1000);say(line);
+	snprintf(line,sizeof(line),"record_us=%llu between_us=%llu",p.recording/1000,p.between/1000);say(line);
+	snprintf(line,sizeof(line),"copy_n=%llu bytes=%llu us=%llu",p.copyins,p.copyin_bytes,p.copyin_ns/1000);say(line);
+	snprintf(line,sizeof(line),"queue_n=%llu us=%llu",p.queue_waits,p.queue_ns/1000);say(line);
+	snprintf(line,sizeof(line),"processed_n=%llu us=%llu",p.processed_waits,p.processed_ns/1000);say(line);
+	snprintf(line,sizeof(line),"completed_n=%llu us=%llu",p.completed_waits,p.completed_ns/1000);say(line);
+	snprintf(line,sizeof(line),"worker_n=%llu wall_us=%llu cpu_us=%llu",p.worker_cbs,p.worker_ns/1000,p.worker_cpu/1000);say(line);
+	snprintf(line,sizeof(line),"made_n=%llu wall_us=%llu cpu_us=%llu",p.made_cbs,p.made_ns/1000,p.made_cpu/1000);say(line);
 
 	static void (*profile)(uint64_t *);
 	static void (*submits)(uint64_t *);
+	static void (*states)(uint64_t *);
 	static int looked;
 
 	if (!looked) {
 		looked = 1;
 		profile = (void (*)(uint64_t *))profile_call("rwa_draw_profile");
 		submits = (void (*)(uint64_t *))profile_call("rwa_submit_profile");
+		states = (void (*)(uint64_t *))profile_call("rwa_state_profile");
 	}
 	if (submits != nullptr) {
 		uint64_t sb[5] = { 0, 0, 0, 0, 0 };
 
 		submits(sb);
-		snprintf(line, sizeof(line), "rwm batches: %llu submitted, %llu us each; %llu blend shaders compiled; "
-			 "%llu shader variants compiled in %llu ms", sb[0], sb[0] ? sb[1] / 1000 / sb[0] : 0, sb[2], sb[3],
+		snprintf(line, sizeof(line), "batch_n=%llu mean_us=%llu blend_n=%llu variants=%llu compile_ms=%llu", sb[0], sb[0] ? sb[1] / 1000 / sb[0] : 0, sb[2], sb[3],
 			 sb[4] / 1000000);
 		say(line);
 	}
@@ -146,13 +160,14 @@ rwm_perf_report(uint64_t now)
 
 		profile(d);
 		if (d[6] != 0) {
-			snprintf(line, sizeof(line), "rwm draw us: check %llu, bindcheck %llu, state %llu, "
-				 "resources %llu, draw_vbo %llu, unbind %llu (%llu draws)",
-				 d[0] / 1000 / d[6], d[1] / 1000 / d[6], d[2] / 1000 / d[6], d[3] / 1000 / d[6],
-				 d[4] / 1000 / d[6], d[5] / 1000 / d[6], d[6]);
-			say(line);
+			snprintf(line,sizeof(line),"check_us=%llu bind_us=%llu state_us=%llu",d[0]/1000/d[6],d[1]/1000/d[6],d[2]/1000/d[6]);say(line);
+			snprintf(line,sizeof(line),"resources_us=%llu draw_us=%llu unbind_us=%llu n=%llu",d[3]/1000/d[6],d[4]/1000/d[6],d[5]/1000/d[6],d[6]);say(line);
 		}
 	}
-	memset(&p, 0, sizeof(p));
-	p.since = now;
+	if(states != nullptr) {
+		uint64_t s[8]={};states(s);
+		snprintf(line,sizeof(line),"fb_requests=%llu fb_reuse=%llu fb_changes=%llu switch_flushes=%llu flush_us=%llu fb_set_us=%llu destroy_unbinds=%llu",
+		    s[0],s[1],s[2],s[3],s[4]/1000,s[5]/1000,s[6]);say(line);
+	}
+
 }

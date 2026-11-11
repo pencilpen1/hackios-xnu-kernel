@@ -20,7 +20,7 @@ namespace {
 void
 say(const char *line)
 {
-	sysctlbyname("kern.redwood.say", NULL, NULL, (void *)line, strlen(line));
+	sysctlbyname("kern.lancelot_hakios.say", NULL, NULL, (void *)line, strlen(line));
 }
 
 /* the first, second, fourth, eighth... time a site says it (as the plug-in's RW_AGAIN) */
@@ -102,6 +102,7 @@ rwm_surface_import(struct rwa_device *device, IOSurfaceRef s, unsigned plane, co
 	const struct rwm_air *air = rwm_air();
 	struct rwa_texture_shape shape = *asked;
 	struct rwa_texture *texture;
+	const bool writable = shape.usage == 0 || (shape.usage & 0x6) != 0;
 
 	memset(road, 0, sizeof(*road));
 	if (device == nullptr) {
@@ -122,7 +123,7 @@ rwm_surface_import(struct rwa_device *device, IOSurfaceRef s, unsigned plane, co
 		}
 	}
 	/* YCbCr in two planes, read and never drawn into: packed into one RGBA8 texture */
-	if (texture == nullptr && plane == 0 && shape.pixel_format == 500 && !(shape.usage & 0x4) &&
+	if (texture == nullptr && plane == 0 && shape.pixel_format == 500 && !writable &&
 	    IOSurfaceGetPlaneCount(s) == 2 && air->texture_create != nullptr && air->texture_write != nullptr) {
 		char why2[256] = { 0 };
 		struct rwa_texture_shape rgba = shape;
@@ -148,11 +149,11 @@ rwm_surface_import(struct rwa_device *device, IOSurfaceRef s, unsigned plane, co
 
 		char line[240];
 
-		snprintf(line, sizeof(line), "!rwm ycbcr: no RGBA8 texture: %s", why2);
+		snprintf(line, sizeof(line), "!rwm ycbcr: no RGBA8 texture: %.200s", why2);
 		say(line);
 	}
-	/* read and never drawn into (MTLTextureUsageRenderTarget, 0x4, not asked for): copied in */
-	if (texture == nullptr && plane == 0 && !(shape.usage & 0x4) && IOSurfaceGetPlaneCount(s) <= 1 &&
+	/* ShaderWrite (0x2) and RenderTarget (0x4) both require output ownership. */
+	if (texture == nullptr && plane == 0 && !writable && IOSurfaceGetPlaneCount(s) <= 1 &&
 	    (shape.pixel_format == 80 || shape.pixel_format == 81 || shape.pixel_format == 70 ||
 	     shape.pixel_format == 30 || shape.pixel_format == 10) && air->texture_create != nullptr &&
 	    air->texture_write != nullptr) {
@@ -175,7 +176,8 @@ rwm_surface_import(struct rwa_device *device, IOSurfaceRef s, unsigned plane, co
 			rwm_print("no texture to copy a surface into: %s\n", why2);
 		}
 	}
-	if (texture == nullptr && plane == 0 && shape.pixel_format == 80 && air->texture_create != nullptr &&
+	if (texture == nullptr && plane == 0 && writable && IOSurfaceGetPlaneCount(s) <= 1 &&
+	    (shape.pixel_format == 80 || shape.pixel_format == 70) && air->texture_create != nullptr &&
 	    air->texture_read != nullptr) {
 		char why2[256] = { 0 };
 
@@ -195,6 +197,7 @@ rwm_surface_import(struct rwa_device *device, IOSurfaceRef s, unsigned plane, co
 			}
 			if (copy != nullptr) {
 				rwm_texture_copy_back_to(copy, s);
+				if ((shape.usage & 1) || shape.usage == 0) rwm_texture_copy_in_from(copy, s, false);
 				road->kind = RWM_IMPORT_COPY_BACK;
 			}
 			return copy;

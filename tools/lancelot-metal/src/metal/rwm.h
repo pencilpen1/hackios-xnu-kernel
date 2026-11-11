@@ -28,7 +28,7 @@ extern "C" {
 
 /*
  * What the driver says, core and plug-in alike: "redwoodmetal[process pid]: " and the line, to stdout,
- * flushed; the first of each sentence that says something went wrong also to kern.redwood.say.
+ * flushed; the first of each sentence that says something went wrong also to kern.lancelot_hakios.say.
  */
 void rwm_print(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
@@ -54,6 +54,10 @@ struct rwm_perf {
 	uint64_t made_cbs, made_ns, made_cpu;
 };
 extern struct rwm_perf rwm_perf;
+static inline void rwm_perf_max(uint64_t *p,uint64_t value) {
+    uint64_t old=__atomic_load_n(p,__ATOMIC_RELAXED);
+    while(old<value && !__atomic_compare_exchange_n(p,&old,value,true,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) {}
+}
 uint64_t rwm_ns(void);
 uint64_t rwm_thread_cpu_ns(void);
 void rwm_perf_report(uint64_t now);
@@ -77,6 +81,7 @@ struct rwm_air {
 	__typeof__(&rwa_buffer_gpu_address) buffer_gpu_address;
 	__typeof__(&rwa_compute_create) compute_create;
 	__typeof__(&rwa_compute_destroy) compute_destroy;
+	__typeof__(&rwa_compute_texture_access) compute_texture_access;
 	__typeof__(&rwa_texture_create) texture_create;
 	__typeof__(&rwa_texture_write) texture_write;
 	__typeof__(&rwa_texture_read) texture_read;
@@ -91,6 +96,8 @@ struct rwm_air {
 	__typeof__(&rwa_sampler_destroy) sampler_destroy;
 	__typeof__(&rwa_dispatch) dispatch;
 	__typeof__(&rwa_dispatch_buffers) dispatch_buffers;
+	__typeof__(&rwa_dispatch_buffers_deferred) dispatch_buffers_deferred;
+	__typeof__(&rwa_submit_status) submit_status;
 	__typeof__(&rwa_module_argbufs) module_argbufs;
 	__typeof__(&rwa_argbuf_encode_buffer) argbuf_encode_buffer;
 	__typeof__(&rwa_argbuf_encode_texture) argbuf_encode_texture;
@@ -527,6 +534,7 @@ struct rwm_command {
 	unsigned status;
 	int failure_error;
 	uint64_t born, born_cpu;        /* when it was made, and the making thread's processor time then */
+	uint64_t trace_id;
 	uint64_t seq;                   /* its last GPU job, when it was sent off without a wait */
 	volatile bool queued, processed;   /* handed to the driver's worker at -commit, and done there */
 	struct rwm_drawn drawn;         /* the surfaces it draws into in place, pending meanwhile */

@@ -7,6 +7,7 @@
 #define LMAL_EIO (-5)
 #define LMAL_EPERM (-1)
 typedef void *task_t;
+struct lmal_cpu_wait_state;
 static int owner_identity;
 static const task_t owner_task=&owner_identity;
 #ifdef CURRENT_FAIRNESS
@@ -35,6 +36,7 @@ struct Root {
     bool late_cpu_blocked=false;
     uint64_t now=0;
     uint64_t deadline(uint64_t ns){return now+ns;}
+    void captureWaitLocked(lmal_cpu_wait_state *out,uint32_t,task_t){assert(!out);}
     void retain(){refs++;}
     void release(){assert(refs);refs--;}
     bool sleepUntil(void *,uint64_t end) {
@@ -98,6 +100,27 @@ int main(int argc,char **)
         Root overflow;overflow.fCpuWaiters=UINT32_MAX;
         assert(overflow.waitCpu(3)==LMAL_EBUSY&&overflow.beginCpuRead(3)==LMAL_EBUSY);
 #ifdef CURRENT_FAIRNESS
+        /* G6 hardware: compositor PID 22 waited five seconds for a logical
+         * read owned by SpringBoard. A sampled-only root can prepare, while
+         * writes and CPU accesses through the kernel cache view still wait. */
+        Root sampled;int other_identity;
+        sampled.fUserReads=1;sampled.fUsers[0].task=&other_identity;sampled.fUsers[0].reads=1;
+        assert(sampled.cpuConflict(owner_task,true));
+        assert(!sampled.cpuConflict(owner_task,true,false,false));
+        assert(sampled.cpuConflict(owner_task,false,false,false)); /* strict path unchanged */
+        IOLockLock(sampled.fGate);
+        assert(sampled.awaitGpuTurn(owner_task,true,10,false,nullptr,false)==LMAL_OK);
+        assert(sampled.awaitGpuTurn(owner_task,true,10,false,nullptr,true)==LMAL_EBUSY);
+        sampled.fWriters=1;
+        assert(sampled.awaitGpuTurn(owner_task,true,10,false,nullptr,false)==LMAL_EBUSY);
+        sampled.fWriters=0;sampled.fReaders=1;
+        assert(sampled.awaitGpuTurn(owner_task,true,10,false,nullptr,false)==LMAL_EBUSY);
+        sampled.fReaders=0;sampled.fUserWrites=1;sampled.fUsers[0].writes=1;
+        assert(sampled.awaitGpuTurn(owner_task,true,10,false,nullptr,false)==LMAL_EBUSY);
+        sampled.fUserWrites=0;sampled.fUsers[0].writes=0;
+        uint64_t earlier=0;assert(sampled.addCpuWaiter(&earlier)==LMAL_OK);
+        assert(sampled.awaitGpuTurn(owner_task,true,10,false,nullptr,false)==LMAL_EBUSY);
+        sampled.removeCpuWaiter(earlier);IOLockUnlock(sampled.fGate);
         /* A nonblocking 1 ms retry has no reserved turn: a fresh reader can
          * repeatedly enter each gap. A queued GPU below closes that gap. */
         Root barging;

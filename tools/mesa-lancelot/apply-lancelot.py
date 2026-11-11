@@ -22,6 +22,15 @@ def change(path,old,new):
  raise SystemExit(f'{path}: expected exact source hunk missing: {old[:80]!r}')
 change(Path('meson.build'),'if dep_libdrm.found()\n',"if host_machine.system() == 'darwin' and with_gallium_panfrost\n  dep_libdrm = declare_dependency(include_directories : include_directories('src/lancelot-drm'), link_args : ['-framework', 'IOKit', '-framework', 'CoreFoundation'])\n  pre_args += '-DHAVE_LIBDRM'\nelif dep_libdrm.found()\n")
 change(Path('src/compiler/meson.build'),"subdir('spirv')","subdir('spirv')\nsubdir('air')")
+# Byte-address expressions must be evaluated before casting to a packed
+# descriptor pointer. Otherwise cpu + 16 becomes packed_cpu + 16 (256 bytes
+# for ATTRIBUTE_BUFFER), corrupting a 32-byte preload allocation on Bifrost.
+change(Path('src/panfrost/lib/genxml/pan_pack_helpers.h'),
+       'pan_pack((PREFIX2(T, PACKED_T) *)dst, T, name)',
+       'pan_pack((PREFIX2(T, PACKED_T) *)(dst), T, name)')
+change(Path('src/panfrost/lib/genxml/pan_pack_helpers.h'),
+       'pan_pack_nodefaults((PREFIX2(T, PACKED_T) *)dst, T, name)',
+       'pan_pack_nodefaults((PREFIX2(T, PACKED_T) *)(dst), T, name)')
 change(Path('src/panfrost/lib/kmod/pan_kmod.h'),'   off_t mmap_offset;\n','''#ifdef __APPLE__
    return lancelot_bo_map(bo->dev->fd, bo->handle, bo->size, bo_offset,
                           size, prot, flags, host_addr);
@@ -2839,11 +2848,11 @@ int lancelot_drm_submit_pair_sync(int fd,const struct drm_panfrost_submit *vt,
                                 const uint32_t *vt_ro,const struct drm_panfrost_submit *fs,
                                 const uint32_t *fs_ro,struct lancelot_sync_pair_result *out) {
    last_submit_sequence=0;
-   if(!out){errno=EINVAL;return -1;}memset(out,0,sizeof(*out));
+   if(!out){errno=EINVAL;return submit_result(-1,0);}memset(out,0,sizeof(*out));
    struct lmal_submit_pair_sync q={0};
-   if(lancelot_pair_request(vt,vt_ro,fs,fs_ro,&q))return -1;
-   struct device *d=get(fd);if(!d)return -1;
-   if(!(d->caps&LMAL_CAP_SUBMIT_PAIR_SYNC)){put(d);errno=ENOTSUP;return -1;}
+   if(lancelot_pair_request(vt,vt_ro,fs,fs_ro,&q))return submit_result(-1,0);
+   struct device *d=get(fd);if(!d)return submit_result(-1,0);
+   if(!(d->caps&LMAL_CAP_SUBMIT_PAIR_SYNC)){put(d);errno=ENOTSUP;return submit_result(-1,0);}
    int ret=call(d,LMAL_SELECTOR_SUBMIT_PAIR_SYNC,&q,sizeof(q));
    out->sequence[0]=q.sequence[0];out->sequence[1]=q.sequence[1];
    out->error[0]=q.stage_error[0];out->error[1]=q.stage_error[1];
@@ -2852,8 +2861,8 @@ int lancelot_drm_submit_pair_sync(int fd,const struct drm_panfrost_submit *vt,
       (!ret&&(q.attempted_mask!=3||q.completed_mask!=3||!q.sequence[0]||!q.sequence[1]||q.stage_error[0]||q.stage_error[1]))) {
       errno=EPROTO;ret=-1;
    }
-   if(!ret)last_submit_sequence=q.sequence[1];
-   put(d);return ret;
+   int saved_errno=errno;put(d);errno=saved_errno;
+   return submit_result(ret,q.sequence[1]);
 }
 ''')
 

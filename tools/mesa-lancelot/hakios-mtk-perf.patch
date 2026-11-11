@@ -201,7 +201,7 @@
 +      why = "a computed index into an array of mixed widths or a large one";
 +   snprintf(line, sizeof(line), "!rwm scratch %s: %u bytes, widths %#x, %s", nir->info.name ? nir->info.name : "?",
 +            nir->scratch_size, widths, why ? why : "into registers");
-+   sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
++   sysctlbyname("kern.lancelot_hakios.say", NULL, NULL, line, strlen(line));
 +   if (why != NULL || widths == 0)
 +      return false;
 +

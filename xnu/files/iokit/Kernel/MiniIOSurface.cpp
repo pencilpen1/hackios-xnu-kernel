@@ -812,6 +812,23 @@ MiniIOSurfaceUsage(uint32_t * count, uint64_t * bytes)
 	*bytes = gSurfaceBytes;
 }
 
+/* Publish display ownership to IOSurfaceIsInUse until every CPU row is read. */
+bool MiniIOSurfaceDisplayRetain(MiniIOSurface *s)
+{
+    if(!s)return false;
+    IOLockLock(gSurfaceLock);
+    bool ok=s->useCount[1]!=UINT32_MAX && s->displayUseCount!=UINT32_MAX;
+    if(ok){++s->useCount[1];++s->displayUseCount;s->shared()->useCount=(uint64_t)s->useCount[1]<<32|s->useCount[0];}
+    IOLockUnlock(gSurfaceLock);return ok;
+}
+void MiniIOSurfaceDisplayRelease(MiniIOSurface *s)
+{
+    if(!s)return;
+    IOLockLock(gSurfaceLock);
+    if(s->displayUseCount){--s->displayUseCount;--s->useCount[1];s->shared()->useCount=(uint64_t)s->useCount[1]<<32|s->useCount[0];}
+    IOLockUnlock(gSurfaceLock);
+}
+
 void
 MiniIOSurfaceDrop(MiniIOSurface * s)
 {

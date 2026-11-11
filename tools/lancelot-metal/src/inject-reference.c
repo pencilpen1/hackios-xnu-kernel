@@ -901,7 +901,7 @@ specialize_without_apple(void)
  * page leaves the faulting thread no stack to run one on. A Mach exception port for the task
  * is served on a thread of its own instead: it reads the faulting thread's registers, names
  * pc, lr and the frame-pointer chain with dladdr (image and nearest symbol), keeps the lines
- * in the kernel's log (kern.redwood.say, "!" first, which the kernel says again every minute)
+ * in the kernel's log (kern.lancelot_hakios.say, "!" first, which the kernel says again every minute)
  * and answers KERN_FAILURE, so that the crash goes on exactly as before.
  */
 #include <mach/exception_types.h>
@@ -916,7 +916,7 @@ keep_line(const char *format, ...)
 	va_start(arguments, format);
 	vsnprintf(line + 1, sizeof(line) - 1, format, arguments);
 	va_end(arguments);
-	sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+	sysctlbyname("kern.lancelot_hakios.say", NULL, NULL, line, strlen(line));
 	say("%s\n", line + 1);
 }
 
@@ -1269,7 +1269,7 @@ prof_main(void *unused)
 					snprintf(line, sizeof(line), "!bbdprof: %s+%#llx %u", key >> 60 == 0 ? "OSMesa" : "RedwoodMetal",
 					    (unsigned long long)(key & 0xfffffffffffffffull), prof_slots[best].count);
 				}
-				sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+				sysctlbyname("kern.lancelot_hakios.say", NULL, NULL, line, strlen(line));
 				picked[best] = true;
 			}
 		}

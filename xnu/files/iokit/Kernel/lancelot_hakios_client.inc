@@ -205,7 +205,7 @@ class LancelotHakiosMaliUserClient : public IOUserClient
 
 	struct mali_buffer * buffer(uint32_t handle);
 	bool freeBuffer(struct mali_buffer * b);
-	IOReturn submitQueued(struct drm_panfrost_submit *request);
+	IOReturn submitQueued(struct drm_panfrost_submit *request, user_addr_t readOnly = 0);
 	IOReturn createBO(struct drm_panfrost_create_bo * request);
 	struct mali_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t * handle);
 	IOReturn surfaceBuffer(struct redwood_surface * request);
@@ -475,6 +475,7 @@ LancelotHakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethod
 	union {
 		struct drm_gem_close close;
 		struct drm_panfrost_submit submit;
+		struct lmq_submit_access access;
 		struct drm_panfrost_wait_bo wait;
 		struct drm_panfrost_create_bo create;
 		struct drm_panfrost_mmap_bo mmap;
@@ -504,7 +505,7 @@ LancelotHakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethod
         q.h.result=0;q.jobs_submitted=fSubmits;q.jobs_completed=__atomic_load_n(&fCompleted,__ATOMIC_RELAXED);
         q.faults=fFailed+__atomic_load_n(&fCompletionErrors,__ATOMIC_RELAXED);q.resets=lancelot_hakios_mali_resets();q.quarantined=fPinned?1:0;
         q.max_bo_bytes=(uint32_t)MALI_BUFFER_MAX;q.max_vm_bytes=(uint32_t)LMAL_MAX_VM_BYTES;
-        q.flags=LMAL_CAP_QUEUED_DRM | LMAL_CAP_HAKIOS_DONOR | LMAL_CAP_ASYNC_SUBMIT | LMAL_CAP_FENCE_SNAPSHOT | LMAL_CAP_JOB_PROFILE;
+        q.flags=LMAL_CAP_QUEUED_DRM | LMAL_CAP_HAKIOS_DONOR | LMAL_CAP_ASYNC_SUBMIT | LMAL_CAP_FENCE_SNAPSHOT | LMAL_CAP_JOB_PROFILE | LMAL_CAP_SURFACE_READ_HINT;
         IOLockUnlock(gHakiosMaliLock);
         *(lmal_caps*)args->structureOutput=q;return kIOReturnSuccess;
     }
@@ -512,6 +513,7 @@ LancelotHakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethod
     switch(selector){
     case kDrmGemClose:expected=sizeof(drm_gem_close);break;
     case kPanfrostSubmit:expected=sizeof(drm_panfrost_submit);break;
+    case LMQ_SUBMIT_ACCESS:expected=sizeof(lmq_submit_access);break;
     case kPanfrostWaitBO:expected=sizeof(drm_panfrost_wait_bo);break;
     case kPanfrostCreateBO:expected=sizeof(drm_panfrost_create_bo);break;
     case kPanfrostMmapBO:expected=sizeof(drm_panfrost_mmap_bo);break;
@@ -585,6 +587,15 @@ LancelotHakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethod
 		break;
 	case kPanfrostSubmit:
         ret=submitQueued(&r.submit);
+        break;
+	case LMQ_SUBMIT_ACCESS:
+        if(!r.access.bo_readonly)ret=kIOReturnBadArgument;
+        else {
+            static_assert(sizeof(r.submit)==sizeof(r.access.submit),"raw submit layout");
+            drm_panfrost_submit request;memcpy(&request,&r.access.submit,sizeof(request));
+            ret=submitQueued(&request,(user_addr_t)r.access.bo_readonly);
+            memcpy(&r.access.submit,&request,sizeof(request));
+        }
         break;
 	case kRedwoodSurface:
 		ret = surfaceBuffer(&r.surface);
@@ -660,10 +671,27 @@ LancelotHakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethod
 
 /* Match the donor's enqueue-and-return contract. The FIFO completion owns the
  * handoff/fence; BO last_seq and explicit waits protect descriptors and scratch. */
-IOReturn LancelotHakiosMaliUserClient::submitQueued(drm_panfrost_submit *q)
+class HakiosSubmitRoles {
+    uint32_t *fReadOnly=NULL,fCount=0;
+public:
+    int init(user_addr_t source,uint32_t count) {
+        if(!source)return LMAL_OK; /* legacy submit is conservative RW */
+        fReadOnly=IONew(uint32_t,count);fCount=count;
+        if(!fReadOnly)return LMAL_ENOMEM;
+        if(copyin(source,fReadOnly,count*sizeof(*fReadOnly)))return LMAL_EINVAL;
+        for(uint32_t i=0;i<count;i++)if(fReadOnly[i]>1)return LMAL_EINVAL;
+        return LMAL_OK;
+    }
+    bool writer(uint32_t i) const {return !fReadOnly || i>=fCount || !fReadOnly[i];}
+    ~HakiosSubmitRoles(){if(fReadOnly)IODelete(fReadOnly,uint32_t,fCount);}
+};
+
+IOReturn LancelotHakiosMaliUserClient::submitQueued(drm_panfrost_submit *q,user_addr_t readOnly)
 {
     if(!q->jc || (q->jc&63u) || (q->requirements&~1u) || q->in_sync_count || q->in_syncs || q->out_sync ||
        !q->bo_handles || !q->bo_handle_count || q->bo_handle_count>MALI_BUFFERS)return kIOReturnBadArgument;
+    HakiosSubmitRoles roles;
+    int roleError=roles.init(readOnly,q->bo_handle_count);if(roleError)return lmq_return(roleError);
     uint32_t *handles=IONew(uint32_t,q->bo_handle_count);
     if(!handles)return kIOReturnNoMemory;
     if(copyin((user_addr_t)q->bo_handles,handles,q->bo_handle_count*sizeof(*handles))) {
@@ -673,7 +701,10 @@ IOReturn LancelotHakiosMaliUserClient::submitQueued(drm_panfrost_submit *q)
     for(uint32_t i=0;i<q->bo_handle_count;i++) {
         auto*b=buffer(handles[i]);
         if(!b){IODelete(handles,uint32_t,q->bo_handle_count);return kIOReturnBadArgument;}
-        if(q->jc>=b->address && q->jc-b->address<=b->size-64)jc=true;
+        if(q->jc>=b->address && q->jc-b->address<=b->size-64) {
+            if(!roles.writer(i)){IODelete(handles,uint32_t,q->bo_handle_count);return kIOReturnBadArgument;}
+            jc=true;
+        }
     }
     if(!jc){IODelete(handles,uint32_t,q->bo_handle_count);return kIOReturnBadArgument;}
     HakiosPreparePins pins;
@@ -686,7 +717,7 @@ IOReturn LancelotHakiosMaliUserClient::submitQueued(drm_panfrost_submit *q)
     HakiosSubmissionOwner owner(work);
     auto &handoff=work->handoff;
     for(uint32_t i=0;i<q->bo_handle_count;i++) {
-        int e=handoff.add(buffer(handles[i])->surface);
+        int e=handoff.add(buffer(handles[i])->surface,roles.writer(i));
         if(e){IODelete(handles,uint32_t,q->bo_handle_count);return lmq_return(e);}
     }
     auto*fence=work->fence;
@@ -703,6 +734,7 @@ IOReturn LancelotHakiosMaliUserClient::submitQueued(drm_panfrost_submit *q)
         int reset=handoff.resetPrepared();if(reset)prepared=reset;
         IOLog("lancelot-hakios-admission: error=%d stage=surface wait_us=%llu pins=%u roots=%u\n",
             prepared,(lmq_clock()-preparedAt)/1000,q->bo_handle_count,handoff.count());
+        handoff.reportWait();
         IODelete(handles,uint32_t,q->bo_handle_count);return lmq_return(prepared);
     }
     uint64_t preparationUs=(lmq_clock()-preparedAt)/1000;

@@ -93,6 +93,12 @@ struct rwa_compute *rwa_compute_create(struct rwa_device *device, const void *bi
 				       size_t size, const char *entry,
 				       struct rwa_compute_info *info, char *why, size_t why_size);
 void rwa_compute_destroy(struct rwa_compute *compute);
+/* Direct texture binding access from the compiled interface: read=1, write=2. */
+unsigned rwa_compute_texture_access(const struct rwa_compute *compute, unsigned index);
+struct rwa_bindings;
+struct rwa_buffer_bind;
+int rwa_dispatch_buffers_deferred(struct rwa_compute *, const struct rwa_bindings *,
+    const struct rwa_buffer_bind *, unsigned, const unsigned[3], const unsigned[3], char *, size_t);
 
 /*
  * A texture. The shape comes from Metal's own descriptor, in Metal's own terms, because that
@@ -602,6 +608,9 @@ int rwa_finish(struct rwa_device *device, char *why, size_t why_size);
 /* where the draws' time went since the last call, in ns: validation, binding checks, fixed
  * state, the stages' resources, draw_vbo, unbinding; then the number of draws */
 void rwa_draw_profile(uint64_t out[7]);
+/* Framebuffer requests/reuses/changes, switch flush count/ns, bind ns,
+ * destruction unbinds, reserved. Counters are reset when read. */
+void rwa_state_profile(uint64_t out[8]);
 
 /* The work so far sent off without waiting, and the number of its last job; a wait for it. */
 uint64_t rwa_flush_seq(struct rwa_device *device);
@@ -1357,6 +1366,9 @@ struct rwa_draw {
 
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 		    char *why, size_t why_size);
+
+/* Calling-thread rejection epoch and last accepted native FIFO sequence. */
+int rwa_submit_status(uint64_t *rejection_epoch, uint64_t *accepted_sequence);
 
 #ifdef __cplusplus
 }

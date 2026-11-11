@@ -98,7 +98,7 @@ char warm_first_refusal[160];  /* the first build the compiler refused, and why 
 void
 say(const char *line)
 {
-	sysctlbyname("kern.redwood.say", NULL, NULL, (void *)line, strlen(line));
+	sysctlbyname("kern.lancelot_hakios.say", NULL, NULL, (void *)line, strlen(line));
 }
 
 const char *
@@ -192,13 +192,14 @@ recipe_parse(const char *text, warm *out)
 void
 say_recipe(const char *text, size_t n, bool to_host)
 {
+	(void)to_host; /* lancelot has one captured log endpoint. */
 	const size_t length = strlen(text), pieces = (length + 149) / 150;
 
 	for (size_t k = 0; k < pieces; k++) {
 		char line[200];
 
 		snprintf(line, sizeof(line), "rwr %s %zu %zu/%zu %.150s", getprogname(), n, k + 1, pieces, text + k * 150);
-		sysctlbyname(to_host ? "kern.redwood.host_keep" : "kern.redwood.say", NULL, NULL, line, strlen(line));
+		sysctlbyname("kern.lancelot_hakios.say", NULL, NULL, line, strlen(line));
 	}
 }
 

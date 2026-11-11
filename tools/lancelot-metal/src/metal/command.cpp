@@ -38,7 +38,9 @@ rwm_run_dispatch(const struct rwm_dispatch *d, char *why, size_t why_size)
 	/* rwa_dispatch_buffers when the library has it, the same call with Metal's offsets as well; a
 	 * library too old to have it is used through rwa_dispatch, and then a kernel with a set is refused
 	 * by name there and every offset is read as zero -- what an older library did in any case */
-	int rc = air->dispatch_buffers != nullptr
+	int rc = air->dispatch_buffers_deferred != nullptr
+            ? air->dispatch_buffers_deferred(d->compute,&bindings,table,count,d->groups,d->size,why,why_size)
+            : air->dispatch_buffers != nullptr
 		    ? air->dispatch_buffers(d->compute, &bindings, table, count, d->groups, d->size, why, why_size)
 		    : air->dispatch(d->compute, &bindings, d->groups, d->size, why, why_size);
 

@@ -2,7 +2,7 @@
 from pathlib import Path
 import argparse
 ap=argparse.ArgumentParser();ap.add_argument('source',type=Path);ap.add_argument('output',type=Path);a=ap.parse_args()
-text=a.source.read_text(encoding='utf-8');assert not a.output.exists()
+text=a.source.read_text(encoding='utf-8').replace('kern.redwood.say','kern.lancelot_hakios.say');assert not a.output.exists()
 assert 'ca_20h392' in text and '.metal_device_array = 0x1e1d8a970UL' in text
 anchor='''		say("redwood: camtl=1: CoreAnimation may have the Metal device (it needs "
 		    "QuartzCore.framework/default.metallib in the image)\\n");

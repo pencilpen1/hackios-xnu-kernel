@@ -50,6 +50,7 @@ load()
 		call("rwa_buffer_gpu_address", &c.buffer_gpu_address, true),
 		call("rwa_compute_create", &c.compute_create, true),
 		call("rwa_compute_destroy", &c.compute_destroy, false),
+		call("rwa_compute_texture_access", &c.compute_texture_access, true),
 		call("rwa_texture_create", &c.texture_create, true),
 		call("rwa_texture_write", &c.texture_write, false),
 		call("rwa_texture_read", &c.texture_read, false),
@@ -66,6 +67,7 @@ load()
 		/* argument buffers, drawing and depth: looked up, not required -- the plug-in checks
 		 * for them before it answers an encoder, a pipeline or a depth state */
 		call("rwa_dispatch_buffers", &c.dispatch_buffers, false),
+		call("rwa_dispatch_buffers_deferred", &c.dispatch_buffers_deferred, true),
 		call("rwa_module_argbufs", &c.module_argbufs, false),
 		call("rwa_argbuf_encode_buffer", &c.argbuf_encode_buffer, false),
 		call("rwa_argbuf_encode_texture", &c.argbuf_encode_texture, false),
@@ -78,6 +80,7 @@ load()
 		call("rwa_depth_stencil_create", &c.depth_stencil_create, false),
 		call("rwa_depth_stencil_destroy", &c.depth_stencil_destroy, false),
 		call("rwa_finish", &c.finish, true),
+		call("rwa_submit_status", &c.submit_status, true),
 		call("rwa_flush_seq", &c.flush_seq, false),
 		call("rwa_wait_seq", &c.wait_seq, false),
 		call("rwa_surface_seq", &c.surface_seq, false),

@@ -340,7 +340,7 @@ score(const char *ours, const char *theirs)
 void
 say(const char *line)
 {
-	sysctlbyname("kern.redwood.say", NULL, NULL, (void *)line, strlen(line));
+	sysctlbyname("kern.lancelot_hakios.say", NULL, NULL, (void *)line, strlen(line));
 }
 
 bool

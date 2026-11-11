@@ -17,22 +17,28 @@ static void hakios_last_gpu_sync(void *address,size_t length) {
         lancelot_hakios_cache_sync((uint8_t *)address+PAGE_SIZE,length-PAGE_SIZE,true);
 }
 class HakiosSurfaceHandoff {
-    struct Entry { LancelotMaliCpuLease *lease; uint64_t cookie; };
+    struct Entry { LancelotMaliCpuLease *lease; uint64_t cookie; uint32_t sid; bool writer; };
     Entry *fEntries = NULL;
     uint32_t fCapacity = 0, fCount = 0;
     bool fFinished = false, fDmaSafe = true;
+    lmal_cpu_wait_state fWait = {};
+    uint32_t fWaitSid = 0;
+    bool fWaitWriter = true;
 public:
     bool init(uint32_t capacity) {
         fCapacity=capacity;fEntries=IONewZero(Entry,capacity);return fEntries!=NULL;
     }
     uint32_t count() const {return fCount;}
-    int add(MiniIOSurface *surface) {
+    int add(MiniIOSurface *surface, bool writer = true) {
         if(!surface)return LMAL_OK;
         LancelotMaliCpuLease *lease=surface->maliCpuLease;
         if(!lease)return LMAL_ENOTSUP;
-        for(uint32_t i=0;i<fCount;i++)if(fEntries[i].lease==lease)return LMAL_OK;
+        for(uint32_t i=0;i<fCount;i++)if(fEntries[i].lease==lease) {
+            fEntries[i].writer |= writer;return LMAL_OK;
+        }
         if(fCount==fCapacity)return LMAL_ENOMEM;
-        lease->retain();fEntries[fCount++].lease=lease;return LMAL_OK;
+        lease->retain();fEntries[fCount].sid=surface->sid;fEntries[fCount].writer=writer;
+        fEntries[fCount++].lease=lease;return LMAL_OK;
     }
     int acquire(uint64_t end,bool waitCpu = true) {
         for(uint32_t i=1;i<fCount;i++) {
@@ -44,13 +50,51 @@ public:
             }
             fEntries[j]=e;
         }
-        for(uint32_t i=0;i<fCount;i++) {
-            uint64_t now=lmq_clock();if(!now||now>=end)return LMAL_ETIMEDOUT;
-            int error=fEntries[i].lease->beginGpu(end-now,&fEntries[i].cookie,false,true,waitCpu,NULL,
-                hakios_first_gpu_sync);
-            if(error)return error;
+        uint32_t pivot=fCount;
+        for(;;) {
+            /* Never sleep for a second root while a first root is frozen:
+             * a CPU owner of the second may need the first to finish. Wait
+             * fairly on the contended root only with all other reservations
+             * released, then try the complete set without blocking. */
+            if(pivot<fCount) {
+                uint64_t now=lmq_clock();if(!now||now>=end)return LMAL_ETIMEDOUT;
+                int error=fEntries[pivot].lease->beginGpu(end-now,&fEntries[pivot].cookie,false,fEntries[pivot].writer,waitCpu,NULL,
+                    hakios_first_gpu_sync,&fWait);
+                fWaitSid=fEntries[pivot].sid;
+                fWaitWriter=fEntries[pivot].writer;
+                if(error)return error;
+            }
+            uint32_t busy=fCount;
+            for(uint32_t i=0;i<fCount;i++) {
+                if(fEntries[i].cookie)continue;
+                uint64_t now=lmq_clock();if(!now||now>=end){resetPrepared();return LMAL_ETIMEDOUT;}
+                int error=fEntries[i].lease->beginGpu(end-now,&fEntries[i].cookie,false,fEntries[i].writer,false,NULL,
+                    hakios_first_gpu_sync,&fWait);
+                fWaitSid=fEntries[i].sid;
+                fWaitWriter=fEntries[i].writer;
+                if(error) {
+                    int reset=resetPrepared();if(reset)return reset;
+                    if(error!=LMAL_EBUSY || !waitCpu)return error;
+                    busy=i;break;
+                }
+            }
+            if(busy==fCount)return LMAL_OK;
+            pivot=busy;
         }
-        return LMAL_OK;
+    }
+    void reportWait() const {
+        if(!fWait.phase)return;
+        IOLog("lancelot-surface-wait: sid=%u phase=%u at=%llu bytes=%llu requester=%d error=%d gpu_writer=%u\n",
+            fWaitSid,fWait.phase,fWait.at_ns/1000,fWait.bytes,fWait.requester_pid,fWait.error,fWaitWriter);
+        IOLog("lancelot-surface-gate: sid=%u gpu=%u readers=%u writers=%u user_r=%u user_w=%u cpu_waiters=%u gpu_waiters=%u priority=%u\n",
+            fWaitSid,fWait.gpu_count,fWait.readers,fWait.writers,fWait.user_reads,fWait.user_writes,
+            fWait.cpu_waiters,fWait.gpu_waiters,fWait.priority_waiters);
+        IOLog("lancelot-surface-ticket: sid=%u ticket=%llu barrier=%llu frozen=%u quarantine=%u owners=%u saved=%u\n",
+            fWaitSid,fWait.cpu_ticket,fWait.gpu_barrier,fWait.frozen,fWait.quarantined,fWait.owners_total,fWait.owners_saved);
+        for(uint32_t i=0;i<fWait.owners_saved;i++) {
+            const auto &o=fWait.owners[i];
+            IOLog("lancelot-surface-owner: sid=%u pid=%d reads=%u writes=%u requester=%u\n",fWaitSid,o.pid,o.reads,o.writes,o.requester);
+        }
     }
     /* Nothing has been enqueued. Drop every partial reservation after the
      * client lock is reacquired, before any handle can be published. */
